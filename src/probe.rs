@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::colors::{ReportedColors, Rgb};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
+use rustix::termios::{QueueSelector, tcflush};
 
 /// Gives up on a terminal that doesn't answer even the attributes request.
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -59,14 +61,22 @@ pub fn probe() -> io::Result<TerminalInfo> {
             tv_nsec: left.subsec_nanos() as _,
         };
         let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
-        if poll(&mut fds, Some(&timeout))? == 0 {
-            break;
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
         }
         let n = rustix::io::read(stdin.as_fd(), &mut buf)?;
         if n == 0 {
             break;
         }
         answers.extend_from_slice(&buf[..n]);
+    }
+    if !has_device_attributes(&answers) {
+        // It gave up waiting. Answers that came in late would be read as
+        // typing, so drop what has arrived by now.
+        let _ = tcflush(&stdin, QueueSelector::IFlush);
     }
     Ok(parse(&answers))
 }

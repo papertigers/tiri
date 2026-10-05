@@ -21,11 +21,19 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
             let mut buf = [0u8; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
-        KeyCode::Enter => out.extend_from_slice(if alt { b"\x1b\r" } else { b"\r" }),
-        KeyCode::Tab => out.push(b'\t'),
+        // Alt sends Escape first, for these as for characters.
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc => {
+            if alt {
+                out.push(0x1b);
+            }
+            out.push(match key.code {
+                KeyCode::Enter => b'\r',
+                KeyCode::Tab => b'\t',
+                KeyCode::Backspace => 0x7f,
+                _ => 0x1b,
+            });
+        }
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
-        KeyCode::Backspace => out.extend_from_slice(if alt { b"\x1b\x7f" } else { b"\x7f" }),
-        KeyCode::Esc => out.push(0x1b),
         KeyCode::Up => cursor_key(&mut out, b'A', mods, application_cursor),
         KeyCode::Down => cursor_key(&mut out, b'B', mods, application_cursor),
         KeyCode::Right => cursor_key(&mut out, b'C', mods, application_cursor),
@@ -36,10 +44,8 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
         KeyCode::Delete => tilde_key(&mut out, 3, mods),
         KeyCode::PageUp => tilde_key(&mut out, 5, mods),
         KeyCode::PageDown => tilde_key(&mut out, 6, mods),
-        KeyCode::F(n @ 1..=4) => {
-            out.extend_from_slice(b"\x1bO");
-            out.push(b'P' + n - 1);
-        }
+        // F1 to F4 are SS3 P to S, or CSI 1 ; modifier P to S.
+        KeyCode::F(n @ 1..=4) => cursor_key(&mut out, b'P' + n - 1, mods, true),
         KeyCode::F(n) => {
             let code = match n {
                 5 => 15,
@@ -67,7 +73,7 @@ fn ctrl_byte(c: char) -> Option<u8> {
         '\\' | '4' => Some(0x1c),
         ']' | '5' => Some(0x1d),
         '^' | '6' => Some(0x1e),
-        '_' | '-' | '7' => Some(0x1f),
+        '_' | '-' | '/' | '7' => Some(0x1f),
         '?' | '8' => Some(0x7f),
         _ => None,
     }
@@ -304,5 +310,23 @@ mod tests {
         assert_eq!(encode_key(key(KeyCode::Delete, none), false), b"\x1b[3~");
         assert_eq!(encode_key(key(KeyCode::F(1), none), false), b"\x1bOP");
         assert_eq!(encode_key(key(KeyCode::F(5), none), false), b"\x1b[15~");
+    }
+
+    #[test]
+    fn modifiers_reach_function_keys_tab_and_escape() {
+        let (shift, alt) = (KeyModifiers::SHIFT, KeyModifiers::ALT);
+        assert_eq!(encode_key(key(KeyCode::F(3), shift), false), b"\x1b[1;2R");
+        assert_eq!(
+            encode_key(key(KeyCode::F(4), KeyModifiers::CONTROL), false),
+            b"\x1b[1;5S"
+        );
+        assert_eq!(encode_key(key(KeyCode::F(5), shift), false), b"\x1b[15;2~");
+        assert_eq!(encode_key(key(KeyCode::Tab, alt), false), b"\x1b\t");
+        assert_eq!(encode_key(key(KeyCode::Esc, alt), false), b"\x1b\x1b");
+        assert_eq!(encode_key(key(KeyCode::Enter, alt), false), b"\x1b\r");
+        assert_eq!(
+            encode_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL), false),
+            [0x1f]
+        );
     }
 }

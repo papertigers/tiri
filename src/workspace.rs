@@ -127,9 +127,11 @@ impl Workspaces {
     pub fn create_named(&mut self, name: String) -> usize {
         let idx = self.list.len() - 1;
         let workspace = self.new_workspace(Some(name));
+        let zoom = self.overview_zoom();
         for view in self.views.values_mut() {
+            let overview = view.overview.then_some(zoom);
             view.strips
-                .insert(idx, StripView::settled(&workspace.strip, None));
+                .insert(idx, StripView::settled(&workspace.strip, overview));
             if view.active >= idx {
                 view.active += 1;
                 view.y += 1.0;
@@ -160,19 +162,22 @@ impl Workspaces {
 
     /// Focuses `pane` for `client`, moving to its workspace if need be.
     pub fn focus_pane(&mut self, client: ClientId, pane: PaneId) -> bool {
-        let Some(idx) = self.list.iter_mut().position(|w| w.strip.focus_pane(pane)) else {
+        let Some(idx) = self.list.iter().position(|w| w.strip.contains(pane)) else {
             return false;
         };
+        self.list[idx].strip.focus_pane(pane);
         self.focus_workspace(client, idx);
         true
     }
 
     /// Puts `client` on workspace `idx` straight away, without sliding there.
     pub fn set_active(&mut self, client: ClientId, idx: usize) {
-        let view = self.view_mut(client);
-        view.active = idx;
-        view.y = idx as f64;
-        self.normalize();
+        if idx < self.list.len() {
+            let view = self.view_mut(client);
+            view.active = idx;
+            view.y = idx as f64;
+            self.normalize();
+        }
     }
 
     /// How many clients are on workspace `idx`.

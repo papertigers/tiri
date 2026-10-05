@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::{ExecutableCommand, cursor, event, terminal};
+use rustix::fs::{FlockOperation, flock};
 
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send};
@@ -32,8 +33,11 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         Ok(_) => true,
         Err(_) => terminal_info.kitty_graphics,
     };
+    // Before starting a server that would have nobody to serve.
+    let (width, height) = terminal::size()
+        .context("couldn't get the terminal's size; tiri needs to run in a terminal")?;
+    let talking = || format!("couldn't talk to the tiri server at {}", socket.display());
     let mut stream = connect_or_start(socket)?;
-    let (width, height) = terminal::size()?;
     let cell_pixels = probed_cell_pixels(&terminal_info, width, height).or_else(size_cell_pixels);
     send(
         &mut stream,
@@ -46,9 +50,10 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
             colors: terminal_info.colors,
             cell_pixels,
         }),
-    )?;
+    )
+    .with_context(talking)?;
     let mut decoder = Decoder::default();
-    match recv(&mut stream, &mut decoder)? {
+    match recv(&mut stream, &mut decoder).with_context(talking)? {
         Some(ServerMsg::Attached) => {}
         Some(ServerMsg::Error(e)) => bail!(e),
         Some(other) => bail!("unexpected reply from the server: {other:?}"),
@@ -132,11 +137,15 @@ fn detect_terminal() -> TerminalInfo {
 fn relay(stream: &mut UnixStream, decoder: &mut Decoder, socket: &Path) -> Result<ExitReason> {
     let mut stdout = io::stdout().lock();
     loop {
-        let msg = recv(stream, decoder).with_context(|| {
-            format!(
+        let msg = recv(stream, decoder).map_err(|e| {
+            // A message that doesn't decode says what's wrong itself.
+            if !e.is::<io::Error>() {
+                return e;
+            }
+            e.context(format!(
                 "lost connection to the tiri server; its log may say why: {}",
                 socket::log_path(socket).display()
-            )
+            ))
         })?;
         match msg {
             Some(ServerMsg::Output(bytes)) => {
@@ -180,7 +189,10 @@ pub fn list(socket: &Path) -> Result<()> {
             Ok(())
         }
         Some(other) => bail!("unexpected reply from the server: {other:?}"),
-        None => bail!("the server closed the connection"),
+        None => bail!(
+            "the server closed the connection; its log may say why: {}",
+            socket::log_path(socket).display()
+        ),
     }
 }
 
@@ -213,6 +225,18 @@ fn connect(socket: &Path) -> Result<Option<UnixStream>> {
 
 /// Connects to the server, starting it first if none is running.
 fn connect_or_start(socket: &Path) -> Result<UnixStream> {
+    if let Some(stream) = connect(socket)? {
+        return Ok(stream);
+    }
+    // One client at a time decides there's no server and starts one, and
+    // holds the lock until its server answers. Otherwise two starting
+    // together could each clear away the other's server's socket.
+    let lock_path = socket::lock_path(socket);
+    let lock = std::fs::File::create(&lock_path)
+        .with_context(|| format!("couldn't create {}", lock_path.display()))?;
+    flock(&lock, FlockOperation::LockExclusive)
+        .with_context(|| format!("couldn't lock {}", lock_path.display()))?;
+    // Someone else may have started it while we waited for the lock.
     if let Some(stream) = connect(socket)? {
         return Ok(stream);
     }

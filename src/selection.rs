@@ -91,6 +91,10 @@ pub fn word_at<T>(term: &Term<T>, point: Point) -> (Point, Point) {
         let mut cell = &row[Column(usize::from(p.col))];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && p.col > 0 {
             cell = &row[Column(usize::from(p.col) - 1)];
+        } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && p.line < bottom {
+            // The gap left where a wide character didn't fit and wrapped
+            // belongs with that character, at the start of the next row.
+            cell = &term.grid()[Line(p.line + 1)][Column(0)];
         }
         match cell.c {
             c if c.is_whitespace() => Class::Blank,
@@ -170,7 +174,10 @@ pub fn text<T>(term: &Term<T>, start: Point, end: Point) -> String {
         let mut text = String::new();
         for col in from..=to {
             let cell = &row[Column(usize::from(col))];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            // Neither the right half of a wide character nor the gap one
+            // left by wrapping is text.
+            let spacers = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+            if cell.flags.intersects(spacers) {
                 continue;
             }
             // alacritty marks where a tab started with a literal tab.
@@ -218,6 +225,15 @@ mod tests {
         let term = term_with(10, 3, b"hello\r\nworld");
         assert_eq!(text(&term, at(0, 2), at(1, 2)), "llo\nwor");
         assert_eq!(text(&term, at(0, 0), at(0, 9)), "hello");
+    }
+
+    #[test]
+    fn a_wide_character_that_wrapped_leaves_no_gap() {
+        // 字 doesn't fit in the last column, so it starts the next row.
+        let term = term_with(5, 3, "abcd字x".as_bytes());
+        assert_eq!(text(&term, at(0, 0), at(1, 4)), "abcd字x");
+        let (start, end) = word_at(&term, at(0, 1));
+        assert_eq!(text(&term, start, end), "abcd字x");
     }
 
     #[test]

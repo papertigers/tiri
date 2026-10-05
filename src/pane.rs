@@ -26,6 +26,9 @@ use crate::input::MouseModes;
 /// output can't starve input or the others. The rest is read next time.
 const READ_BUDGET: usize = 256 * 1024;
 
+/// The most text a program may put on the clipboard with OSC 52.
+const MAX_COPY: usize = 1 << 20;
+
 /// Reported to apps that ask for the text area in pixels.
 const CELL_WIDTH: u16 = 8;
 const CELL_HEIGHT: u16 = 16;
@@ -79,20 +82,25 @@ impl Pane {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TIRI", "1");
         cmd.cwd(cwd);
-        // The shell portable-pty will pick: $SHELL, or the user's own.
-        let shell = cmd.get_shell();
-        let child = (pair.slave.spawn_command(cmd))
-            .with_context(|| format!("couldn't start {shell} in {}", cwd.display()))?;
-        // Drop our copy of the subsidiary side so reads see EOF when the child exits.
-        drop(pair.slave);
 
+        // Everything that can fail comes before the shell starts, so a
+        // failure never leaves one running with nobody to reap it.
         let fd = pair
             .master
             .as_raw_fd()
             .context("pty has no file descriptor")?;
         // SAFETY: `fd` belongs to `pair.master`, which is alive here.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        fcntl_setfl(borrowed, fcntl_getfl(borrowed)? | OFlags::NONBLOCK)?;
+        fcntl_getfl(borrowed)
+            .and_then(|flags| fcntl_setfl(borrowed, flags | OFlags::NONBLOCK))
+            .context("couldn't make the pane's pty non-blocking")?;
+
+        // The shell portable-pty will pick: $SHELL, or the user's own.
+        let shell = cmd.get_shell();
+        let child = (pair.slave.spawn_command(cmd))
+            .with_context(|| format!("couldn't start {shell} in {}", cwd.display()))?;
+        // Drop our copy of the subsidiary side so reads see EOF when the child exits.
+        drop(pair.slave);
 
         let fallback_title = std::env::var("SHELL")
             .ok()
@@ -303,7 +311,15 @@ impl Pane {
                 TermEvent::PtyWrite(text) => self.write(text.as_bytes()),
                 TermEvent::Title(title) => self.title = Some(title),
                 TermEvent::ResetTitle => self.title = None,
-                TermEvent::ClipboardStore(_, text) => self.copied.push(text),
+                TermEvent::ClipboardStore(_, text) if text.len() <= MAX_COPY => {
+                    self.copied.push(text);
+                }
+                TermEvent::ClipboardStore(_, text) => {
+                    log::warn!(
+                        "a pane tried to copy {} bytes; the most is {MAX_COPY}",
+                        text.len()
+                    );
+                }
                 TermEvent::ColorRequest(idx, reply) => {
                     // Colors the program set itself win; otherwise the
                     // real terminal's.

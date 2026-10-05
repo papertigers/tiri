@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ const BACKLOG_LIMIT: usize = 1 << 20;
 /// The most read from one connection per wakeup, so a client flooding the
 /// socket can't keep the server from everything else.
 const READ_BUDGET: usize = 256 * 1024;
+/// The most terminal output in one message, far below what the client
+/// refuses to take.
+const MAX_OUTPUT: usize = 1 << 20;
 /// A server started for a client that never attaches gives up after this.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// How long to stop accepting after accepting fails (say, out of file
@@ -50,7 +54,10 @@ struct Connection {
     client: Option<Client>,
     /// Close once `outgoing` has been sent.
     closing: bool,
-    /// The other end hung up, or the connection failed.
+    /// The other end has sent all it's going to. What it sent first is
+    /// still handled.
+    eof: bool,
+    /// The connection failed, or has been dealt with after `eof`.
     dead: bool,
     /// A frame was held back while this was behind, so it's owed one.
     owed_frame: bool,
@@ -65,6 +72,7 @@ impl Connection {
             outgoing: Vec::new(),
             client: None,
             closing: false,
+            eof: false,
             dead: false,
             owed_frame: false,
         }
@@ -77,6 +85,14 @@ impl Connection {
 
     fn send(&mut self, msg: &ServerMsg) {
         self.outgoing.extend(encode(msg));
+    }
+
+    /// Sends bytes for the client's terminal, in messages of a size the
+    /// client will take however much there is (a big clipboard copy, say).
+    fn send_output(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(MAX_OUTPUT) {
+            self.send(&ServerMsg::Output(chunk.to_vec()));
+        }
     }
 
     /// Sends as much queued output as the socket will take.
@@ -101,7 +117,7 @@ impl Connection {
         while budget > 0 {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
-                    self.dead = true;
+                    self.eof = true;
                     return;
                 }
                 Ok(n) => {
@@ -138,21 +154,37 @@ impl Connection {
     }
 }
 
+/// Runs the server until it has nothing left to serve. Whatever stops it
+/// early is in the log by the time this returns.
 pub fn run(socket: &Path) -> Result<()> {
     init_logging();
+    let result = listen(socket);
+    if let Err(e) = &result {
+        log::error!("stopping: {e:#}");
+    }
+    result
+}
+
+fn listen(socket: &Path) -> Result<()> {
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("couldn't listen on {}", socket.display()))?;
-    listener.set_nonblocking(true)?;
+    listener
+        .set_nonblocking(true)
+        .context("couldn't make the socket non-blocking")?;
     log::info!("listening on {}", socket.display());
+    // To tell this socket from one a later server puts at the same path.
+    let bound = std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
     let config_path = config::default_path();
     match &config_path {
         Some(path) => log::info!("config: {}", path.display()),
         None => log::warn!("no $HOME or $XDG_CONFIG_HOME, so no config file"),
     }
     let result = serve(&listener, config_path);
-    let _ = std::fs::remove_file(socket);
-    if let Err(e) = &result {
-        log::error!("stopping: {e:#}");
+    let current = std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
+    if let (Ok(bound), Ok(current)) = (bound, current)
+        && bound == current
+    {
+        let _ = std::fs::remove_file(socket);
     }
     result
 }
@@ -237,7 +269,8 @@ fn event_loop(
                 .context("couldn't watch the socket")?;
         }
         for (&key, connection) in connections.iter_mut() {
-            let interest = PollEvent::new(key, true, !connection.outgoing.is_empty());
+            // After end of input a socket stays readable, to no purpose.
+            let interest = PollEvent::new(key, !connection.eof, !connection.outgoing.is_empty());
             if let Err(e) = poller.modify(&connection.stream, interest) {
                 log::warn!("{}: couldn't watch it: {e}", connection.name());
                 connection.dead = true;
@@ -276,7 +309,9 @@ fn event_loop(
         }
 
         for connection in connections.values_mut() {
-            while !connection.dead {
+            // A connection that's been answered and is closing has had its
+            // say; anything more is dropped with it.
+            while !connection.dead && !connection.closing {
                 match connection.decoder.next::<ClientMsg>() {
                     Ok(Some(msg)) => handle(app, connection, msg, &mut kill),
                     Ok(None) => break,
@@ -286,6 +321,8 @@ fn event_loop(
                     }
                 }
             }
+            // Nothing more is coming. One still owed a reply gets it first.
+            connection.dead |= connection.eof && !connection.closing;
             if connection
                 .client
                 .as_ref()
@@ -294,7 +331,7 @@ fn event_loop(
                 let mut client = connection.client.take().expect("checked above");
                 app.detach(&mut client);
                 // Thumbnail cleanup, before the client leaves the screen.
-                connection.send(&ServerMsg::Output(client.take_escapes()));
+                connection.send_output(&client.take_escapes());
                 connection.send(&ServerMsg::Exit(ExitReason::Detached));
                 connection.closing = true;
             }
@@ -372,7 +409,7 @@ fn event_loop(
                 connection.dead = true;
                 continue;
             }
-            connection.send(&ServerMsg::Output(bytes));
+            connection.send_output(&bytes);
             connection.flush();
         }
 
@@ -499,7 +536,7 @@ fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connect
     for (_, mut connection) in connections {
         if let Some(mut client) = connection.client.take() {
             app.detach(&mut client);
-            connection.send(&ServerMsg::Output(client.take_escapes()));
+            connection.send_output(&client.take_escapes());
         }
         connection.send(&ServerMsg::Exit(ExitReason::ServerExited));
         let _ = poller.delete(&connection.stream);

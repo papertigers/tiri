@@ -70,7 +70,7 @@ impl Key {
     /// what this is: for writing several keys run together, as in "hjkl".
     fn bare_char(self) -> Option<char> {
         match self.code {
-            KeyCode::Char(c) if self.mods.is_empty() => Some(c),
+            KeyCode::Char(c) if self.mods.is_empty() && c != ' ' => Some(c),
             _ => None,
         }
     }
@@ -162,9 +162,10 @@ impl FromStr for Key {
     /// Parses keys like `h`, `Shift+h`, `Ctrl+a`, `Alt+Enter` or `F5`.
     fn from_str(s: &str) -> Result<Self, String> {
         // The key is after the last +, unless it's + itself.
-        let (mods_part, key) = match s.strip_suffix("++") {
-            Some(mods) => (Some(mods), "+"),
-            None => match s.rsplit_once('+') {
+        let (mods_part, key) = match (s, s.strip_suffix("++")) {
+            ("+", _) => (None, "+"),
+            (_, Some(mods)) => (Some(mods), "+"),
+            (_, None) => match s.rsplit_once('+') {
                 Some((mods, key)) => (Some(mods), key),
                 None => (None, s),
             },
@@ -191,7 +192,11 @@ impl FromStr for Key {
                     ));
                 }
                 let c = if mods.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
+                    let mut upper = c.to_uppercase();
+                    match (upper.next(), upper.next()) {
+                        (Some(upper), None) => upper,
+                        _ => return Err(format!("Shift+{c} isn't a single character")),
+                    }
                 } else {
                     c
                 };
@@ -455,6 +460,14 @@ mod tests {
             event(KeyCode::Char('+'), KeyModifiers::CONTROL)
         );
         assert_eq!(key("F5"), event(KeyCode::F(5), KeyModifiers::NONE));
+        assert_eq!(key("+"), event(KeyCode::Char('+'), KeyModifiers::SHIFT));
+        assert_eq!(key("+").to_string(), "+");
+        // Letters outside ASCII shift too.
+        assert_eq!(
+            key("Shift+é"),
+            event(KeyCode::Char('É'), KeyModifiers::SHIFT)
+        );
+        assert_ne!(key("Shift+é"), key("é"));
     }
 
     #[test]
@@ -490,6 +503,7 @@ mod tests {
         assert_eq!(hint_keys(&keys(&["PageUp", "PageDown"])), "PgUp/PgDn");
         assert_eq!(hint_keys(&keys(&["Alt+Enter"])), "Alt-⏎");
         assert_eq!(hint_keys(&keys(&["Ctrl+a", "n"])), "C-a/n");
+        assert_eq!(hint_keys(&keys(&["Space", "j", "k", "l"])), "Space/j/k/l");
     }
 
     #[test]

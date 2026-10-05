@@ -346,20 +346,19 @@ pub fn id_color(id: u32) -> Color {
 pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 1);
     let payload = BASE64.encode(compressed);
-    // q=2 keeps the terminal from replying; replies would arrive as input.
-    let control = format!(
-        "a=t,f=32,o=z,s={},v={},i={id},q=2",
-        image.width, image.height
-    );
-    let chunks: Vec<&[u8]> = payload.as_bytes().chunks(CHUNK).collect();
-    for (n, chunk) in chunks.iter().enumerate() {
-        let more = u8::from(n + 1 < chunks.len());
+    let control = format!("a=t,f=32,o=z,s={},v={},i={id},", image.width, image.height);
+    let chunks = payload.as_bytes().chunks(CHUNK);
+    let last = chunks.len().saturating_sub(1);
+    for (n, chunk) in chunks.enumerate() {
         out.extend_from_slice(b"\x1b_G");
         if n == 0 {
             out.extend_from_slice(control.as_bytes());
-            out.push(b',');
         }
-        out.extend_from_slice(format!("m={more};").as_bytes());
+        // q=2 keeps the terminal from replying; replies would arrive as
+        // input. It's on every chunk, since terminals differ on which
+        // chunk's they go by.
+        let more = u8::from(n < last);
+        out.extend_from_slice(format!("q=2,m={more};").as_bytes());
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
@@ -400,6 +399,25 @@ mod tests {
     }
 
     #[test]
+    fn every_chunk_of_a_big_upload_is_quiet() {
+        // Noise doesn't compress, so this takes several chunks.
+        let mut image = Image::new(64, 64);
+        let mut seed = 1u32;
+        for byte in &mut image.rgba {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (seed >> 24) as u8;
+        }
+        let mut out = Vec::new();
+        transmit(&mut out, 7, &image);
+        let text = String::from_utf8(out).unwrap();
+        let chunks: Vec<&str> = text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
+        assert!(chunks.len() > 2);
+        assert!(chunks.iter().all(|c| c.contains("q=2,m=")));
+        assert!(chunks[1].starts_with("\x1b_Gq=2,m=1;"));
+        assert!(chunks.last().unwrap().starts_with("\x1b_Gq=2,m=0;"));
+    }
+
+    #[test]
     fn transmit_chunks_the_payload_then_place_shows_it() {
         let image = Image::new(64, 64);
         let mut out = Vec::new();
@@ -409,6 +427,9 @@ mod tests {
         let commands: Vec<&str> = text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(commands[0].starts_with("\x1b_Ga=t,f=32,o=z,s=64,v=64,i=7,q=2,m="));
         assert!(commands[commands.len() - 2].contains("m=0;"));
+        // Every chunk of the upload asks for no reply.
+        let upload = &commands[..commands.len() - 1];
+        assert!(upload.iter().all(|c| c.contains("q=2,m=")), "{upload:?}");
         assert_eq!(
             commands[commands.len() - 1],
             "\x1b_Ga=p,U=1,i=7,p=1,c=10,r=5,q=2"

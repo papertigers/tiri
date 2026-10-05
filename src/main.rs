@@ -81,7 +81,13 @@ fn main() -> Result<()> {
         Command::New { name } => client::attach(&socket_path(cli.socket)?, Target::New(name)),
         Command::Ls => client::list(&socket_path(cli.socket)?),
         Command::KillServer => client::kill_server(&socket_path(cli.socket)?),
-        Command::Server => server::run(&socket_path(cli.socket)?),
+        Command::Server => {
+            // Its errors are in its log already, which is where stderr goes.
+            if server::run(&socket_path(cli.socket)?).is_err() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Config {
             command: ConfigCommand::Default,
         } => {

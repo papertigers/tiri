@@ -47,6 +47,12 @@ pub fn prepare_dir(socket: &Path, private: bool) -> Result<()> {
     Ok(())
 }
 
+/// The file clients lock while starting a server for `socket`, so only
+/// one does.
+pub fn lock_path(socket: &Path) -> PathBuf {
+    socket.with_extension("lock")
+}
+
 /// Where a server started for `socket` writes its errors.
 pub fn log_path(socket: &Path) -> PathBuf {
     socket.with_extension("log")

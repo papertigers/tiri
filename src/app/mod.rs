@@ -13,7 +13,6 @@ mod status;
 mod thumbnails;
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,7 +127,7 @@ impl App {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
                 Some(idx) => Some(idx),
-                None => bail!("no workspace named {name:?}"),
+                None => bail!("no workspace named {name:?}; `tiri ls` lists them"),
             },
             Target::New(name) => {
                 if self.workspaces.find(name).is_some() {
@@ -229,13 +228,14 @@ impl App {
         // Width isn't known until it's in the strip, so start narrow and fix it below.
         let mut pane = Pane::spawn(self.pane_rows(), 1, &client.cwd)?;
         pane.set_palette(client.palette);
-        // SAFETY: the pane is deleted from the poller in `pane_exited` or
+        // SAFETY: the pane is deleted from the poller in `close_pane` or
         // `shutdown`, before it's dropped and its PTY closed.
-        unsafe {
-            self.poller
-                .add(pane.fd().as_raw_fd(), PollEvent::readable(id.0 as usize))
+        let watched = unsafe { (self.poller).add(&pane.fd(), PollEvent::readable(id.0 as usize)) };
+        if let Err(e) = watched {
+            pane.kill();
+            self.exited.push(pane.into_child());
+            return Err(e).context("couldn't watch the new pane's pty");
         }
-        .context("failed to watch the new pane's pty")?;
         self.panes.insert(id, pane);
         self.workspaces.insert(client.id, id);
         self.resize_panes();
@@ -307,7 +307,7 @@ impl App {
             pane.flush();
         }
         if event.readable && !pane.read_ready() {
-            self.pane_exited(id);
+            self.close_pane(id);
         }
     }
 
@@ -343,9 +343,13 @@ impl App {
         }
     }
 
-    fn pane_exited(&mut self, id: PaneId) {
+    /// Takes pane `id` away: because its shell has gone, or to make it go.
+    pub(super) fn close_pane(&mut self, id: PaneId) {
         if let Some(pane) = self.panes.remove(&id) {
             let _ = self.poller.delete(pane.fd());
+            // If it's still running (it may only have closed its terminal),
+            // losing the terminal should end it.
+            pane.kill();
             self.exited.push(pane.into_child());
         }
         self.workspaces.remove(id);

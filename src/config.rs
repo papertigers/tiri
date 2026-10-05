@@ -226,14 +226,8 @@ impl<S: ErrorSpan> knus::Decode<S> for RawBind {
         let key = node
             .node_name
             .parse::<Key>()
-            .map_err(|e| DecodeError::conversion(&node.node_name, e))?;
-        for arg in &node.arguments {
-            ctx.emit_error(DecodeError::unexpected(
-                &arg.literal,
-                "argument",
-                "a binding takes no arguments; its action goes in braces",
-            ));
-        }
+            .map_err(|e| DecodeError::unexpected(&node.node_name, "key", e))?;
+        only_a_name(node, ctx, "a binding is a key and, in braces, its action");
         let children = node.children.as_ref().map_or(&[][..], |c| &c[..]);
         let [child] = children else {
             return Err(DecodeError::missing(
@@ -242,6 +236,14 @@ impl<S: ErrorSpan> knus::Decode<S> for RawBind {
             ));
         };
         if &**child.node_name == "unbind" {
+            only_a_name(child, ctx, "unbind takes nothing");
+            if let Some(children) = &child.children {
+                ctx.emit_error(DecodeError::unexpected(
+                    children,
+                    "block",
+                    "unbind takes nothing",
+                ));
+            }
             return Ok(RawBind { key, action: None });
         }
         let action = Action::decode_node(child, ctx)?;
@@ -249,6 +251,24 @@ impl<S: ErrorSpan> knus::Decode<S> for RawBind {
             key,
             action: Some(action),
         })
+    }
+}
+
+/// Reports anything on `node` besides its name and children: a type,
+/// arguments or properties.
+fn only_a_name<S: ErrorSpan>(node: &SpannedNode<S>, ctx: &mut Context<S>, message: &str) {
+    if let Some(type_name) = &node.type_name {
+        ctx.emit_error(DecodeError::unexpected(type_name, "type", message));
+    }
+    for argument in &node.arguments {
+        ctx.emit_error(DecodeError::unexpected(
+            &argument.literal,
+            "argument",
+            message,
+        ));
+    }
+    for name in node.properties.keys() {
+        ctx.emit_error(DecodeError::unexpected(name, "property", message));
     }
 }
 
@@ -296,11 +316,29 @@ impl RawConfig {
         if let Some(ConfigKey(prefix)) = self.prefix {
             bindings.prefix = prefix;
         }
-        self.prefix_binds
-            .apply_to(&mut bindings.prefix_binds, "prefix-binds")?;
-        self.binds.apply_to(&mut bindings.binds, "binds")?;
-        self.overview_binds
-            .apply_to(&mut bindings.overview_binds, "overview-binds")?;
+        let prefix = bindings.prefix;
+        for (binds, table, section) in [
+            (
+                self.prefix_binds,
+                &mut bindings.prefix_binds,
+                "prefix-binds",
+            ),
+            (self.binds, &mut bindings.binds, "binds"),
+            (
+                self.overview_binds,
+                &mut bindings.overview_binds,
+                "overview-binds",
+            ),
+        ] {
+            // The prefix key always starts a prefix binding (or, pressed
+            // twice, is typed), so it can't do anything else.
+            if (binds.binds.iter()).any(|bind| bind.key == prefix && bind.action.is_some()) {
+                return Err(format!("{section} binds {prefix}, which is the prefix key"));
+            }
+            binds.apply_to(table, section)?;
+            // A built-in binding it takes over goes quietly.
+            table.set(prefix, None);
+        }
 
         let mut defined: Vec<(String, Theme)> = Vec::new();
         for raw in self.themes {
@@ -460,7 +498,10 @@ fn no_type_name<S: ErrorSpan>(
 }
 
 fn parse_hex(s: &str) -> Option<Color> {
-    let hex = s.strip_prefix('#').filter(|h| h.len() == 6)?;
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let value = u32::from_str_radix(hex, 16).ok()?;
     Some(Color::Rgb(
         (value >> 16) as u8,
@@ -557,6 +598,39 @@ mod tests {
         assert!(no_action.contains("needs one action"), "{no_action}");
         let bad_prefix = err(r#"prefix "Ctrl+""#);
         assert!(bad_prefix.contains("no key given"), "{bad_prefix}");
+        // Nothing but a key and an action.
+        for extra in [
+            "binds { Alt+h foo=1 { detach; }; }",
+            "binds { (ty)Alt+h { detach; }; }",
+            "binds { Alt+h 1 { detach; }; }",
+            "binds { Alt+h { unbind 1; }; }",
+            "binds { Alt+h { unbind { detach; }; }; }",
+        ] {
+            assert!(parse(extra).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_prefix_key_does_nothing_else() {
+        // Taking a key the defaults bind takes it from them.
+        let b = parse(r#"prefix "Alt+o""#).unwrap().bindings;
+        assert_eq!(b.binds.get(key("Alt+o")), None);
+        // Binding it yourself is a mistake.
+        let err = parse("prefix \"Alt+o\"\nbinds { Alt+o { detach; }; }").unwrap_err();
+        assert_eq!(
+            err.summary,
+            "config.kdl: binds binds Alt+o, which is the prefix key"
+        );
+        // Unbinding it is fine, if unneeded.
+        assert!(parse("prefix \"Alt+o\"\nbinds { Alt+o { unbind; }; }").is_ok());
+    }
+
+    #[test]
+    fn colors_are_six_hex_digits() {
+        assert_eq!(parse_hex("#0a1B2c"), Some(Color::Rgb(0x0a, 0x1b, 0x2c)));
+        for bad in ["#+12345", "#12345", "#1234567", "123456", "#12345g"] {
+            assert_eq!(parse_hex(bad), None, "{bad}");
+        }
     }
 
     #[test]

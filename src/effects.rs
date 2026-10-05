@@ -178,27 +178,32 @@ impl Transition {
         let elapsed = self.last.map_or(Duration::ZERO, |last| now - last);
         self.last = Some(now);
         let area = Rect::new(0, 0, frame.width(), frame.height().saturating_sub(1));
+        if !self.coming_in
+            && (self.from.width(), self.from.height()) != (frame.width(), frame.height())
+        {
+            // The terminal changed size, so the old view no longer fits it.
+            // Skip to bringing the new one in.
+            self.coming_in = true;
+        }
         if !self.coming_in {
             self.out_elapsed += elapsed;
             // The old view, out of date though it is, still fills the screen.
-            if self.from.width() == frame.width() && self.from.height() == frame.height() {
-                let mut old = self.from.clone();
-                on_buffer(&mut old, palette, |buffer| {
-                    self.out.process(elapsed, buffer, area);
-                });
-                let status = frame.height().saturating_sub(1);
-                for x in 0..frame.width() {
-                    // Keep the new status bar.
-                    let (sym, wide, style) = frame.content(x, status);
-                    let sym = sym.to_owned();
-                    if wide {
-                        old.put_wide(i32::from(x), i32::from(status), &sym, style);
-                    } else if !sym.is_empty() {
-                        old.put(i32::from(x), i32::from(status), &sym, style);
-                    }
+            let mut old = self.from.clone();
+            on_buffer(&mut old, palette, |buffer| {
+                self.out.process(elapsed, buffer, area);
+            });
+            let status = frame.height().saturating_sub(1);
+            for x in 0..frame.width() {
+                // Keep the new status bar.
+                let (sym, wide, style) = frame.content(x, status);
+                let sym = sym.to_owned();
+                if wide {
+                    old.put_wide(i32::from(x), i32::from(status), &sym, style);
+                } else if !sym.is_empty() {
+                    old.put(i32::from(x), i32::from(status), &sym, style);
                 }
-                *frame = old;
             }
+            *frame = old;
             if !self.out.done() {
                 return true;
             }

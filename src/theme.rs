@@ -2,7 +2,7 @@
 //! the selection. Pane contents keep their programs' and the terminal's
 //! colors whatever the theme.
 //!
-//! A client picks one as it attaches, with `TIRI_THEME`.
+//! The config file picks one, or defines its own on top of one.
 
 use crate::render::Color;
 

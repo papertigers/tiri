@@ -86,8 +86,9 @@ pub struct WorkspaceInfo {
 /// Encodes `msg` with its length prefix, ready to write to a socket.
 pub fn encode(msg: &impl Serialize) -> Vec<u8> {
     let body = postcard::to_stdvec(msg).expect("protocol messages always serialize");
+    let len = u32::try_from(body.len()).expect("messages are far smaller than 4 GiB");
     let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&body);
     out
 }
@@ -121,7 +122,10 @@ impl Decoder {
         let Some(body) = buf.get(4..4 + len) else {
             return Ok(None);
         };
-        let msg = postcard::from_bytes(body).context("malformed message")?;
+        let msg = postcard::from_bytes(body).context(
+            "couldn't understand a message: are the tiri client and server different \
+             versions? `tiri kill-server` stops a server left from before an upgrade",
+        )?;
         self.start += 4 + len;
         Ok(Some(msg))
     }

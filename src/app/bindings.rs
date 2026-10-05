@@ -20,36 +20,32 @@ impl App {
         let bindings = &self.config.bindings;
         let is_prefix = key == bindings.prefix;
 
-        if std::mem::take(&mut client.prefix_pending) {
-            if is_prefix {
-                // Prefix twice sends it through to the pane.
-                if let Some(pane) = self.focused_pane_mut(client) {
-                    pane.write(&encode_key(event, pane.application_cursor()));
-                }
-            } else {
-                // Holding Ctrl through, as in C-a C-n, works too.
+        let after_prefix = std::mem::take(&mut client.prefix_pending);
+        let overview = self.workspaces.in_overview(client.id);
+        let action = match (after_prefix, is_prefix) {
+            // Prefix twice types it, like any key not bound; see below.
+            (true, true) => None,
+            // Holding Ctrl through, as in C-a C-n, works too.
+            (true, false) => {
                 let action = (bindings.prefix_binds.get(key))
                     .or_else(|| bindings.prefix_binds.get(key.without_ctrl()?));
-                if let Some(action) = action {
-                    self.run(client, action)?;
-                }
+                return action.map_or(Ok(()), |action| self.run(client, action));
             }
-            return Ok(());
-        }
-        if is_prefix {
-            client.prefix_pending = true;
-            return Ok(());
-        }
-        if self.workspaces.in_overview(client.id) {
-            // The overview takes the keyboard; nothing reaches the panes.
-            let action = (bindings.overview_binds.get(key)).or_else(|| bindings.binds.get(key));
-            if let Some(action) = action {
-                self.run(client, action)?;
+            (false, true) => {
+                client.prefix_pending = true;
+                return Ok(());
             }
-            return Ok(());
-        }
-        if let Some(action) = bindings.binds.get(key) {
+            (false, false) if overview => {
+                (bindings.overview_binds.get(key)).or_else(|| bindings.binds.get(key))
+            }
+            (false, false) => bindings.binds.get(key),
+        };
+        if let Some(action) = action {
             return self.run(client, action);
+        }
+        if overview {
+            // The overview takes the keyboard; nothing reaches the panes.
+            return Ok(());
         }
         client.selection = None;
         if let Some(id) = self.workspaces.focused(client.id) {
@@ -91,10 +87,7 @@ impl App {
             Action::CenterColumn => self.workspaces.active_mut(id).center_focused(),
             Action::ClosePane => {
                 if let Some(pane_id) = self.workspaces.focused(id) {
-                    if let Some(pane) = self.panes.get(&pane_id) {
-                        pane.kill();
-                    }
-                    self.pane_exited(pane_id);
+                    self.close_pane(pane_id);
                 }
             }
             Action::FocusWorkspaceDown => self.workspaces.focus_down(id),
