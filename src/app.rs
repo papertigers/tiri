@@ -3,7 +3,7 @@
 //! terminal's own state (its size, its drawing, and its view of the
 //! workspaces). Keybindings and drawing act on behalf of a client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -17,6 +17,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use polling::{Event as PollEvent, Poller};
+use portable_pty::Child;
 
 use crate::colors::Palette;
 use crate::effects::{Anchor, Effects, Transition};
@@ -33,6 +34,9 @@ use crate::workspace::{ClientId, Workspaces};
 /// The prefix key, tmux-style: Ctrl-a, then a command key.
 const PREFIX: char = 'a';
 const STATUS_HEIGHT: u16 = 1;
+/// The largest terminal a client may claim to have, in cells.
+const MAX_WIDTH: u16 = 1000;
+const MAX_HEIGHT: u16 = 500;
 /// The shortest a stacked pane's box may get, borders included. Columns
 /// refuse to consume more panes than fit at this height.
 const MIN_PANE_HEIGHT: i32 = 5;
@@ -47,6 +51,8 @@ const DIM_TEXT: Color = Color::Idx(242);
 const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
 /// Thumbnails of busy panes are redrawn at most this often.
 const THUMBNAIL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often to check on closed panes' children until they've exited.
+const REAP_INTERVAL: Duration = Duration::from_millis(100);
 /// Fading a thumbnail in uploads it this many times, at rising opacity.
 const OPACITY_STEPS: u8 = 4;
 
@@ -302,15 +308,15 @@ impl Client {
         }
     }
 
-    /// Frees the thumbnails of panes that have since closed.
-    fn forget_closed_thumbnails(&mut self, panes: &HashMap<PaneId, Pane>) {
+    /// Frees the thumbnails of panes for which `keep` is false.
+    fn retain_thumbnails(&mut self, keep: impl Fn(&PaneId) -> bool) {
         let escapes = &mut self.escapes;
         self.thumbnails.retain(|id, _| {
-            let open = panes.contains_key(id);
-            if !open {
+            let kept = keep(id);
+            if !kept {
                 kitty::delete(escapes, THUMBNAIL_ID_BASE + id.0);
             }
-            open
+            kept
         });
     }
 
@@ -379,6 +385,12 @@ impl Client {
     }
 }
 
+/// Bounds a client's claimed terminal size, so a bogus one can't make the
+/// server allocate enormous frames and terminals.
+fn clamp_size(width: u16, height: u16) -> (u16, u16) {
+    (width.clamp(1, MAX_WIDTH), height.clamp(1, MAX_HEIGHT))
+}
+
 /// What every client shares: the panes, the workspaces and their columns.
 pub struct App {
     workspaces: Workspaces,
@@ -391,6 +403,8 @@ pub struct App {
     /// recently used, recorded in `size_owner`.
     layout_size: (u16, u16),
     size_owner: Option<ClientId>,
+    /// Children of closed panes, kept until they've exited and been reaped.
+    exited: Vec<Box<dyn Child + Send + Sync>>,
     pub quit: bool,
 }
 
@@ -407,6 +421,7 @@ impl App {
             poller,
             layout_size,
             size_owner: None,
+            exited: Vec::new(),
             quit: false,
         }
     }
@@ -423,6 +438,7 @@ impl App {
             colors,
             cell_pixels,
         } = hello;
+        let (width, height) = clamp_size(width, height);
         let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
@@ -464,8 +480,11 @@ impl App {
             transition: None,
         };
         self.lay_out_for(&client);
-        if matches!(target, Target::New(_)) || self.panes.is_empty() {
-            self.open_column(&mut client)?;
+        if (matches!(target, Target::New(_)) || self.panes.is_empty())
+            && let Err(e) = self.open_column(&mut client)
+        {
+            self.detach(&mut client);
+            return Err(e);
         }
         Ok(client)
     }
@@ -603,8 +622,7 @@ impl App {
 
     /// A client's terminal changed size.
     pub fn resize(&mut self, client: &mut Client, width: u16, height: u16) {
-        client.width = width;
-        client.height = height;
+        (client.width, client.height) = clamp_size(width, height);
         client.renderer.invalidate();
         if self.size_owner == Some(client.id) || self.size_owner.is_none() {
             self.lay_out_for(client);
@@ -657,17 +675,30 @@ impl App {
     }
 
     fn pane_exited(&mut self, id: PaneId) {
-        if let Some(mut pane) = self.panes.remove(&id) {
+        if let Some(pane) = self.panes.remove(&id) {
             let _ = self.poller.delete(pane.fd());
-            pane.reap();
+            self.exited.push(pane.into_child());
         }
         self.workspaces.remove(id);
         // Whatever shared its column grows into the space.
         self.resize_panes();
     }
 
+    /// Collects the exit status of closed panes' children that have gone,
+    /// so they don't linger as zombies.
+    pub fn reap_exited(&mut self) {
+        self.exited
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+
+    /// When to look again for closed panes' children having exited, if any
+    /// haven't yet. Nothing else would wake the server when they do.
+    pub fn reap_deadline(&self) -> Option<Instant> {
+        (!self.exited.is_empty()).then(|| Instant::now() + REAP_INTERVAL)
+    }
+
     pub fn shutdown(&mut self) {
-        for pane in self.panes.values_mut() {
+        for pane in self.panes.values() {
             let _ = self.poller.delete(pane.fd());
             pane.kill();
         }
@@ -1153,7 +1184,7 @@ impl App {
             Action::Center => self.workspaces.active_mut(id).center_focused(),
             Action::Close => {
                 if let Some(pane_id) = self.workspaces.focused(id) {
-                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    if let Some(pane) = self.panes.get(&pane_id) {
                         pane.kill();
                     }
                     self.pane_exited(pane_id);
@@ -1186,21 +1217,26 @@ impl App {
             })
             .collect();
 
-        client.forget_closed_thumbnails(&self.panes);
         let thumbnails = self.showing_thumbnails(client);
         if thumbnails {
             let now = Instant::now();
             // Fully opaque unless the overview is fading in.
             let opacity = (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
+            let mut drawn = HashSet::new();
             for &(ws, idx) in &visible {
                 for (id, _, _, w, h) in self.pane_boxes(client, ws, idx) {
                     let size = Client::thumbnail_size(w, h);
                     client.refresh_thumbnail(&self.panes, id, size, opacity, now);
+                    drawn.insert(id);
                 }
             }
+            // Panes scrolled out of view would otherwise keep asking for
+            // redraws they never get.
+            client.retain_thumbnails(|id| drawn.contains(id));
         } else if let Some(transition) = &client.transition {
             // The overview fading out: its thumbnails fade with it.
             let opacity = transition.image_opacity();
+            client.retain_thumbnails(|id| self.panes.contains_key(id));
             client.fade_thumbnails(opacity);
         } else {
             client.clear_thumbnails();
@@ -1344,7 +1380,10 @@ impl App {
                 if focused && show_cursor && scrolled == 0 && pane.cursor_visible() {
                     let (r, c) = pane.cursor();
                     let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
-                    if (0..i32::from(client.width)).contains(&cx) && cy < y + h - 1 {
+                    if (0..i32::from(client.width)).contains(&cx)
+                        && (0..client.area_height()).contains(&cy)
+                        && cy < y + h - 1
+                    {
                         cursor = Some((cx as u16, cy as u16));
                     }
                 }

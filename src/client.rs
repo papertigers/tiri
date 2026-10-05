@@ -4,10 +4,12 @@
 //! sent.
 
 use std::io::{self, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,7 +41,7 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
             width,
             height,
             target,
-            cwd: std::env::current_dir()?,
+            cwd: std::env::current_dir().context("couldn't read the current directory")?,
             kitty_overview,
             colors: terminal_info.colors,
             cell_pixels,
@@ -56,11 +58,22 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         ),
     }
 
+    let (input_failed, input_error) = mpsc::channel();
     let reason = {
         let _guard = TerminalGuard::enter()?;
         let mut writer = stream.try_clone()?;
         thread::spawn(move || {
-            while let Ok(event) = event::read() {
+            loop {
+                let event = match event::read() {
+                    Ok(event) => event,
+                    Err(e) => {
+                        // Hang up, so the relay below stops too and the
+                        // terminal is put back before the error is shown.
+                        let _ = input_failed.send(e);
+                        let _ = writer.shutdown(Shutdown::Both);
+                        break;
+                    }
+                };
                 // A resize may come with new cell proportions, say from a
                 // font size change. Only send them when the terminal says:
                 // many, Ghostty among them, leave pixel sizes out, and the
@@ -76,9 +89,12 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
                 }
             }
         });
-        relay(&mut stream, &mut decoder)?
+        relay(&mut stream, &mut decoder, socket)
     };
-    match reason {
+    if let Ok(e) = input_error.try_recv() {
+        return Err(e).context("couldn't read input from the terminal");
+    }
+    match reason? {
         ExitReason::Detached => println!("[detached]"),
         ExitReason::ServerExited => println!("[tiri server exited]"),
     }
@@ -113,10 +129,16 @@ fn detect_terminal() -> TerminalInfo {
 }
 
 /// Writes the server's output to the terminal until it says goodbye.
-fn relay(stream: &mut UnixStream, decoder: &mut Decoder) -> Result<ExitReason> {
+fn relay(stream: &mut UnixStream, decoder: &mut Decoder, socket: &Path) -> Result<ExitReason> {
     let mut stdout = io::stdout().lock();
     loop {
-        match recv(stream, decoder)? {
+        let msg = recv(stream, decoder).with_context(|| {
+            format!(
+                "lost connection to the tiri server; its log may say why: {}",
+                socket::log_path(socket).display()
+            )
+        })?;
+        match msg {
             Some(ServerMsg::Output(bytes)) => {
                 stdout.write_all(&bytes)?;
                 stdout.flush()?;
@@ -222,11 +244,14 @@ fn connect_or_start(socket: &Path) -> Result<UnixStream> {
 /// forks again and exits, leaving the server a plain session member, which
 /// can never acquire a controlling terminal.
 fn start_server(socket: &Path) -> Result<()> {
+    let log_path = socket::log_path(socket);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(socket::log_path(socket))?;
-    let mut command = Command::new(std::env::current_exe()?);
+        .open(&log_path)
+        .with_context(|| format!("couldn't open the server log {}", log_path.display()))?;
+    let exe = std::env::current_exe().context("couldn't find the tiri executable")?;
+    let mut command = Command::new(exe);
     command
         .arg("--socket")
         .arg(socket)
@@ -235,7 +260,10 @@ fn start_server(socket: &Path) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(log);
     // SAFETY: setsid, fork and _exit are async-signal-safe, so fine
-    // between fork and exec.
+    // between fork and exec. Forking again there is only sound because this
+    // process is still single-threaded: no other thread can hold a lock
+    // (say, the allocator's) that the grandchild would inherit held. The
+    // input thread starts later, once attached.
     unsafe {
         command.pre_exec(|| {
             rustix::process::setsid()?;
@@ -251,7 +279,9 @@ fn start_server(socket: &Path) -> Result<()> {
     // Reap the session leader, which exits straight away. The server itself
     // is adopted by init, so nothing waits on it.
     let mut leader = command.spawn().context("couldn't start the tiri server")?;
-    leader.wait()?;
+    leader
+        .wait()
+        .context("couldn't wait for the tiri server to start")?;
     Ok(())
 }
 

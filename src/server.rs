@@ -27,12 +27,20 @@ const FRAME: Duration = Duration::from_millis(16);
 /// it catches up. Its next frame is then diffed against the last one it was
 /// sent, so it skips the states in between but never sees a broken screen.
 const BACKLOG_LIMIT: usize = 1 << 20;
+/// The most read from one connection per wakeup, so a client flooding the
+/// socket can't keep the server from everything else.
+const READ_BUDGET: usize = 256 * 1024;
 /// A server started for a client that never attaches gives up after this.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
+/// How long to stop accepting after accepting fails (say, out of file
+/// descriptors), rather than retrying in a tight loop.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// One connection to the socket: an attached client, or a one-off request
 /// such as `tiri ls`.
 struct Connection {
+    /// Its key with the poller, which also names it in the log.
+    key: usize,
     stream: UnixStream,
     decoder: Decoder,
     /// Encoded messages the socket hasn't accepted yet.
@@ -46,8 +54,9 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(stream: UnixStream) -> Self {
+    fn new(key: usize, stream: UnixStream) -> Self {
         Self {
+            key,
             stream,
             decoder: Decoder::default(),
             outgoing: Vec::new(),
@@ -55,6 +64,11 @@ impl Connection {
             closing: false,
             dead: false,
         }
+    }
+
+    /// How log lines refer to it.
+    fn name(&self) -> String {
+        format!("connection {}", self.key - CONNECTION_KEY_BASE)
     }
 
     fn send(&mut self, msg: &ServerMsg) {
@@ -70,32 +84,49 @@ impl Connection {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.dead = true;
-                    return;
-                }
+                Err(e) => return self.fail("writing", &e),
             }
         }
     }
 
-    /// Takes in whatever the client has sent.
+    /// Takes in what the client has sent, up to [`READ_BUDGET`]; the rest
+    /// waits for the next wakeup.
     fn read(&mut self) {
         let mut buf = [0u8; 64 * 1024];
-        loop {
+        let mut budget = READ_BUDGET;
+        while budget > 0 {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
                     self.dead = true;
                     return;
                 }
-                Ok(n) => self.decoder.push(&buf[..n]),
+                Ok(n) => {
+                    self.decoder.push(&buf[..n]);
+                    budget = budget.saturating_sub(n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.dead = true;
-                    return;
-                }
+                Err(e) => return self.fail("reading", &e),
             }
         }
+    }
+
+    /// Gives up on the connection after an I/O error, logging it unless it's
+    /// just the client going away.
+    fn fail(&mut self, doing: &str, e: &io::Error) {
+        if !matches!(
+            e.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        ) {
+            log::warn!("{}: {doing} failed: {e}", self.name());
+        }
+        self.dead = true;
+    }
+
+    /// Whether to wait on this client's deadlines. One that's closing or
+    /// behind won't be drawn for, so they'd only wake the server for nothing.
+    fn wants_frames(&self) -> bool {
+        !self.closing && self.outgoing.len() <= BACKLOG_LIMIT
     }
 
     fn finished(&self) -> bool {
@@ -104,31 +135,58 @@ impl Connection {
 }
 
 pub fn run(socket: &Path) -> Result<()> {
+    init_logging();
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("couldn't listen on {}", socket.display()))?;
     listener.set_nonblocking(true)?;
-    eprintln!(
-        "tiri server {} listening on {}",
-        std::process::id(),
-        socket.display()
-    );
+    log::info!("listening on {}", socket.display());
     let result = serve(&listener);
     let _ = std::fs::remove_file(socket);
+    if let Err(e) = &result {
+        log::error!("stopping: {e:#}");
+    }
     result
 }
 
+/// Logs to stderr, which is the log file beside the socket. Each line has
+/// the server's pid, since the file outlives many servers. `TIRI_LOG` sets
+/// the level, as `RUST_LOG` would (default `info`).
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::new().filter_or("TIRI_LOG", "info"))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} {:<5} tiri[{}] {}",
+                buf.timestamp_seconds(),
+                record.level(),
+                std::process::id(),
+                record.args()
+            )
+        })
+        .init();
+}
+
 fn serve(listener: &UnixListener) -> Result<()> {
-    let poller = Arc::new(Poller::new()?);
+    let poller = Arc::new(Poller::new().context("couldn't create a poller")?);
     // SAFETY: deleted from the poller before `serve` returns.
-    unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY))? };
-    let result = serve_with(listener, &poller);
+    unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY)) }
+        .context("couldn't watch the socket")?;
+    let mut app = App::new(&[], Arc::clone(&poller));
+    let mut connections = HashMap::new();
+    let result = event_loop(listener, &poller, &mut app, &mut connections);
+    // However the loop ended, panes are killed and clients told.
+    shut_down(&mut app, &poller, std::mem::take(&mut connections));
     let _ = poller.delete(listener);
     result
 }
 
-fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
-    let mut app = App::new(&[], Arc::clone(poller));
-    let mut connections: HashMap<usize, Connection> = HashMap::new();
+/// Runs until the server should stop: asked to, or out of panes.
+fn event_loop(
+    listener: &UnixListener,
+    poller: &Poller,
+    app: &mut App,
+    connections: &mut HashMap<usize, Connection>,
+) -> Result<()> {
     let mut next_connection = CONNECTION_KEY_BASE;
     let mut events = Events::new();
     let started = Instant::now();
@@ -136,17 +194,25 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
     let mut kill = false;
     let mut animating = false;
     let mut last_tick = Instant::now();
+    let mut accept_paused_until: Option<Instant> = None;
 
     loop {
+        if accept_paused_until.is_some_and(|until| Instant::now() >= until) {
+            accept_paused_until = None;
+        }
+
         // Wake for the next animation frame, a pane or thumbnail deadline,
-        // or giving up on a first client that never came; otherwise only
-        // for I/O.
+        // accepting again, reaping closed panes, or giving up on a first
+        // client that never came; otherwise only for I/O.
         let client_deadlines = (connections.values())
+            .filter(|c| c.wants_frames())
             .filter_map(|c| c.client.as_ref())
             .filter_map(|client| app.next_deadline(client));
         let deadline = [
             animating.then(|| Instant::now() + FRAME),
             (!had_panes).then_some(started + STARTUP_GRACE),
+            accept_paused_until,
+            app.reap_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -155,10 +221,17 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
 
         // `polling` reports each source once per arming, so re-arm them all.
         app.arm_panes();
-        poller.modify(listener, PollEvent::readable(LISTENER_KEY))?;
-        for (&key, connection) in &connections {
+        if accept_paused_until.is_none() {
+            poller
+                .modify(listener, PollEvent::readable(LISTENER_KEY))
+                .context("couldn't watch the socket")?;
+        }
+        for (&key, connection) in connections.iter_mut() {
             let interest = PollEvent::new(key, true, !connection.outgoing.is_empty());
-            let _ = poller.modify(&connection.stream, interest);
+            if let Err(e) = poller.modify(&connection.stream, interest) {
+                log::warn!("{}: couldn't watch it: {e}", connection.name());
+                connection.dead = true;
+            }
         }
         events.clear();
         match poller.wait(
@@ -167,12 +240,17 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
         ) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).context("couldn't wait for events"),
         }
 
         for event in events.iter() {
             match event.key {
-                LISTENER_KEY => accept(listener, poller, &mut connections, &mut next_connection),
+                LISTENER_KEY => {
+                    if let Err(e) = accept(listener, poller, connections, &mut next_connection) {
+                        log::warn!("couldn't accept a connection: {e}");
+                        accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                    }
+                }
                 key if key >= CONNECTION_KEY_BASE => {
                     if let Some(connection) = connections.get_mut(&key) {
                         if event.writable {
@@ -188,14 +266,13 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
         }
 
         for connection in connections.values_mut() {
-            loop {
+            while !connection.dead {
                 match connection.decoder.next::<ClientMsg>() {
-                    Ok(Some(msg)) => handle(&mut app, connection, msg, &mut kill),
+                    Ok(Some(msg)) => handle(app, connection, msg, &mut kill),
                     Ok(None) => break,
                     Err(e) => {
-                        eprintln!("tiri server: dropping a client: {e:#}");
+                        log::warn!("{}: dropping it: {e:#}", connection.name());
                         connection.dead = true;
-                        break;
                     }
                 }
             }
@@ -219,11 +296,11 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
                 client.copy(&text);
             }
         }
+        app.reap_exited();
 
         had_panes |= !app.is_empty();
         let abandoned = !had_panes && connections.is_empty() && started.elapsed() > STARTUP_GRACE;
         if kill || app.quit || (had_panes && app.is_empty()) || abandoned {
-            shut_down(&mut app, poller, connections);
             return Ok(());
         }
 
@@ -239,7 +316,7 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
         animating = app.tick(dt.max(Duration::from_millis(1)));
 
         for connection in connections.values_mut() {
-            if connection.closing || connection.outgoing.len() > BACKLOG_LIMIT {
+            if !connection.wants_frames() || connection.dead {
                 continue;
             }
             let Some(client) = connection.client.as_mut() else {
@@ -249,7 +326,11 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
             // Running effects need further frames, as animations do.
             animating |= client.effects_running();
             let mut bytes = Vec::new();
-            client.render(&mut bytes, frame, cursor)?;
+            if let Err(e) = client.render(&mut bytes, frame, cursor) {
+                log::error!("{}: couldn't render: {e}", connection.name());
+                connection.dead = true;
+                continue;
+            }
             connection.send(&ServerMsg::Output(bytes));
             connection.flush();
         }
@@ -267,36 +348,36 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
     }
 }
 
-/// Accepts every pending connection.
+/// Accepts every pending connection. An error means accepting is failing
+/// for now, rather than for one connection.
 fn accept(
     listener: &UnixListener,
     poller: &Poller,
     connections: &mut HashMap<usize, Connection>,
     next_connection: &mut usize,
-) {
+) -> io::Result<()> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(e) = stream.set_nonblocking(true) {
-                    eprintln!("tiri server: couldn't accept a client: {e}");
-                    continue;
-                }
                 let key = *next_connection;
                 *next_connection += 1;
-                // SAFETY: deleted from the poller when the connection is
-                // dropped from `connections`, or at shutdown.
-                if let Err(e) = unsafe { poller.add(&stream, PollEvent::readable(key)) } {
-                    eprintln!("tiri server: couldn't watch a client: {e}");
+                let connection = Connection::new(key, stream);
+                if let Err(e) = connection.stream.set_nonblocking(true) {
+                    log::warn!("{}: couldn't make it non-blocking: {e}", connection.name());
                     continue;
                 }
-                connections.insert(key, Connection::new(stream));
+                // SAFETY: deleted from the poller when the connection is
+                // dropped from `connections`, or at shutdown.
+                if let Err(e) = unsafe { poller.add(&connection.stream, PollEvent::readable(key)) }
+                {
+                    log::warn!("{}: couldn't watch it: {e}", connection.name());
+                    continue;
+                }
+                connections.insert(key, connection);
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                eprintln!("tiri server: accept failed: {e}");
-                return;
-            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -304,9 +385,10 @@ fn accept(
 fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut bool) {
     match msg {
         ClientMsg::Hello(hello) if connection.client.is_none() => {
-            eprintln!(
-                "tiri server: client attaching: {}x{} cells, cell pixels {:?}, \
+            log::info!(
+                "{}: attaching: {}x{} cells, cell pixels {:?}, \
                  kitty overview {}, foreground {:?}, background {:?}",
+                connection.name(),
                 hello.width,
                 hello.height,
                 hello.cell_pixels,
@@ -320,6 +402,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                     connection.client = Some(client);
                 }
                 Err(e) => {
+                    log::warn!("{}: couldn't attach: {e:#}", connection.name());
                     connection.send(&ServerMsg::Error(format!("{e:#}")));
                     connection.closing = true;
                 }
@@ -347,7 +430,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 _ => Ok(()),
             };
             if let Err(e) = result {
-                eprintln!("tiri server: {e:#}");
+                log::error!("{}: {e:#}", connection.name());
             }
         }
         ClientMsg::CellPixels(cell_pixels) => {

@@ -19,3 +19,5 @@ rustix = { version = "1", features = ["event", "fs", "process", "termios"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
 ratatui-core = "0.1.2"
+log = "0.4.34"
+env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }

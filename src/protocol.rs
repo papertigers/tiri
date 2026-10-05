@@ -96,27 +96,33 @@ pub fn encode(msg: &impl Serialize) -> Vec<u8> {
 #[derive(Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    /// Where the next message starts in `buf`; what's before it has been
+    /// decoded, and is dropped on the next push rather than per message.
+    start: usize,
 }
 
 impl Decoder {
     pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.drain(..self.start);
+        self.start = 0;
         self.buf.extend_from_slice(bytes);
     }
 
     /// The next complete message, if one has fully arrived.
     pub fn next<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
-        let Some(header) = self.buf.get(..4) else {
+        let buf = &self.buf[self.start..];
+        let Some(header) = buf.get(..4) else {
             return Ok(None);
         };
         let len = u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
         if len > MAX_MESSAGE {
             bail!("message of {len} bytes is too big");
         }
-        let Some(body) = self.buf.get(4..4 + len) else {
+        let Some(body) = buf.get(4..4 + len) else {
             return Ok(None);
         };
         let msg = postcard::from_bytes(body).context("malformed message")?;
-        self.buf.drain(..4 + len);
+        self.start += 4 + len;
         Ok(Some(msg))
     }
 }

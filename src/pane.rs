@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process};
 
 use crate::colors::Palette;
 use crate::input::MouseModes;
@@ -63,10 +64,10 @@ impl Pane {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TIRI", "1");
         cmd.cwd(cwd);
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("failed to spawn shell")?;
+        let child = pair.slave.spawn_command(cmd).with_context(|| {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "a shell".to_owned());
+            format!("couldn't start {shell} in {}", cwd.display())
+        })?;
         // Drop our copy of the subsidiary side so reads see EOF when the child exits.
         drop(pair.slave);
 
@@ -305,16 +306,26 @@ impl Pane {
         }
         self.generation += 1;
         self.term.resize(Size { rows, cols });
-        let _ = self.master.resize(pty_size(rows, cols));
+        if let Err(e) = self.master.resize(pty_size(rows, cols)) {
+            log::warn!("couldn't resize a pane to {cols}x{rows}: {e:#}");
+        }
     }
 
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
+    /// Hangs up on the child, as closing a terminal window would. Doesn't
+    /// wait for it to go: see [`Self::into_child`].
+    pub fn kill(&self) {
+        let pid = self
+            .child
+            .process_id()
+            .and_then(|pid| Pid::from_raw(pid as i32));
+        if let Some(pid) = pid {
+            let _ = kill_process(pid, Signal::HUP);
+        }
     }
 
-    /// Collects the child's exit status so it doesn't linger as a zombie.
-    pub fn reap(&mut self) {
-        let _ = self.child.try_wait();
+    /// The child process, to be reaped once it has exited.
+    pub fn into_child(self) -> Box<dyn Child + Send + Sync> {
+        self.child
     }
 }
 

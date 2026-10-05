@@ -23,8 +23,17 @@ pub const DEFAULT_CELL: CellSize = (8, 16);
 /// least 8 pixels across for the font. The terminal fits an image into its
 /// placement without stretching it, so any difference in shape leaves a gap
 /// that visibly closes when the overview hands back to live text.
+///
+/// Shapes that only reduce to something large (say 250×509) are rounded to
+/// 8 pixels across instead, and sizes no font has are ignored.
 pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
-    let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) else {
+    let plausible = |&(w, h): &(u16, u16)| {
+        (1..=MAX_CELL_PIXELS).contains(&w)
+            && (1..=MAX_CELL_PIXELS).contains(&h)
+            && h >= w / 2
+            && h <= w * 4
+    };
+    let Some((w, h)) = cell_pixels.filter(plausible) else {
         return DEFAULT_CELL;
     };
     let gcd = |mut a: usize, mut b: usize| {
@@ -36,9 +45,17 @@ pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
     let (w, h) = (usize::from(w), usize::from(h));
     let g = gcd(w, h);
     let (w, h) = (w / g, h / g);
+    if w > MAX_EXACT_WIDTH {
+        return (8, (8 * h + w / 2) / w);
+    }
     let scale = 8usize.div_ceil(w);
     (w * scale, h * scale)
 }
+
+/// Larger than any real font's cell.
+const MAX_CELL_PIXELS: u16 = 256;
+/// The widest thumbnail cell kept at exactly the terminal's shape.
+const MAX_EXACT_WIDTH: usize = 32;
 
 /// Opacity of the smudge drawn for characters the font doesn't have.
 const UNKNOWN_GLYPH_ALPHA: u8 = 0x90;
@@ -266,6 +283,10 @@ mod tests {
         assert_eq!(cell_size_for(Some((17, 41))), (17, 41));
         assert_eq!(cell_size_for(Some((6, 13))), (12, 26));
         assert_eq!(cell_size_for(Some((0, 20))), (8, 16));
+        // Shapes too fine to keep exactly, and sizes no font has.
+        assert_eq!(cell_size_for(Some((250, 509))), (8, 16));
+        assert_eq!(cell_size_for(Some((255, 1))), (8, 16));
+        assert_eq!(cell_size_for(Some((1000, 2000))), (8, 16));
         let image = rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20));
         assert_eq!((image.width, image.height), (27, 40));
     }
