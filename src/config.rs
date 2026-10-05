@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use knus::ast::{Literal, SpannedNode, TypeName};
@@ -36,16 +37,17 @@ impl Default for Config {
     /// What tiri does without a config: [`DEFAULT`], which is also where the
     /// built-in key bindings are written down.
     fn default() -> Self {
-        let raw = decode("default-config.kdl", DEFAULT).expect("the default config parses");
-        let empty = Bindings {
-            prefix: "Ctrl+a".parse().expect("a key"),
-            prefix_binds: Table::default(),
-            binds: Table::default(),
-            overview_binds: Table::default(),
-        };
-        raw.resolve(empty).expect("the default config is valid")
+        BUILT_IN.clone()
     }
 }
+
+/// [`DEFAULT`], parsed once. A test checks that it parses.
+static BUILT_IN: LazyLock<Config> = LazyLock::new(|| {
+    decode("default-config.kdl", DEFAULT)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| raw.resolve(None))
+        .expect("the default config is valid")
+});
 
 impl Config {
     /// Reads the config at `path`; defaults if there's no file.
@@ -63,7 +65,7 @@ impl Config {
     /// add to and override the built-in ones.
     pub fn parse(file: &str, text: &str) -> Result<Config, ConfigError> {
         decode(file, text)?
-            .resolve(Config::default().bindings)
+            .resolve(Some(Config::default().bindings))
             .map_err(|problem| ConfigError::plain(file, problem))
     }
 }
@@ -312,10 +314,20 @@ struct RawTheme {
 
 impl RawConfig {
     /// Looks names up, and lays this config's bindings over `bindings`.
-    fn resolve(self, mut bindings: Bindings) -> Result<Config, String> {
-        if let Some(ConfigKey(prefix)) = self.prefix {
-            bindings.prefix = prefix;
-        }
+    /// Looks names up, and lays this config's bindings over `base`: the
+    /// built-in ones, or nothing for the config that defines those.
+    fn resolve(self, base: Option<Bindings>) -> Result<Config, String> {
+        let mut bindings = match (base, self.prefix) {
+            (Some(base), None) => base,
+            (Some(base), Some(ConfigKey(prefix))) => Bindings { prefix, ..base },
+            (None, Some(ConfigKey(prefix))) => Bindings {
+                prefix,
+                prefix_binds: Table::default(),
+                binds: Table::default(),
+                overview_binds: Table::default(),
+            },
+            (None, None) => return Err("no prefix is set".to_owned()),
+        };
         let prefix = bindings.prefix;
         for (binds, table, section) in [
             (

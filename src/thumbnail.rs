@@ -253,25 +253,24 @@ fn glyph(c: char) -> Option<[u8; 8]> {
 /// The RGB for a cell color, or None for the default background. Colors
 /// the program set itself (OSC 4/10/11) win over the palette.
 fn resolve(color: TermColor, colors: &Colors, palette: &Palette) -> Option<Rgb> {
-    let idx = match color {
+    // Where the program's own setting for it would be, and the palette's.
+    let (idx, from_palette) = match color {
         TermColor::Spec(c) => return Some([c.r, c.g, c.b]),
-        TermColor::Indexed(i) => usize::from(i),
-        TermColor::Named(n) => n as usize,
-    };
-    if let Some(c) = colors[idx] {
-        return Some([c.r, c.g, c.b]);
-    }
-    match color {
-        TermColor::Named(NamedColor::Background) => None,
-        TermColor::Named(n) if (n as usize) < 16 => Some(palette.indexed(n as u8)),
-        TermColor::Named(n) if (NamedColor::DimBlack..=NamedColor::DimWhite).contains(&n) => {
-            let base = (n as usize - NamedColor::DimBlack as usize) as u8;
-            Some(palette.indexed(base).map(|c| c / 2))
+        TermColor::Indexed(i) => (usize::from(i), Some(palette.indexed(i))),
+        TermColor::Named(n) => {
+            let from_palette = match n {
+                NamedColor::Background => None,
+                n if (n as usize) < 16 => Some(palette.indexed(n as u8)),
+                n if (NamedColor::DimBlack..=NamedColor::DimWhite).contains(&n) => {
+                    let base = (n as usize - NamedColor::DimBlack as usize) as u8;
+                    Some(palette.indexed(base).map(|c| c / 2))
+                }
+                _ => Some(palette.foreground),
+            };
+            (n as usize, from_palette)
         }
-        TermColor::Named(_) => Some(palette.foreground),
-        TermColor::Indexed(i) => Some(palette.indexed(i)),
-        TermColor::Spec(_) => unreachable!(),
-    }
+    };
+    colors[idx].map(|c| [c.r, c.g, c.b]).or(from_palette)
 }
 
 #[cfg(test)]

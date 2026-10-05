@@ -10,7 +10,7 @@ use crate::layout::PaneId;
 use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
 
-use super::client_state::Drag;
+use super::client_state::{Click, Drag};
 use super::screen::content_top;
 use super::status::StatusTarget;
 use super::{App, Client};
@@ -217,14 +217,21 @@ impl App {
                 // in a row starts over.
                 let now = Instant::now();
                 let clicks = inner.map_or(1, |(_, _, point)| match client.last_click {
-                    Some((at, pane, last, n))
-                        if pane == id && last == point && now - at < MULTI_CLICK =>
+                    Some(last)
+                        if last.pane == id
+                            && last.point == point
+                            && now - last.at < MULTI_CLICK =>
                     {
-                        n % 3 + 1
+                        last.count % 3 + 1
                     }
                     _ => 1,
                 });
-                client.last_click = inner.map(|(_, _, point)| (now, id, point, clicks));
+                client.last_click = inner.map(|(_, _, point)| Click {
+                    at: now,
+                    pane: id,
+                    point,
+                    count: clicks,
+                });
 
                 // A click that focuses a pane isn't passed to its program.
                 let Some((col, row, point)) = inner.filter(|_| focused || clicks > 1) else {
@@ -266,16 +273,20 @@ impl App {
                 }
             }
             Drag::Selecting { pane: id, .. } => {
-                // Dragging above or below the pane scrolls it along.
-                if let Some((_, _, _, past)) = self.clamped_point(client, id, x, y)
-                    && past != 0
+                let Some((_, _, mut point, past)) = self.clamped_point(client, id, x, y) else {
+                    return;
+                };
+                // Dragging above or below the pane scrolls it along, which
+                // puts other text under the mouse.
+                if past != 0
                     && let Some(pane) = self.panes.get(&id)
                 {
                     client.scroll(id, pane, -past);
+                    if let Some((_, _, scrolled_to, _)) = self.clamped_point(client, id, x, y) {
+                        point = scrolled_to;
+                    }
                 }
-                if let Some((_, _, point, _)) = self.clamped_point(client, id, x, y)
-                    && let Some(selection) = client.selection.as_mut()
-                {
+                if let Some(selection) = client.selection.as_mut() {
                     selection.head = point;
                 }
             }

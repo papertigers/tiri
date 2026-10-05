@@ -3,6 +3,7 @@
 
 use std::io::{self, Write};
 
+use compact_str::CompactString;
 use crossterm::{QueueableCommand, cursor, style, terminal};
 use unicode_width::UnicodeWidthChar;
 
@@ -39,7 +40,9 @@ impl Style {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cell {
     /// Empty when this cell is covered by the wide character to its left.
-    sym: String,
+    /// Nearly always one character, which is kept inline: a frame is tens
+    /// of thousands of cells, rebuilt for every draw.
+    sym: CompactString,
     wide: bool,
     style: Style,
 }
@@ -47,7 +50,7 @@ struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            sym: " ".to_owned(),
+            sym: CompactString::const_new(" "),
             wide: false,
             style: Style::default(),
         }
@@ -89,7 +92,7 @@ impl Frame {
         if let Some(i) = self.index(x, y) {
             self.split_wide(i);
             self.cells[i] = Cell {
-                sym: printable(sym).to_owned(),
+                sym: printable(sym).into(),
                 wide: false,
                 style,
             };
@@ -125,12 +128,12 @@ impl Frame {
             self.split_wide(i);
             self.split_wide(i + 1);
             self.cells[i] = Cell {
-                sym: printable(sym).to_owned(),
+                sym: printable(sym).into(),
                 wide: true,
                 style,
             };
             self.cells[i + 1] = Cell {
-                sym: String::new(),
+                sym: CompactString::default(),
                 wide: false,
                 style,
             };
@@ -216,7 +219,8 @@ pub fn fit_width(s: &str, max: usize) -> &str {
 /// renderer's back. Emulators can leave them in cells: alacritty marks where
 /// a tab started with a literal `\t`.
 fn printable(sym: &str) -> &str {
-    if sym.chars().any(char::is_control) {
+    // Nor may a cell be empty: that marks the covered half of a wide one.
+    if sym.is_empty() || sym.chars().any(char::is_control) {
         " "
     } else {
         sym
@@ -453,7 +457,7 @@ mod tests {
                 }
             }
 
-            let expected: Vec<String> = frame.cells.iter().map(|c| c.sym.clone()).collect();
+            let expected: Vec<String> = (frame.cells.iter()).map(|c| c.sym.to_string()).collect();
             let mut out = Vec::new();
             renderer.draw(&mut out, &[], frame, None).unwrap();
             parser.advance(&mut term, &out);

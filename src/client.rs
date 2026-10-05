@@ -9,6 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -286,12 +287,17 @@ fn start_server(socket: &Path) -> Result<()> {
         .arg("server")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log);
-    // SAFETY: setsid, fork and _exit are async-signal-safe, so fine
-    // between fork and exec. Forking again there is only sound because this
-    // process is still single-threaded: no other thread can hold a lock
-    // (say, the allocator's) that the grandchild would inherit held. The
-    // input thread starts later, once attached.
+        .stderr(log)
+        // Not wherever this client happens to be: the server would keep
+        // that directory busy for as long as it runs. Panes are told where
+        // to start by the client that opens them.
+        .current_dir("/");
+    // SAFETY: the closure runs between fork and exec, where only
+    // async-signal-safe calls are allowed: another thread may have held a
+    // lock (the allocator's, say) at the fork, and here it's held forever.
+    // setsid, fork and _exit are such calls, and nothing in the closure
+    // allocates or locks, error paths included: both make an io::Error from
+    // an errno, which is a plain number.
     unsafe {
         command.pre_exec(|| {
             rustix::process::setsid()?;
@@ -320,22 +326,35 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
+        // From here, dropping the guard puts the terminal back, whichever
+        // of the steps below fails.
+        let guard = Self;
+        TERMINAL_TAKEN.store(true, Ordering::Relaxed);
         let mut out = io::stdout();
         out.execute(terminal::EnterAlternateScreen)?;
         out.execute(event::EnableBracketedPaste)?;
         out.execute(event::EnableMouseCapture)?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore();
+            // So the message lands on a usable screen. Not once the guard
+            // has put the terminal back already.
+            if TERMINAL_TAKEN.swap(false, Ordering::Relaxed) {
+                restore();
+            }
             hook(info);
         }));
-        Ok(Self)
+        Ok(guard)
     }
 }
 
+/// Whether a [`TerminalGuard`] has the terminal in raw mode.
+static TERMINAL_TAKEN: AtomicBool = AtomicBool::new(false);
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore();
+        if TERMINAL_TAKEN.swap(false, Ordering::Relaxed) {
+            restore();
+        }
     }
 }
 

@@ -183,17 +183,14 @@ impl App {
 
     /// Every workspace, for `tiri ls`.
     pub fn workspace_infos(&self) -> Vec<WorkspaceInfo> {
-        (0..self.workspaces.list().len())
-            .map(|ws| {
-                let workspace = &self.workspaces.list()[ws];
-                WorkspaceInfo {
-                    name: workspace.name().map(str::to_owned),
-                    label: self.workspace_label(ws),
-                    panes: (workspace.strip().columns().iter())
-                        .map(|c| c.panes().len())
-                        .sum(),
-                    clients: self.workspaces.clients_on(ws),
-                }
+        (self.workspaces.list().iter().enumerate())
+            .map(|(ws, workspace)| WorkspaceInfo {
+                name: workspace.name().map(str::to_owned),
+                label: self.workspace_label(ws),
+                panes: (workspace.strip().columns().iter())
+                    .map(|c| c.panes().len())
+                    .sum(),
+                clients: self.workspaces.clients_on(ws),
             })
             .collect()
     }

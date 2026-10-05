@@ -49,15 +49,24 @@ pub struct Client {
     pub(super) selection: Option<Selection>,
     /// What the left button is doing while held.
     pub(super) drag: Drag,
-    /// When and where the last left press in a pane was, and how many
-    /// presses in a row it made, to spot double and triple clicks.
-    pub(super) last_click: Option<(Instant, PaneId, Point, u8)>,
+    /// The last left press in a pane, to spot double and triple clicks.
+    pub(super) last_click: Option<Click>,
     /// Visual effects running on this client's screen.
     pub(super) effects: Effects,
     /// The overview fading in or out, if it is.
     pub(super) transition: Option<Transition>,
     /// Something to tell the user, shown in the status bar for a while.
     pub(super) notice: Option<Notice>,
+}
+
+/// A left press in a pane.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Click {
+    pub(super) at: Instant,
+    pub(super) pane: PaneId,
+    pub(super) point: Point,
+    /// How many presses in a row this made, at the same place.
+    pub(super) count: u8,
 }
 
 /// A message for the status bar, in place of the key hints.

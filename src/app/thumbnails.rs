@@ -144,7 +144,8 @@ impl Client {
 
     /// The inner size of a pane's box in cells, as a thumbnail placement.
     pub(super) fn thumbnail_size(w: i32, h: i32) -> (u16, u16) {
-        let clamp = |n: i32| (n.max(1) as u16).min(kitty::MAX_CELLS);
+        let clamp =
+            |n: i32| u16::try_from(n.max(1)).map_or(kitty::MAX_CELLS, |n| n.min(kitty::MAX_CELLS));
         (clamp(w - 2), clamp(h - 2))
     }
 }

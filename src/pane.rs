@@ -391,7 +391,7 @@ impl Pane {
         let pid = self
             .child
             .process_id()
-            .and_then(|pid| Pid::from_raw(pid as i32));
+            .and_then(|pid| Pid::from_raw(i32::try_from(pid).ok()?));
         if let Some(pid) = pid {
             let _ = kill_process(pid, Signal::HUP);
         }

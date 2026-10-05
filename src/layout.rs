@@ -211,14 +211,7 @@ impl Strip {
 
     /// Opens a new column to the right of the focused one and focuses it.
     pub fn insert(&mut self, pane: PaneId) {
-        let idx = if self.columns.is_empty() {
-            0
-        } else {
-            self.focus + 1
-        };
-        self.columns.insert(idx, Column::new(pane));
-        self.focus = idx;
-        self.scroll_to_focus();
+        self.insert_column(Column::new(pane));
     }
 
     /// Removes `pane`, and its column if it was the last pane there.

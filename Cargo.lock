@@ -1467,6 +1467,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "clap",
+ "compact_str 0.9.1",
  "crossterm",
  "env_logger",
  "font8x8",

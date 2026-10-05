@@ -37,6 +37,8 @@ const READ_BUDGET: usize = 256 * 1024;
 const MAX_OUTPUT: usize = 1 << 20;
 /// A server started for a client that never attaches gives up after this.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
+/// How long shutting down waits, in all, for clients to take their goodbyes.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// How long to stop accepting after accepting fails (say, out of file
 /// descriptors), rather than retrying in a tight loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -529,10 +531,11 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
     }
 }
 
-/// Kills every pane and tells every client the server is gone, giving each
-/// a moment to receive it.
+/// Kills every pane and tells every client the server is gone, giving them
+/// a moment, between them, to receive it.
 fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connection>) {
     app.shutdown();
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
     for (_, mut connection) in connections {
         if let Some(mut client) = connection.client.take() {
             app.detach(&mut client);
@@ -541,9 +544,9 @@ fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connect
         connection.send(&ServerMsg::Exit(ExitReason::ServerExited));
         let _ = poller.delete(&connection.stream);
         let _ = connection.stream.set_nonblocking(false);
-        let _ = connection
-            .stream
-            .set_write_timeout(Some(Duration::from_secs(1)));
+        // A client that isn't reading doesn't hold up the rest for long.
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _ = (connection.stream).set_write_timeout(Some(left.max(Duration::from_millis(10))));
         let _ = connection.stream.write_all(&connection.outgoing);
     }
 }
