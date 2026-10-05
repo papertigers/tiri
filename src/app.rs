@@ -1577,20 +1577,74 @@ impl App {
         }
 
         let overview = self.workspaces.in_overview(client.id);
-        let hint = if client.prefix_pending {
-            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  f max  F full  o overview  x close  d detach  q kill server "
-        } else if overview && client.kitty_overview {
-            "OVERVIEW (kitty)  hjkl select  u/i workspace  HJKL/U/I move  x close  t text  ⏎/o/Esc open "
+        let hints: &[&str] = if client.prefix_pending {
+            &[
+                "C-a:",
+                "n new",
+                "hjkl focus",
+                "HJKL move",
+                "u/i workspace",
+                "o overview",
+                "x close",
+                "d detach",
+                "r width",
+                "f max",
+                "F full",
+                "c center",
+                "U/I to workspace",
+                "[/] consume/expel",
+                ",/. into/out of column",
+                "0/$ first/last",
+                "q kill server",
+            ]
         } else if overview {
-            "OVERVIEW  hjkl select  u/i workspace  HJKL/U/I move  x close  t thumbnails  ⏎/o/Esc open "
+            &[
+                "OVERVIEW",
+                "⏎/o/Esc open",
+                "hjkl select",
+                "u/i workspace",
+                "HJKL/U/I move",
+                "x close",
+                if client.kitty_overview {
+                    "t text"
+                } else {
+                    "t thumbnails"
+                },
+            ]
         } else {
-            "C-a or Alt: n/⏎ new  h/l focus  u/i workspace  r width  o overview "
+            &[
+                "C-a n or Alt-⏎ new",
+                "Alt-h/l focus",
+                "Alt-o overview",
+                "C-a d detach",
+                "C-a for more",
+            ]
         };
+        let room = (i32::from(client.width) - x - 2).max(0) as usize;
+        let hint = fit_hints(hints, room);
         let hint_x = i32::from(client.width) - hint.chars().count() as i32;
-        if hint_x > x + 1 {
-            frame.put_str(hint_x, y, hint, base);
+        if !hint.is_empty() {
+            frame.put_str(hint_x, y, &hint, base);
         }
     }
+}
+
+/// As many of `hints` as fit in `room` columns, from the first, two spaces
+/// apart and with one after. Empty if not even the first fits.
+fn fit_hints(hints: &[&str], room: usize) -> String {
+    let mut out = String::new();
+    for hint in hints {
+        let sep = if out.is_empty() { "" } else { "  " };
+        if out.chars().count() + sep.len() + hint.chars().count() + 1 > room {
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(hint);
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out
 }
 
 fn prefix_binding(key: KeyEvent) -> Option<Action> {
@@ -1835,5 +1889,18 @@ fn term_color(pane: &Pane, color: TermColor) -> Color {
                 Color::Default
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_drop_from_the_end_to_fit() {
+        let hints = ["C-a:", "n new", "x close"];
+        assert_eq!(fit_hints(&hints, 100), "C-a:  n new  x close ");
+        assert_eq!(fit_hints(&hints, 13), "C-a:  n new ");
+        assert_eq!(fit_hints(&hints, 4), "");
     }
 }
