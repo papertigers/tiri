@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::Event;
 use crate::input::encode_key;
 use crate::kitty;
-use crate::layout::{PaneId, Strip, Visibility};
+use crate::layout::{PaneId, Strip, Visibility, split_heights};
 use crate::pane::Pane;
 use crate::render::{Color, Frame, Style};
 use crate::thumbnail;
@@ -20,6 +20,9 @@ use crate::thumbnail;
 /// The prefix key, tmux-style: Ctrl-a, then a command key.
 const PREFIX: char = 'a';
 const STATUS_HEIGHT: u16 = 1;
+/// The shortest a stacked pane's box may get, borders included. Columns
+/// refuse to consume more panes than fit at this height.
+const MIN_PANE_HEIGHT: i32 = 5;
 
 const FOCUSED_BORDER: Color = Color::Idx(12);
 const UNFOCUSED_BORDER: Color = Color::Idx(8);
@@ -40,6 +43,14 @@ enum Action {
     FocusLast,
     MoveLeft,
     MoveRight,
+    FocusUp,
+    FocusDown,
+    MoveUp,
+    MoveDown,
+    ConsumeOrExpelLeft,
+    ConsumeOrExpelRight,
+    ConsumeIntoColumn,
+    ExpelFromColumn,
     CycleWidth,
     Center,
     Close,
@@ -116,13 +127,18 @@ impl App {
         Ok(())
     }
 
-    /// Brings every pane's PTY size in line with its column.
+    /// Brings every pane's PTY size in line with its share of its column.
     fn resize_panes(&mut self) {
-        let rows = self.pane_rows();
+        let area = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
+        self.strip
+            .set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
         for (idx, col) in self.strip.columns().iter().enumerate() {
             let cols = self.strip.column_width(idx).saturating_sub(2).max(1);
-            if let Some(pane) = self.panes.get_mut(&col.pane) {
-                pane.resize(rows, cols);
+            let heights = split_heights(area, col.panes().len());
+            for (id, h) in col.panes().iter().zip(heights) {
+                if let Some(pane) = self.panes.get_mut(id) {
+                    pane.resize((h - 2).max(1) as u16, cols);
+                }
             }
         }
     }
@@ -173,6 +189,8 @@ impl App {
             kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
         }
         self.strip.remove(id);
+        // Whatever shared its column grows into the space.
+        self.resize_panes();
     }
 
     pub fn shutdown(&mut self) {
@@ -225,7 +243,7 @@ impl App {
         );
     }
 
-    /// Where column `idx` is drawn: x, y, width, height, including its border.
+    /// Where column `idx` is drawn: x, y, width, height.
     fn column_box(&self, idx: usize) -> (i32, i32, i32, i32) {
         let pane_height = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
         // Columns shrink vertically with the zoom, centered in the pane area.
@@ -233,6 +251,22 @@ impl App {
             .clamp(pane_height.min(3), pane_height);
         let (x, w) = self.strip.column_span(idx);
         (x, (pane_height - h) / 2, w, h)
+    }
+
+    /// Where each pane in column `idx` is drawn, top to bottom, borders
+    /// included: the column's box split among its panes.
+    fn pane_boxes(&self, idx: usize) -> Vec<(PaneId, i32, i32, i32, i32)> {
+        let (x, mut y, w, h) = self.column_box(idx);
+        let panes = self.strip.columns()[idx].panes();
+        panes
+            .iter()
+            .zip(split_heights(h, panes.len()))
+            .map(|(&id, h)| {
+                let pane_box = (id, x, y, w, h);
+                y += h;
+                pane_box
+            })
+            .collect()
     }
 
     /// The inner size of a column's box in cells, as a thumbnail placement.
@@ -304,6 +338,26 @@ impl App {
             Action::FocusLast => self.strip.focus_last(),
             Action::MoveLeft => self.strip.move_left(),
             Action::MoveRight => self.strip.move_right(),
+            Action::FocusUp => self.strip.focus_up(),
+            Action::FocusDown => self.strip.focus_down(),
+            Action::MoveUp => self.strip.move_up(),
+            Action::MoveDown => self.strip.move_down(),
+            Action::ConsumeOrExpelLeft => {
+                self.strip.consume_or_expel_left();
+                self.resize_panes();
+            }
+            Action::ConsumeOrExpelRight => {
+                self.strip.consume_or_expel_right();
+                self.resize_panes();
+            }
+            Action::ConsumeIntoColumn => {
+                self.strip.consume_into_column();
+                self.resize_panes();
+            }
+            Action::ExpelFromColumn => {
+                self.strip.expel_from_column();
+                self.resize_panes();
+            }
             Action::CycleWidth => {
                 self.strip.cycle_width();
                 self.resize_panes();
@@ -339,9 +393,9 @@ impl App {
         if thumbnails {
             let now = Instant::now();
             for &idx in &visible {
-                let (_, _, w, h) = self.column_box(idx);
-                let id = self.strip.columns()[idx].pane;
-                self.refresh_thumbnail(id, Self::thumbnail_size(w, h), now);
+                for (id, _, _, w, h) in self.pane_boxes(idx) {
+                    self.refresh_thumbnail(id, Self::thumbnail_size(w, h), now);
+                }
             }
         } else if !(self.kitty_overview && self.strip.in_overview()) && !self.thumbnails.is_empty()
         {
@@ -353,49 +407,55 @@ impl App {
         let mut cursor = None;
 
         for idx in visible {
-            let col = self.strip.columns()[idx];
-            let (x, y, w, h) = self.column_box(idx);
-            let Some(pane) = self.panes.get(&col.pane) else {
-                continue;
-            };
-            let focused = idx == self.strip.focus_index();
-            let border = if focused {
-                Style {
-                    bold: true,
-                    ..Style::fg(FOCUSED_BORDER)
-                }
-            } else {
-                Style::fg(UNFOCUSED_BORDER)
-            };
-            draw_box(&mut frame, x, y, w, h, border);
-            let title = format!(" {}: {} ", idx + 1, pane.title());
-            let title: String = title
-                .chars()
-                .take(w.saturating_sub(4).max(0) as usize)
-                .collect();
-            frame.put_str(x + 2, y, &title, border);
-
-            let thumbnail = self.thumbnails.get(&col.pane);
-            let first_row = match thumbnail {
-                Some(thumb) if thumbnails => {
-                    let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + col.pane.0));
-                    let (cols, rows) = thumb.size;
-                    for row in 0..rows {
-                        for c in 0..cols {
-                            let cell = kitty::placeholder(row, c);
-                            frame.put(x + 1 + i32::from(c), y + 1 + i32::from(row), &cell, style);
-                        }
+            let column = &self.strip.columns()[idx];
+            let stacked = column.panes().len() > 1;
+            for (row, (id, x, y, w, h)) in self.pane_boxes(idx).into_iter().enumerate() {
+                let Some(pane) = self.panes.get(&id) else {
+                    continue;
+                };
+                let focused = idx == self.strip.focus_index() && row == column.focus_index();
+                let border = if focused {
+                    Style {
+                        bold: true,
+                        ..Style::fg(FOCUSED_BORDER)
                     }
-                    0
-                }
-                _ => draw_screen(&mut frame, pane, x + 1, y + 1, w - 2, h - 2),
-            };
+                } else {
+                    Style::fg(UNFOCUSED_BORDER)
+                };
+                draw_box(&mut frame, x, y, w, h, border);
+                let number = if stacked {
+                    format!("{}.{}", idx + 1, row + 1)
+                } else {
+                    format!("{}", idx + 1)
+                };
+                let title = format!(" {number}: {} ", pane.title());
+                let title: String = title
+                    .chars()
+                    .take(w.saturating_sub(4).max(0) as usize)
+                    .collect();
+                frame.put_str(x + 2, y, &title, border);
 
-            if focused && show_cursor && pane.cursor_visible() {
-                let (row, c) = pane.cursor();
-                let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(row - first_row));
-                if (0..i32::from(self.width)).contains(&cx) && cy < y + h - 1 {
-                    cursor = Some((cx as u16, cy as u16));
+                let first_row = match self.thumbnails.get(&id) {
+                    Some(thumb) if thumbnails => {
+                        let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + id.0));
+                        let (cols, rows) = thumb.size;
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                let cell = kitty::placeholder(r, c);
+                                frame.put(x + 1 + i32::from(c), y + 1 + i32::from(r), &cell, style);
+                            }
+                        }
+                        0
+                    }
+                    _ => draw_screen(&mut frame, pane, x + 1, y + 1, w - 2, h - 2),
+                };
+
+                if focused && show_cursor && pane.cursor_visible() {
+                    let (r, c) = pane.cursor();
+                    let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r - first_row));
+                    if (0..i32::from(self.width)).contains(&cx) && cy < y + h - 1 {
+                        cursor = Some((cx as u16, cy as u16));
+                    }
                 }
             }
         }
@@ -443,7 +503,7 @@ impl App {
         }
 
         let hint = if self.prefix_pending {
-            "C-a: n new  h/l focus  H/L move  r width  c center  o overview  x close  q quit "
+            "C-a: n new  hjkl focus  HJKL move  [/] consume/expel  ,/. in/out  r width  o overview  x close  q quit "
         } else if self.strip.in_overview() && self.kitty_overview {
             "OVERVIEW (kitty)  h/l select  H/L move  x close  t text  ⏎/o/Esc open "
         } else if self.strip.in_overview() {
@@ -467,6 +527,14 @@ fn prefix_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('$') | KeyCode::End => Action::FocusLast,
         KeyCode::Char('H') => Action::MoveLeft,
         KeyCode::Char('L') => Action::MoveRight,
+        KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
+        KeyCode::Char('J') => Action::MoveDown,
+        KeyCode::Char('K') => Action::MoveUp,
+        KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
+        KeyCode::Char(']') => Action::ConsumeOrExpelRight,
+        KeyCode::Char(',') => Action::ConsumeIntoColumn,
+        KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
@@ -492,6 +560,14 @@ fn overview_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('$') | KeyCode::End => Action::FocusLast,
         KeyCode::Char('H') => Action::MoveLeft,
         KeyCode::Char('L') => Action::MoveRight,
+        KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
+        KeyCode::Char('J') => Action::MoveDown,
+        KeyCode::Char('K') => Action::MoveUp,
+        KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
+        KeyCode::Char(']') => Action::ConsumeOrExpelRight,
+        KeyCode::Char(',') => Action::ConsumeIntoColumn,
+        KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('n') => Action::NewColumn,
         KeyCode::Char('r') => Action::CycleWidth,
         KeyCode::Char('x') => Action::Close,
@@ -514,6 +590,16 @@ fn alt_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('l') | KeyCode::Right => Action::FocusRight,
         KeyCode::Char('H') => Action::MoveLeft,
         KeyCode::Char('L') => Action::MoveRight,
+        KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
+        KeyCode::Char('J') => Action::MoveDown,
+        KeyCode::Char('K') => Action::MoveUp,
+        // Alt-[ would be read as the start of an escape sequence, so
+        // consume-or-expel is on Alt-{ and Alt-} instead.
+        KeyCode::Char('{') => Action::ConsumeOrExpelLeft,
+        KeyCode::Char('}') => Action::ConsumeOrExpelRight,
+        KeyCode::Char(',') => Action::ConsumeIntoColumn,
+        KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,

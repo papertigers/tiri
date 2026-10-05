@@ -1,6 +1,7 @@
 //! The niri-style scrollable strip: an unbounded row of columns with a
 //! viewport sliding over it. Opening a column never resizes the others; the
-//! viewport scrolls instead.
+//! viewport scrolls instead. Each column is a stack of one or more panes
+//! sharing its height.
 
 use std::time::Duration;
 
@@ -19,10 +20,60 @@ const OVERVIEW_MIN_ZOOM: f64 = 0.25;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
-    pub pane: PaneId,
+    /// Top to bottom; never empty.
+    panes: Vec<PaneId>,
+    /// Index of the focused pane in `panes`.
+    focus: usize,
     preset: usize,
+}
+
+impl Column {
+    fn new(pane: PaneId) -> Self {
+        Self {
+            panes: vec![pane],
+            focus: 0,
+            preset: DEFAULT_PRESET,
+        }
+    }
+
+    pub fn panes(&self) -> &[PaneId] {
+        &self.panes
+    }
+
+    pub fn focus_index(&self) -> usize {
+        self.focus
+    }
+
+    pub fn focused(&self) -> PaneId {
+        self.panes[self.focus]
+    }
+
+    /// Takes out the pane at `idx`, keeping focus on the same pane if it
+    /// stays, or on its neighbor if it was the one removed.
+    fn take(&mut self, idx: usize) -> PaneId {
+        let pane = self.panes.remove(idx);
+        if idx < self.focus || self.focus >= self.panes.len() {
+            self.focus = self.focus.saturating_sub(1);
+        }
+        pane
+    }
+}
+
+/// Splits `total` rows among `n` stacked panes as evenly as possible, giving
+/// any leftover rows to the topmost panes.
+pub fn split_heights(total: i32, n: usize) -> Vec<i32> {
+    let n = n.max(1) as i32;
+    (0..n)
+        .map(|i| total / n + i32::from(i < total % n))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +95,8 @@ pub struct Strip {
     overview: bool,
     /// Current scale, 1.0 outside the overview; eases like `offset`.
     zoom: f64,
+    /// The most panes a column may hold before consuming is refused.
+    max_stack: usize,
 }
 
 impl Strip {
@@ -56,7 +109,12 @@ impl Strip {
             offset: 0.0,
             overview: false,
             zoom: 1.0,
+            max_stack: usize::MAX,
         }
+    }
+
+    pub fn set_max_stack(&mut self, max: usize) {
+        self.max_stack = max.max(1);
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -72,7 +130,7 @@ impl Strip {
     }
 
     pub fn focused(&self) -> Option<PaneId> {
-        self.columns.get(self.focus).map(|c| c.pane)
+        self.columns.get(self.focus).map(Column::focused)
     }
 
     pub fn column_width(&self, idx: usize) -> u16 {
@@ -133,23 +191,34 @@ impl Strip {
         } else {
             self.focus + 1
         };
-        self.columns.insert(
-            idx,
-            Column {
-                pane,
-                preset: DEFAULT_PRESET,
-            },
-        );
+        self.columns.insert(idx, Column::new(pane));
         self.focus = idx;
         self.scroll_to_focus();
     }
 
-    /// Removes the column holding `pane`. Returns false if it wasn't here.
+    /// Removes `pane`, and its column if it was the last pane there.
+    /// Returns false if it wasn't here.
     pub fn remove(&mut self, pane: PaneId) -> bool {
-        let Some(idx) = self.columns.iter().position(|c| c.pane == pane) else {
+        let Some((col, row)) = self.locate(pane) else {
             return false;
         };
-        self.columns.remove(idx);
+        if self.columns[col].panes.len() > 1 {
+            self.columns[col].take(row);
+        } else {
+            self.remove_column(col);
+        }
+        true
+    }
+
+    fn locate(&self, pane: PaneId) -> Option<(usize, usize)> {
+        self.columns.iter().enumerate().find_map(|(c, col)| {
+            let row = col.panes.iter().position(|&p| p == pane)?;
+            Some((c, row))
+        })
+    }
+
+    fn remove_column(&mut self, idx: usize) -> Column {
+        let column = self.columns.remove(idx);
         if idx < self.focus || self.focus >= self.columns.len() {
             self.focus = self.focus.saturating_sub(1);
         }
@@ -157,7 +226,127 @@ impl Strip {
         let max_offset = (self.total_width() - i32::from(self.view_width)).max(0);
         self.target_offset = self.target_offset.min(max_offset);
         self.scroll_to_focus();
-        true
+        column
+    }
+
+    pub fn focus_up(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus) {
+            col.focus = col.focus.saturating_sub(1);
+        }
+    }
+
+    pub fn focus_down(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus) {
+            col.focus = (col.focus + 1).min(col.panes.len() - 1);
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus)
+            && col.focus > 0
+        {
+            col.panes.swap(col.focus, col.focus - 1);
+            col.focus -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus)
+            && col.focus + 1 < col.panes.len()
+        {
+            col.panes.swap(col.focus, col.focus + 1);
+            col.focus += 1;
+        }
+    }
+
+    /// niri's `consume-or-expel-window-left`: a pane sharing its column is
+    /// expelled into a new column on the left; a pane alone in its column
+    /// joins the bottom of the column on its left.
+    pub fn consume_or_expel_left(&mut self) {
+        self.consume_or_expel(Side::Left);
+    }
+
+    /// Like [`Self::consume_or_expel_left`], to the right.
+    pub fn consume_or_expel_right(&mut self) {
+        self.consume_or_expel(Side::Right);
+    }
+
+    fn consume_or_expel(&mut self, side: Side) {
+        let Some(col) = self.columns.get(self.focus) else {
+            return;
+        };
+        if col.panes.len() > 1 {
+            self.expel(side);
+            return;
+        }
+        let neighbor = match side {
+            Side::Left => self.focus.checked_sub(1),
+            Side::Right => Some(self.focus + 1).filter(|&i| i < self.columns.len()),
+        };
+        let Some(neighbor) = neighbor.filter(|&i| self.has_room(i)) else {
+            return;
+        };
+        let pane = self.columns[self.focus].focused();
+        let target = &mut self.columns[neighbor];
+        target.panes.push(pane);
+        target.focus = target.panes.len() - 1;
+        // Removing our column shifts the neighbor left if it was to the right.
+        let neighbor = if neighbor > self.focus {
+            neighbor - 1
+        } else {
+            neighbor
+        };
+        let current = self.focus;
+        self.remove_column(current);
+        self.focus = neighbor;
+        self.scroll_to_focus();
+    }
+
+    /// niri's `consume-window-into-column`: the top pane of the column to the
+    /// right joins the bottom of the focused column. Focus stays put.
+    pub fn consume_into_column(&mut self) {
+        let right = self.focus + 1;
+        if right >= self.columns.len() || !self.has_room(self.focus) {
+            return;
+        }
+        let pane = self.columns[right].panes[0];
+        if self.columns[right].panes.len() > 1 {
+            self.columns[right].take(0);
+        } else {
+            self.columns.remove(right);
+        }
+        self.columns[self.focus].panes.push(pane);
+        self.scroll_to_focus();
+    }
+
+    /// niri's `expel-window-from-column`: the focused pane leaves its column
+    /// for a new column on the right, if it shares its column.
+    pub fn expel_from_column(&mut self) {
+        if self
+            .columns
+            .get(self.focus)
+            .is_some_and(|c| c.panes.len() > 1)
+        {
+            self.expel(Side::Right);
+        }
+    }
+
+    /// Moves the focused pane out of its (shared) column into a new column on
+    /// `side`, and focuses it there.
+    fn expel(&mut self, side: Side) {
+        let col = &mut self.columns[self.focus];
+        let pane = col.take(col.focus);
+        let idx = match side {
+            Side::Left => self.focus,
+            Side::Right => self.focus + 1,
+        };
+        self.columns.insert(idx, Column::new(pane));
+        self.focus = idx;
+        self.scroll_to_focus();
+    }
+
+    fn has_room(&self, idx: usize) -> bool {
+        self.columns[idx].panes.len() < self.max_stack
     }
 
     pub fn focus_left(&mut self) {
@@ -324,12 +513,21 @@ mod tests {
         assert_eq!(strip.target_offset, 100);
     }
 
+    /// The strip's panes, column by column, top to bottom.
+    fn layout(strip: &Strip) -> Vec<Vec<u32>> {
+        strip
+            .columns()
+            .iter()
+            .map(|c| c.panes().iter().map(|p| p.0).collect())
+            .collect()
+    }
+
     #[test]
     fn insert_goes_right_of_focus() {
         let mut strip = strip_with(3, 100);
         strip.focus_first();
         strip.insert(PaneId(9));
-        let order: Vec<_> = strip.columns().iter().map(|c| c.pane.0).collect();
+        let order: Vec<_> = strip.columns().iter().map(|c| c.focused().0).collect();
         assert_eq!(order, [0, 9, 1, 2]);
         assert_eq!(strip.focused(), Some(PaneId(9)));
     }
@@ -428,5 +626,133 @@ mod tests {
         settle(&mut strip);
         assert_eq!(strip.zoom(), 1.0);
         assert_eq!(strip.column_span(0), (0, 50));
+    }
+
+    #[test]
+    fn consume_or_expel_moves_a_lone_pane_into_its_neighbor() {
+        let mut strip = strip_with(3, 100);
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![0], vec![1, 2]]);
+        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(2))));
+
+        strip.focus_first();
+        strip.consume_or_expel_right();
+        assert_eq!(layout(&strip), [vec![1, 2, 0]]);
+        assert_eq!(strip.focused(), Some(PaneId(0)));
+    }
+
+    #[test]
+    fn consume_or_expel_moves_a_stacked_pane_out() {
+        let mut strip = strip_with(2, 100);
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![0, 1]]);
+
+        // Pane 1 is focused and shares its column, so it's expelled.
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![1], vec![0]]);
+        assert_eq!((strip.focus_index(), strip.focused()), (0, Some(PaneId(1))));
+
+        strip.consume_or_expel_right();
+        assert_eq!(layout(&strip), [vec![0, 1]]);
+        strip.focus_up();
+        strip.consume_or_expel_right();
+        assert_eq!(layout(&strip), [vec![1], vec![0]]);
+        assert_eq!(strip.focused(), Some(PaneId(0)));
+    }
+
+    #[test]
+    fn consume_or_expel_at_the_edge_does_nothing() {
+        let mut strip = strip_with(2, 100);
+        strip.consume_or_expel_right();
+        strip.focus_first();
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn consume_into_column_takes_the_top_pane_on_the_right() {
+        let mut strip = strip_with(3, 100);
+        strip.focus_last();
+        strip.consume_or_expel_left(); // [0] [1 2]
+        strip.focus_first();
+        strip.consume_into_column();
+        assert_eq!(layout(&strip), [vec![0, 1], vec![2]]);
+        assert_eq!(strip.focused(), Some(PaneId(0)), "focus stays put");
+        strip.consume_into_column();
+        assert_eq!(layout(&strip), [vec![0, 1, 2]]);
+        strip.consume_into_column();
+        assert_eq!(layout(&strip), [vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn expel_from_column_only_splits_shared_columns() {
+        let mut strip = strip_with(2, 100);
+        strip.expel_from_column();
+        assert_eq!(layout(&strip), [vec![0], vec![1]]);
+        strip.consume_or_expel_left();
+        strip.focus_up();
+        strip.expel_from_column();
+        assert_eq!(layout(&strip), [vec![1], vec![0]]);
+        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(0))));
+    }
+
+    #[test]
+    fn consuming_respects_the_stack_limit() {
+        let mut strip = strip_with(3, 100);
+        strip.set_max_stack(2);
+        strip.consume_or_expel_left(); // [0] [1 2]
+        strip.focus_first();
+        strip.consume_or_expel_right();
+        assert_eq!(layout(&strip), [vec![0], vec![1, 2]], "column is full");
+        strip.consume_into_column();
+        assert_eq!(layout(&strip), [vec![0, 1], vec![2]]);
+        strip.consume_into_column();
+        assert_eq!(layout(&strip), [vec![0, 1], vec![2]], "column is full");
+    }
+
+    #[test]
+    fn focus_and_move_within_a_column() {
+        let mut strip = strip_with(3, 100);
+        strip.focus_first();
+        strip.consume_into_column();
+        strip.consume_into_column(); // [0 1 2], focus on 0
+        strip.focus_down();
+        strip.focus_down();
+        strip.focus_up();
+        assert_eq!(strip.focused(), Some(PaneId(1)));
+        strip.move_up();
+        assert_eq!(layout(&strip), [vec![1, 0, 2]]);
+        assert_eq!(strip.focused(), Some(PaneId(1)));
+        strip.move_up();
+        strip.focus_down();
+        strip.focus_down();
+        strip.focus_down();
+        assert_eq!(strip.focused(), Some(PaneId(2)));
+        strip.move_down();
+        assert_eq!(layout(&strip), [vec![1, 0, 2]]);
+    }
+
+    #[test]
+    fn removing_a_stacked_pane_keeps_its_column() {
+        let mut strip = strip_with(3, 100);
+        strip.consume_or_expel_left(); // [0] [1 2], focus on 2
+        assert!(strip.remove(PaneId(2)));
+        assert_eq!(layout(&strip), [vec![0], vec![1]]);
+        assert_eq!(strip.focused(), Some(PaneId(1)));
+        strip.consume_or_expel_left(); // [0 1]
+        strip.focus_up();
+        assert!(strip.remove(PaneId(1)));
+        assert_eq!(
+            strip.focused(),
+            Some(PaneId(0)),
+            "focus stays on the same pane"
+        );
+    }
+
+    #[test]
+    fn heights_split_evenly_with_extra_rows_on_top() {
+        assert_eq!(split_heights(10, 3), [4, 3, 3]);
+        assert_eq!(split_heights(9, 3), [3, 3, 3]);
+        assert_eq!(split_heights(5, 1), [5]);
     }
 }
