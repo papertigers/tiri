@@ -8,24 +8,19 @@ mod thumbnail;
 mod workspace;
 
 use std::io::{self, Write};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{ExecutableCommand, cursor, event, terminal};
+use polling::{Events, Poller};
 
 use app::App;
-use layout::PaneId;
 use render::Renderer;
 
 const FRAME: Duration = Duration::from_millis(16);
-
-pub enum Event {
-    Terminal(event::Event),
-    Output(PaneId, Vec<u8>),
-    Exited(PaneId),
-}
 
 fn main() -> Result<()> {
     let _guard = TerminalGuard::enter()?;
@@ -33,29 +28,34 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let (tx, rx) = mpsc::channel();
-
-    let input_tx = tx.clone();
+    // One poller watches every pane's PTY. Terminal input arrives on its own
+    // thread (crossterm reads it blocking) and wakes the poller when it does.
+    let poller = Arc::new(Poller::new()?);
+    let (input_tx, input) = mpsc::channel();
+    let waker = Arc::clone(&poller);
     thread::spawn(move || {
         while let Ok(ev) = event::read() {
-            if input_tx.send(Event::Terminal(ev)).is_err() {
+            if input_tx.send(ev).is_err() {
                 break;
             }
+            let _ = waker.notify();
         }
+        let _ = waker.notify();
     });
 
     let (width, height) = terminal::size()?;
     // Each argument names a workspace to start with.
     let names: Vec<String> = std::env::args().skip(1).collect();
-    let mut app = App::new(width, height, &names, tx)?;
+    let mut app = App::new(width, height, &names, Arc::clone(&poller))?;
     let mut renderer = Renderer::default();
     let mut stdout = io::stdout().lock();
+    let mut events = Events::new();
     let mut animating = false;
     let mut last_tick = Instant::now();
 
-    loop {
+    'main: loop {
         // Wake for the next animation frame, or when a pane's synchronized
-        // update times out, whichever is sooner.
+        // update times out, whichever is sooner; otherwise only for I/O.
         let deadline = [
             animating.then(|| Instant::now() + FRAME),
             app.next_deadline(),
@@ -63,30 +63,31 @@ fn run() -> Result<()> {
         .into_iter()
         .flatten()
         .min();
-        let first = match deadline {
-            Some(deadline) => {
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(ev) => Some(ev),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            None => match rx.recv() {
-                Ok(ev) => Some(ev),
-                Err(_) => break,
-            },
-        };
-        for ev in first.into_iter().chain(rx.try_iter()) {
-            match ev {
-                Event::Terminal(event::Event::Key(key)) => app.key(key)?,
-                Event::Terminal(event::Event::Paste(text)) => app.paste(&text),
-                Event::Terminal(event::Event::Resize(w, h)) => {
+        app.arm_panes();
+        events.clear();
+        match poller.wait(
+            &mut events,
+            deadline.map(|d| d.saturating_duration_since(Instant::now())),
+        ) {
+            Ok(_) => {}
+            // Signals such as SIGWINCH interrupt the wait; just go round.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+        for event in events.iter() {
+            app.pane_ready(event);
+        }
+        loop {
+            match input.try_recv() {
+                Ok(event::Event::Key(key)) => app.key(key)?,
+                Ok(event::Event::Paste(text)) => app.paste(&text),
+                Ok(event::Event::Resize(w, h)) => {
                     app.resize(w, h);
                     renderer.invalidate();
                 }
-                Event::Terminal(_) => {}
-                Event::Output(id, bytes) => app.pane_output(id, &bytes),
-                Event::Exited(id) => app.pane_exited(id),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break 'main,
             }
         }
         if app.quit || app.is_empty() {

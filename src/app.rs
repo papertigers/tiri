@@ -1,15 +1,16 @@
 //! Application state: the workspaces, their panes, keybindings, and drawing.
 
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use polling::{Event as PollEvent, Poller};
 
-use crate::Event;
 use crate::input::encode_key;
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
@@ -79,7 +80,8 @@ pub struct App {
     workspaces: Workspaces,
     panes: HashMap<PaneId, Pane>,
     next_id: u32,
-    events: Sender<Event>,
+    /// Watches every pane's PTY; panes are keyed by their id.
+    poller: Arc<Poller>,
     width: u16,
     height: u16,
     prefix_pending: bool,
@@ -94,12 +96,12 @@ pub struct App {
 impl App {
     /// Starts with a named workspace for each of `names` (plus the usual
     /// empty one), and a shell in the first.
-    pub fn new(width: u16, height: u16, names: &[String], events: Sender<Event>) -> Result<Self> {
+    pub fn new(width: u16, height: u16, names: &[String], poller: Arc<Poller>) -> Result<Self> {
         let mut app = Self {
             workspaces: Workspaces::new(width, names),
             panes: HashMap::new(),
             next_id: 0,
-            events,
+            poller,
             width,
             height,
             prefix_pending: false,
@@ -131,7 +133,14 @@ impl App {
         let id = PaneId(self.next_id);
         self.next_id += 1;
         // Width isn't known until it's in the strip, so start narrow and fix it below.
-        let pane = Pane::spawn(id, self.pane_rows(), 1, self.events.clone())?;
+        let pane = Pane::spawn(self.pane_rows(), 1)?;
+        // SAFETY: the pane is deleted from the poller in `pane_exited` or
+        // `shutdown`, before it's dropped and its PTY closed.
+        unsafe {
+            self.poller
+                .add(pane.fd().as_raw_fd(), PollEvent::readable(id.0 as usize))
+        }
+        .context("failed to watch the new pane's pty")?;
         self.panes.insert(id, pane);
         self.workspaces.insert(id);
         self.resize_panes();
@@ -164,9 +173,27 @@ impl App {
         self.resize_panes();
     }
 
-    pub fn pane_output(&mut self, id: PaneId, bytes: &[u8]) {
-        if let Some(pane) = self.panes.get_mut(&id) {
-            pane.process(bytes);
+    /// Handles a pane's PTY becoming readable or writable.
+    pub fn pane_ready(&mut self, event: PollEvent) {
+        let id = PaneId(event.key as u32);
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if event.writable {
+            pane.flush();
+        }
+        if event.readable && !pane.read_ready() {
+            self.pane_exited(id);
+        }
+    }
+
+    /// Re-arms every pane's PTY with the poller, which reports each one only
+    /// once per arming. Panes with queued input also wait to be writable.
+    pub fn arm_panes(&self) {
+        for (id, pane) in &self.panes {
+            let interest = PollEvent::new(id.0 as usize, true, pane.wants_write());
+            // A failure means the PTY is gone, which reading will report.
+            let _ = self.poller.modify(pane.fd(), interest);
         }
     }
 
@@ -197,6 +224,7 @@ impl App {
 
     pub fn pane_exited(&mut self, id: PaneId) {
         if let Some(mut pane) = self.panes.remove(&id) {
+            let _ = self.poller.delete(pane.fd());
             pane.reap();
         }
         if self.thumbnails.remove(&id).is_some() {
@@ -209,6 +237,7 @@ impl App {
 
     pub fn shutdown(&mut self) {
         for pane in self.panes.values_mut() {
+            let _ = self.poller.delete(pane.fd());
             pane.kill();
         }
         self.clear_thumbnails();

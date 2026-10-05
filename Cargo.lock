@@ -654,7 +654,9 @@ dependencies = [
  "crossterm",
  "font8x8",
  "miniz_oxide",
+ "polling",
  "portable-pty",
+ "rustix",
 ]
 
 [[package]]

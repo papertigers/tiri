@@ -2,10 +2,8 @@
 //! draws into.
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::os::fd::{BorrowedFd, RawFd};
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
-use std::thread;
 use std::time::Instant;
 
 use alacritty_terminal::Term;
@@ -16,9 +14,8 @@ use alacritty_terminal::term::{Config, TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-
-use crate::Event;
-use crate::layout::PaneId;
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::io::Errno;
 
 /// Answers for apps that ask what colors the terminal uses (OSC 10/11).
 /// Assumes a dark theme until we ask the outer terminal.
@@ -32,6 +29,10 @@ const DEFAULT_BG: Rgb = Rgb {
     g: 0x00,
     b: 0x00,
 };
+/// The most output to take from one pane per wakeup, so a pane streaming
+/// output can't starve input or the others. The rest is read next time.
+const READ_BUDGET: usize = 256 * 1024;
+
 /// Reported to apps that ask for the text area in pixels.
 const CELL_WIDTH: u16 = 8;
 const CELL_HEIGHT: u16 = 16;
@@ -41,7 +42,10 @@ pub struct Pane {
     parser: Processor,
     events: Rc<RefCell<Vec<TermEvent>>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// The PTY's controller side, non-blocking. Owned by `master`.
+    fd: RawFd,
+    /// Input for the child that the PTY hasn't accepted yet.
+    outgoing: Vec<u8>,
     child: Box<dyn Child + Send + Sync>,
     title: Option<String>,
     fallback_title: String,
@@ -50,9 +54,9 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Starts the user's shell in a new PTY. Output and exit are reported to
-    /// `events` from a reader thread.
-    pub fn spawn(id: PaneId, rows: u16, cols: u16, events: Sender<Event>) -> Result<Self> {
+    /// Starts the user's shell in a new PTY. Its output is read with
+    /// [`Self::read_ready`] once [`Self::fd`] polls readable.
+    pub fn spawn(rows: u16, cols: u16) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(pty_size(rows, cols))
             .context("failed to open pty")?;
@@ -71,22 +75,13 @@ impl Pane {
         // Drop our copy of the subsidiary side so reads see EOF when the child exits.
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-        thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if events.send(Event::Output(id, buf[..n].to_vec())).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-            let _ = events.send(Event::Exited(id));
-        });
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .context("pty has no file descriptor")?;
+        // SAFETY: `fd` belongs to `pair.master`, which is alive here.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        fcntl_setfl(borrowed, fcntl_getfl(borrowed)? | OFlags::NONBLOCK)?;
 
         let fallback_title = std::env::var("SHELL")
             .ok()
@@ -105,7 +100,8 @@ impl Pane {
             parser: Processor::new(),
             events: term_events,
             master: pair.master,
-            writer,
+            fd,
+            outgoing: Vec::new(),
             child,
             title: None,
             fallback_title,
@@ -156,7 +152,38 @@ impl Pane {
         self.generation
     }
 
-    pub fn process(&mut self, bytes: &[u8]) {
+    /// The PTY to poll: readable when the child has written output, writable
+    /// when it can take more of [`Self::wants_write`]'s queued input.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `fd` belongs to `master`, which lives as long as `self`.
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
+    }
+
+    /// Reads and processes the child's output until the PTY runs dry or the
+    /// read budget is spent. Returns false once the child has gone.
+    pub fn read_ready(&mut self) -> bool {
+        let mut buf = [0u8; 16 * 1024];
+        let mut total = 0;
+        loop {
+            match rustix::io::read(self.fd(), &mut buf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    self.process(&buf[..n]);
+                    total += n;
+                    if total >= READ_BUDGET {
+                        return true;
+                    }
+                }
+                Err(Errno::AGAIN) => return true,
+                Err(Errno::INTR) => {}
+                // Once the child and everything it started have closed the
+                // PTY, reads fail with EIO rather than returning 0.
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
         self.generation += 1;
         self.parser.advance(&mut self.term, bytes);
         self.handle_term_events();
@@ -206,12 +233,34 @@ impl Pane {
         }
     }
 
+    /// Sends input to the child. Whatever the PTY can't take right now is
+    /// queued and sent by [`Self::flush`] once it polls writable, so a child
+    /// that isn't reading never blocks tiri.
     pub fn write(&mut self, bytes: &[u8]) {
-        // A failed write means the child is gone; the reader thread reports that.
-        let _ = self
-            .writer
-            .write_all(bytes)
-            .and_then(|()| self.writer.flush());
+        self.outgoing.extend_from_slice(bytes);
+        self.flush();
+    }
+
+    pub fn wants_write(&self) -> bool {
+        !self.outgoing.is_empty()
+    }
+
+    /// Sends as much queued input as the PTY will take.
+    pub fn flush(&mut self) {
+        while !self.outgoing.is_empty() {
+            match rustix::io::write(self.fd(), &self.outgoing) {
+                Ok(n) => {
+                    self.outgoing.drain(..n);
+                }
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
+                // The child is gone; reading will notice and close the pane.
+                Err(_) => {
+                    self.outgoing.clear();
+                    return;
+                }
+            }
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
