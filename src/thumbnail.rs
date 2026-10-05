@@ -43,6 +43,7 @@ pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
 /// Opacity of the smudge drawn for characters the font doesn't have.
 const UNKNOWN_GLYPH_ALPHA: u8 = 0x90;
 
+#[derive(Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -56,6 +57,18 @@ impl Image {
             height,
             rgba: vec![0; width as usize * height as usize * 4],
         }
+    }
+
+    /// The same image at `opacity` (0 to 1) of its own opacity. Thumbnails
+    /// are transparent where the pane has its default background, so this
+    /// fades them over the terminal's own background.
+    pub fn with_opacity(&self, opacity: f32) -> Self {
+        let opacity = opacity.clamp(0.0, 1.0);
+        let mut faded = self.clone();
+        for alpha in faded.rgba.iter_mut().skip(3).step_by(4) {
+            *alpha = (f32::from(*alpha) * opacity).round() as u8;
+        }
+        faded
     }
 
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: [u8; 3], alpha: u8) {
@@ -332,5 +345,14 @@ mod tests {
         assert_eq!(pixel(&image, 1, 1)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 5, 13)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 1, 1)[3], 0);
+    }
+
+    #[test]
+    fn fading_scales_only_opacity() {
+        let image = rasterize_default(&term_with(1, 1, b"\x1b[48;2;10;20;30m "));
+        let half = image.with_opacity(0.5);
+        assert_eq!(pixel(&half, 3, 8), [10, 20, 30, 128]);
+        assert_eq!(pixel(&image.with_opacity(0.0), 3, 8)[3], 0);
+        assert_eq!(pixel(&image.with_opacity(1.0), 3, 8), pixel(&image, 3, 8));
     }
 }

@@ -53,6 +53,7 @@ impl Default for Cell {
     }
 }
 
+#[derive(Clone)]
 pub struct Frame {
     width: u16,
     height: u16,
@@ -168,6 +169,11 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// The last frame drawn, as the terminal shows it now.
+    pub fn last_frame(&self) -> Option<&Frame> {
+        self.prev.as_ref()
+    }
+
     /// Forces the next frame to be drawn in full.
     pub fn invalidate(&mut self) {
         self.prev = None;

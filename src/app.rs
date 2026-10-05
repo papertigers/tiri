@@ -19,7 +19,7 @@ use crossterm::event::{
 use polling::{Event as PollEvent, Poller};
 
 use crate::colors::Palette;
-use crate::effects::{Anchor, Effects};
+use crate::effects::{Anchor, Effects, Transition};
 use crate::input::{encode_key, encode_mouse};
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
@@ -47,6 +47,8 @@ const DIM_TEXT: Color = Color::Idx(242);
 const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
 /// Thumbnails of busy panes are redrawn at most this often.
 const THUMBNAIL_INTERVAL: Duration = Duration::from_millis(250);
+/// Fading a thumbnail in uploads it this many times, at rising opacity.
+const OPACITY_STEPS: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -123,6 +125,39 @@ struct Thumbnail {
     /// The pane's generation when this was drawn.
     generation: u64,
     uploaded: Instant,
+    /// The image as drawn, kept for fading it in.
+    image: thumbnail::Image,
+    /// The opacity it was last uploaded at, in steps of [`OPACITY_STEPS`].
+    opacity: u8,
+}
+
+/// Uploads `thumb` as image `image_id` if it's not already there at
+/// `opacity` (rounded to a few steps), and places it at `size` cells if it
+/// isn't already.
+fn upload(
+    escapes: &mut Vec<u8>,
+    image_id: u32,
+    thumb: &mut Thumbnail,
+    size: (u16, u16),
+    opacity: f32,
+) {
+    let step = (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
+    let uploading = thumb.opacity != step;
+    if uploading {
+        if step == OPACITY_STEPS {
+            kitty::transmit(escapes, image_id, &thumb.image);
+        } else {
+            let faded = thumb
+                .image
+                .with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
+            kitty::transmit(escapes, image_id, &faded);
+        }
+        thumb.opacity = step;
+    }
+    if uploading || thumb.size != size {
+        kitty::place(escapes, image_id, size.0, size.1);
+        thumb.size = size;
+    }
 }
 
 /// One attached terminal: its size, its prefix-key and overview settings,
@@ -161,6 +196,8 @@ pub struct Client {
     last_click: Option<(Instant, PaneId, Point, u8)>,
     /// Visual effects running on this client's screen.
     effects: Effects,
+    /// The overview fading in or out, if it is.
+    transition: Option<Transition>,
 }
 
 /// How far back a client has scrolled a pane, and how much history the pane
@@ -192,7 +229,7 @@ impl Client {
 
     /// Whether effects are running, so frames must keep coming.
     pub fn effects_running(&self) -> bool {
-        self.effects.is_active()
+        self.effects.is_active() || self.transition.is_some()
     }
 
     /// Its terminal's cells changed shape: redraw its thumbnails to match.
@@ -277,15 +314,16 @@ impl Client {
         });
     }
 
-    /// Keeps `id`'s thumbnail current: uploads the image if there's none yet
-    /// or the pane changed (at most every [`THUMBNAIL_INTERVAL`]), and sizes
-    /// its placement to `size` cells. Placing is cheap, so it follows the
-    /// zoom animation frame by frame.
+    /// Keeps `id`'s thumbnail current: draws it if there's none yet or the
+    /// pane changed (at most every [`THUMBNAIL_INTERVAL`]), uploads it at
+    /// `opacity` (0 to 1, in a few steps, for fading it in), and sizes its
+    /// placement to `size` cells.
     fn refresh_thumbnail(
         &mut self,
         panes: &HashMap<PaneId, Pane>,
         id: PaneId,
         size: (u16, u16),
+        opacity: f32,
         now: Instant,
     ) {
         let Some(pane) = panes.get(&id) else {
@@ -293,28 +331,41 @@ impl Client {
         };
         let image_id = THUMBNAIL_ID_BASE + id.0;
         let generation = pane.generation();
-        let current = self.thumbnails.get(&id);
-        let stale = current
+        let stale = self
+            .thumbnails
+            .get(&id)
             .is_none_or(|t| t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL);
-        let (generation, uploaded) = if stale {
+        if stale {
             let image = thumbnail::rasterize(pane.term(), &self.palette, self.thumbnail_cell);
-            kitty::transmit(&mut self.escapes, image_id, &image);
-            (generation, now)
-        } else {
-            let t = current.expect("not stale, so present");
-            (t.generation, t.uploaded)
-        };
-        if stale || current.is_some_and(|t| t.size != size) {
-            kitty::place(&mut self.escapes, image_id, size.0, size.1);
+            self.thumbnails.insert(
+                id,
+                Thumbnail {
+                    size,
+                    generation,
+                    uploaded: now,
+                    image,
+                    // Not uploaded yet.
+                    opacity: u8::MAX,
+                },
+            );
         }
-        self.thumbnails.insert(
-            id,
-            Thumbnail {
+        let thumb = self.thumbnails.get_mut(&id).expect("inserted if missing");
+        upload(&mut self.escapes, image_id, thumb, size, opacity);
+    }
+
+    /// Re-uploads the thumbnails already shown at `opacity`, as the overview
+    /// fades out.
+    fn fade_thumbnails(&mut self, opacity: f32) {
+        for (id, thumb) in &mut self.thumbnails {
+            let size = thumb.size;
+            upload(
+                &mut self.escapes,
+                THUMBNAIL_ID_BASE + id.0,
+                thumb,
                 size,
-                generation,
-                uploaded,
-            },
-        );
+                opacity,
+            );
+        }
     }
 
     /// The inner size of a pane's box in cells, as a thumbnail placement.
@@ -410,6 +461,7 @@ impl App {
             drag: Drag::None,
             last_click: None,
             effects: Effects::default(),
+            transition: None,
         };
         self.lay_out_for(&client);
         if matches!(target, Target::New(_)) || self.panes.is_empty() {
@@ -621,9 +673,8 @@ impl App {
         }
     }
 
-    /// Thumbnails show whenever the view is zoomed out: while the overview
-    /// zooms out, while it's open, and while it zooms back in. Live text
-    /// only returns at full size, so nothing pops in or out mid-zoom.
+    /// Thumbnails show whenever the view is zoomed out, which is whenever the
+    /// overview is open.
     fn showing_thumbnails(&self, client: &Client) -> bool {
         client.kitty_overview && self.workspaces.zoom(client.id) < 1.0
     }
@@ -944,13 +995,13 @@ impl App {
             }
             Hit::EmptyWorkspace(ws) => {
                 self.workspaces.focus_workspace(client.id, ws);
-                self.workspaces.set_overview(client.id, false);
+                self.set_overview(client, false);
             }
             Hit::Pane { id, inner } => {
                 let focused = self.workspaces.focused(client.id) == Some(id);
                 self.workspaces.focus_pane(client.id, id);
                 if overview {
-                    self.workspaces.set_overview(client.id, false);
+                    self.set_overview(client, false);
                     return;
                 }
                 // Counted before the focus check, so double-clicking a pane
@@ -1114,9 +1165,9 @@ impl App {
             Action::MoveColumnToWorkspaceUp => self.workspaces.move_column_up(id),
             Action::ToggleOverview => {
                 let on = !self.workspaces.in_overview(id);
-                self.workspaces.set_overview(id, on);
+                self.set_overview(client, on);
             }
-            Action::ExitOverview => self.workspaces.set_overview(id, false),
+            Action::ExitOverview => self.set_overview(client, false),
             Action::ToggleThumbnails => client.kitty_overview = !client.kitty_overview,
             Action::Detach => client.detach_requested = true,
             Action::Quit => self.quit = true,
@@ -1139,12 +1190,18 @@ impl App {
         let thumbnails = self.showing_thumbnails(client);
         if thumbnails {
             let now = Instant::now();
+            // Fully opaque unless the overview is fading in.
+            let opacity = (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
             for &(ws, idx) in &visible {
                 for (id, _, _, w, h) in self.pane_boxes(client, ws, idx) {
                     let size = Client::thumbnail_size(w, h);
-                    client.refresh_thumbnail(&self.panes, id, size, now);
+                    client.refresh_thumbnail(&self.panes, id, size, opacity, now);
                 }
             }
+        } else if let Some(transition) = &client.transition {
+            // The overview fading out: its thumbnails fade with it.
+            let opacity = transition.image_opacity();
+            client.fade_thumbnails(opacity);
         } else {
             client.clear_thumbnails();
         }
@@ -1162,10 +1219,37 @@ impl App {
             })
             .collect();
         let palette = client.palette;
-        client
-            .effects
-            .apply(&mut frame, &palette, Instant::now(), &areas);
+        let now = Instant::now();
+        client.effects.apply(&mut frame, &palette, now, &areas);
+        if let Some(transition) = client.transition.as_mut() {
+            if transition.apply(&mut frame, &palette, now) {
+                return (frame, None);
+            }
+            client.transition = None;
+            // Thumbnails kept for the overview going out can go now; no more
+            // frames may come to do it later.
+            if !thumbnails {
+                client.clear_thumbnails();
+            }
+        }
         (frame, cursor)
+    }
+
+    /// Opens or closes `client`'s overview. The layout changes at once, and
+    /// a [`Transition`] fades between the two.
+    fn set_overview(&mut self, client: &mut Client, on: bool) {
+        if on == self.workspaces.in_overview(client.id) {
+            return;
+        }
+        self.workspaces.set_overview(client.id, on);
+        self.workspaces.snap(client.id);
+        if let Some(from) = client.renderer.last_frame().cloned() {
+            client.transition = Some(if on {
+                Transition::opening(from, &client.palette)
+            } else {
+                Transition::closing(from, &client.palette)
+            });
+        }
     }
 
     /// Composes the frame itself: every visible pane, labels and status bar.

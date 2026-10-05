@@ -12,7 +12,7 @@ use crate::thumbnail::Image;
 
 /// A cell showing part of an image. The image id is carried in the cell's
 /// foreground color, and which part of the image in two combining marks.
-const PLACEHOLDER: char = '\u{10EEEE}';
+pub const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// Each image has a single virtual placement, with this id.
 const PLACEMENT_ID: u32 = 1;
@@ -367,7 +367,7 @@ pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
 
 /// Shows image `id` through placeholders `cols` x `rows` cells big, by
 /// creating or resizing its virtual placement. The terminal scales the
-/// image to fit, so resizing every frame zooms it smoothly.
+/// image to fit.
 ///
 /// The placement always gets the same id, so it replaces the previous one.
 /// Re-uploading an image keeps its placements, and an unnumbered placement

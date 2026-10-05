@@ -330,6 +330,18 @@ impl Workspaces {
         view.overview.then(|| self.overview_zoom())
     }
 
+    /// Puts `client`'s view straight where it's heading, without animating:
+    /// the workspace it's on, the scroll positions and the zoom.
+    pub fn snap(&mut self, client: ClientId) {
+        let zoom = self.overview_zoom();
+        let view = self.views.get_mut(&client).expect("client is attached");
+        view.y = view.active as f64;
+        let target = view.overview.then_some(zoom);
+        for (strip_view, workspace) in view.strips.iter_mut().zip(&self.list) {
+            *strip_view = StripView::settled(&workspace.strip, target);
+        }
+    }
+
     /// `client`'s current zoom, 1.0 outside the overview.
     pub fn zoom(&self, client: ClientId) -> f64 {
         let view = self.view(client);

@@ -1,5 +1,5 @@
-//! Visual effects over a client's frames, using tachyonfx: new panes
-//! fade in from the background.
+//! Visual effects over a client's frames, using tachyonfx: new panes fade
+//! in from the background, and the overview fades in and out.
 //!
 //! tiri composes frames in its own [`Frame`]; effects run on a copy of it as
 //! a ratatui buffer, with colors resolved to RGB through the client's
@@ -16,11 +16,17 @@ use ratatui_core::style::{Color as RColor, Modifier};
 use tachyonfx::{Effect, Interpolation, fx};
 
 use crate::colors::Palette;
+use crate::kitty;
 use crate::layout::PaneId;
 use crate::render::{Color, Frame, Style};
 
 /// How long a new pane takes to fade in.
 const OPEN_FADE: Duration = Duration::from_millis(200);
+
+/// The overview transition's phases: the old view going out, then the new
+/// one coming in.
+const OVERVIEW_OUT: Duration = Duration::from_millis(130);
+const OVERVIEW_IN: Duration = Duration::from_millis(260);
 
 /// What an effect is drawn over, looked up afresh each frame since panes
 /// move while the strip scrolls.
@@ -112,6 +118,130 @@ impl Effects {
     }
 }
 
+/// Switching between the normal view and the overview in two phases: the
+/// old view fades out to the background, then the new one, already at its
+/// final size, fades in from it.
+///
+/// Text fades through tachyonfx. Thumbnails can't be recolored, since a
+/// cell's color is what names its image, so they fade by being uploaded at
+/// changing opacity instead, following [`Transition::image_opacity`].
+pub struct Transition {
+    /// The view going out, as last drawn.
+    from: Frame,
+    out: Effect,
+    into: Effect,
+    /// Opening the overview, rather than closing it.
+    opening: bool,
+    coming_in: bool,
+    last: Option<Instant>,
+    /// How long each phase has been running.
+    out_elapsed: Duration,
+    in_elapsed: Duration,
+}
+
+impl Transition {
+    /// Into the overview.
+    pub fn opening(from: Frame, palette: &Palette) -> Self {
+        Self::new(from, true, palette)
+    }
+
+    /// Out of the overview.
+    pub fn closing(from: Frame, palette: &Palette) -> Self {
+        Self::new(from, false, palette)
+    }
+
+    fn new(from: Frame, opening: bool, palette: &Palette) -> Self {
+        let background = background(palette);
+        Self {
+            from,
+            out: fx::fade_to(
+                background,
+                background,
+                (OVERVIEW_OUT, Interpolation::QuadIn),
+            ),
+            into: fx::fade_from(
+                background,
+                background,
+                (OVERVIEW_IN, Interpolation::QuadOut),
+            ),
+            opening,
+            coming_in: false,
+            last: None,
+            out_elapsed: Duration::ZERO,
+            in_elapsed: Duration::ZERO,
+        }
+    }
+
+    /// How opaque the overview's thumbnails should be right now, following
+    /// the text: rising as the overview fades in, falling as it fades out.
+    pub fn image_opacity(&self) -> f32 {
+        let progress = |elapsed: Duration, length: Duration| {
+            (elapsed.as_secs_f32() / length.as_secs_f32()).min(1.0)
+        };
+        match (self.opening, self.coming_in) {
+            (true, false) | (false, true) => 0.0,
+            (true, true) => {
+                // Matching the text's QuadOut fade in.
+                let t = progress(self.in_elapsed, OVERVIEW_IN);
+                1.0 - (1.0 - t) * (1.0 - t)
+            }
+            (false, false) => {
+                // Matching the text's QuadIn fade out.
+                let t = progress(self.out_elapsed, OVERVIEW_OUT);
+                1.0 - t * t
+            }
+        }
+    }
+
+    /// Draws the transition at `now` into `frame`, which holds the new
+    /// view. The status bar's row is left alone. Returns false once done.
+    pub fn apply(&mut self, frame: &mut Frame, palette: &Palette, now: Instant) -> bool {
+        let elapsed = self.last.map_or(Duration::ZERO, |last| now - last);
+        self.last = Some(now);
+        let area = Rect::new(0, 0, frame.width(), frame.height().saturating_sub(1));
+        if !self.coming_in {
+            self.out_elapsed += elapsed;
+            // The old view, out of date though it is, still fills the screen.
+            if self.from.width() == frame.width() && self.from.height() == frame.height() {
+                let original = to_buffer(&self.from, palette);
+                let mut buffer = original.clone();
+                self.out.process(elapsed, &mut buffer, area);
+                let status = frame.height().saturating_sub(1);
+                let mut old = self.from.clone();
+                copy_changes(&mut old, &original, &buffer);
+                for x in 0..frame.width() {
+                    // Keep the new status bar.
+                    let (sym, wide, style) = frame.content(x, status);
+                    let sym = sym.to_owned();
+                    if wide {
+                        old.put_wide(i32::from(x), i32::from(status), &sym, style);
+                    } else if !sym.is_empty() {
+                        old.put(i32::from(x), i32::from(status), &sym, style);
+                    }
+                }
+                *frame = old;
+            }
+            if !self.out.done() {
+                return true;
+            }
+            self.coming_in = true;
+            self.last = None;
+            return true;
+        }
+        self.in_elapsed += elapsed;
+        let original = to_buffer(frame, palette);
+        let mut buffer = original.clone();
+        self.into.process(elapsed, &mut buffer, area);
+        copy_changes(frame, &original, &buffer);
+        !self.into.done()
+    }
+}
+
+fn background(palette: &Palette) -> RColor {
+    let [r, g, b] = palette.background;
+    RColor::Rgb(r, g, b)
+}
+
 /// `frame` as a ratatui buffer, colors resolved to RGB.
 fn to_buffer(frame: &Frame, palette: &Palette) -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, frame.width(), frame.height()));
@@ -128,12 +258,19 @@ fn to_buffer(frame: &Frame, palette: &Palette) -> Buffer {
     buffer
 }
 
-/// Copies back the cells effects changed.
+/// Copies back the cells effects changed. Kitty placeholder cells keep
+/// their colors whatever an effect did, since their color names the image
+/// they show; an effect may still blank them.
 fn copy_changes(frame: &mut Frame, original: &Buffer, changed: &Buffer) {
     for y in 0..frame.height() {
         for x in 0..frame.width() {
             let after = &changed[(x, y)];
-            if *after == original[(x, y)] {
+            let before = &original[(x, y)];
+            if *after == *before {
+                continue;
+            }
+            let placeholder = before.symbol().starts_with(kitty::PLACEHOLDER);
+            if placeholder && after.symbol() == before.symbol() {
                 continue;
             }
             let (_, wide, mut style) = frame.content(x, y);
@@ -282,5 +419,109 @@ mod tests {
         let [r, g, b] = palette.background;
         assert_eq!(frame.content(2, 1).2.fg, Color::Rgb(r, g, b));
         assert!(effects.is_active());
+    }
+
+    /// A frame filled with `ch`, as a stand-in for a view.
+    fn filled(ch: &str) -> Frame {
+        let mut frame = Frame::new(40, 11);
+        for y in 0..10 {
+            frame.put_str(0, y, &ch.repeat(40), Style::default());
+        }
+        frame
+    }
+
+    /// Runs `transition` to `at` after it started, with `new` as the view
+    /// coming in, and returns what's drawn.
+    fn run(transition: &mut Transition, new: &Frame, at: &[Duration]) -> Frame {
+        let start = Instant::now();
+        let mut frame = new.clone();
+        for &t in at {
+            frame = new.clone();
+            transition.apply(&mut frame, &Palette::default(), start + t);
+        }
+        frame
+    }
+
+    #[test]
+    fn opening_fades_the_overview_in() {
+        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let ms = Duration::from_millis;
+        assert_eq!(transition.image_opacity(), 0.0);
+        // Through the fade-out, then part way into the fade-in.
+        let frame = run(
+            &mut transition,
+            &filled("n"),
+            &[ms(0), ms(140), ms(141), ms(141 + 100)],
+        );
+        let (sym, _, style) = frame.content(0, 0);
+        assert_eq!(sym, "n", "nothing blanked, just fading");
+        assert_ne!(style.fg, Color::Default, "still mid-fade");
+        let opacity = transition.image_opacity();
+        assert!(opacity > 0.0 && opacity < 1.0, "{opacity}");
+    }
+
+    #[test]
+    fn closing_fades_the_overview_out() {
+        let mut transition = Transition::closing(filled("o"), &Palette::default());
+        let ms = Duration::from_millis;
+        assert_eq!(transition.image_opacity(), 1.0);
+        let frame = run(&mut transition, &filled("n"), &[ms(0), ms(80)]);
+        let (sym, _, style) = frame.content(0, 0);
+        assert_eq!(sym, "o", "the overview, fading");
+        assert_ne!(style.fg, Color::Default);
+        let opacity = transition.image_opacity();
+        assert!(opacity > 0.0 && opacity < 1.0, "{opacity}");
+        // Once the view is coming back in, the thumbnails are gone.
+        run(&mut transition, &filled("n"), &[ms(140), ms(141)]);
+        assert_eq!(transition.image_opacity(), 0.0);
+    }
+
+    #[test]
+    fn placeholder_cells_keep_their_colors() {
+        let mut new = filled("n");
+        let id = Style::fg(Color::Rgb(0, 0, 7));
+        new.put(5, 5, &kitty::placeholder(0, 0), id);
+        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let ms = Duration::from_millis;
+        let frame = run(
+            &mut transition,
+            &new,
+            &[ms(0), ms(140), ms(141), ms(141 + 100)],
+        );
+        assert_eq!(frame.content(5, 5).2.fg, Color::Rgb(0, 0, 7));
+    }
+
+    #[test]
+    fn a_transition_ends_showing_the_new_view_untouched() {
+        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let new = filled("n");
+        let mut running = true;
+        let mut frame = new.clone();
+        for t in (0..60).map(|i| ms(i * 16)) {
+            frame = new.clone();
+            running = transition.apply(&mut frame, &Palette::default(), start + t);
+            if !running {
+                break;
+            }
+        }
+        assert!(!running);
+        assert_eq!(frame.content(0, 0), new.content(0, 0));
+        assert_eq!(frame.content(20, 5), new.content(20, 5));
+    }
+
+    #[test]
+    fn the_status_bar_is_never_part_of_it() {
+        let mut transition = Transition::closing(filled("o"), &Palette::default());
+        let mut new = filled("n");
+        new.put_str(0, 10, "status", Style::default());
+        let frame = run(
+            &mut transition,
+            &new,
+            &[Duration::ZERO, Duration::from_millis(60)],
+        );
+        assert_eq!(frame.content(0, 10).0, "s");
+        assert_eq!(frame.content(0, 10).2.fg, Color::Default);
     }
 }
