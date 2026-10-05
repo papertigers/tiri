@@ -1482,6 +1482,7 @@ dependencies = [
  "rustix",
  "serde",
  "tachyonfx",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

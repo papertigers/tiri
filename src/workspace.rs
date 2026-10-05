@@ -139,6 +139,17 @@ impl Workspaces {
         idx
     }
 
+    /// Removes the workspace named `name`, if it's empty and no client is
+    /// on it.
+    pub fn remove_named(&mut self, name: &str) {
+        if let Some(idx) = self.find(name)
+            && self.list[idx].is_empty()
+        {
+            self.list[idx].name = None;
+            self.normalize();
+        }
+    }
+
     /// Moves `client` to workspace `idx`, sliding there.
     pub fn focus_workspace(&mut self, client: ClientId, idx: usize) {
         if idx < self.list.len() {
@@ -632,6 +643,24 @@ mod tests {
         settle(&mut ws);
         assert!(ws.in_overview(A) && !ws.in_overview(B));
         assert_eq!((ws.zoom(A), ws.zoom(B)), (0.5, 1.0));
+    }
+
+    #[test]
+    fn remove_named_drops_an_empty_workspace_nobody_is_on() {
+        let mut ws = with_client(&[]);
+        ws.insert(A, PaneId(0));
+        ws.create_named("gone".into());
+        assert_eq!(ws.list().len(), 3);
+        ws.remove_named("gone");
+        assert_eq!(ws.find("gone"), None);
+        assert_eq!((ws.list().len(), ws.active_index(A)), (2, 0));
+
+        // One with panes stays.
+        let idx = ws.create_named("kept".into());
+        ws.set_active(A, idx);
+        ws.insert(A, PaneId(1));
+        ws.remove_named("kept");
+        assert_eq!(ws.find("kept"), Some(idx));
     }
 
     #[test]

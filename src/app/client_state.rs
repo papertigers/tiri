@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::colors::Palette;
 use crate::effects::{Effects, Transition};
 use crate::layout::PaneId;
-use crate::pane::Pane;
+use crate::pane::{Pane, ScrollMark};
 use crate::render::{Frame, Renderer};
 use crate::selection::{Point, Selection};
 use crate::thumbnail;
@@ -56,14 +56,26 @@ pub struct Client {
     pub(super) effects: Effects,
     /// The overview fading in or out, if it is.
     pub(super) transition: Option<Transition>,
+    /// Something to tell the user, shown in the status bar for a while.
+    pub(super) notice: Option<Notice>,
 }
 
-/// How far back a client has scrolled a pane, and how much history the pane
-/// had then, so output arriving meanwhile doesn't drag the view along.
+/// A message for the status bar, in place of the key hints.
+#[derive(Debug, Clone)]
+pub(super) struct Notice {
+    pub(super) text: String,
+    pub(super) until: Instant,
+}
+
+/// How long a [`Notice`] stays up.
+const NOTICE_TIME: Duration = Duration::from_secs(8);
+
+/// How far back a client has scrolled a pane, and when it was that far, so
+/// output arriving meanwhile doesn't drag the view along.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Scrollback {
     lines: usize,
-    history: usize,
+    at: ScrollMark,
 }
 
 /// What a held left button is doing.
@@ -86,6 +98,14 @@ impl Client {
     }
 
     /// Whether effects are running, so frames must keep coming.
+    /// Tells the user something, say that what they asked for failed.
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            until: Instant::now() + NOTICE_TIME,
+        });
+    }
+
     pub fn effects_running(&self) -> bool {
         self.effects.is_active() || self.transition.is_some()
     }
@@ -119,8 +139,40 @@ impl Client {
         let Some(scroll) = self.scrollback.get(&id) else {
             return 0;
         };
-        let history = pane.history_size();
-        (scroll.lines + history.saturating_sub(scroll.history)).min(history)
+        // History being cleared returns to the live screen.
+        let since = pane.scrolled_since(scroll.at);
+        since.map_or(0, |since| (scroll.lines + since).min(pane.history_size()))
+    }
+
+    /// Keeps the selection on the text it was made on as output moves that
+    /// up, and drops it once the text or its pane has gone.
+    pub(super) fn follow_selection(&mut self, panes: &HashMap<PaneId, Pane>) {
+        let Some(selection) = &mut self.selection else {
+            return;
+        };
+        let moved = panes.get(&selection.pane).and_then(|pane| {
+            let scrolled = pane.scrolled_since(selection.at)? as i64;
+            let top = -(pane.history_size() as i64);
+            let shift = |p: Point| {
+                let line = i64::from(p.line) - scrolled;
+                (line >= top).then_some(Point {
+                    line: line as i32,
+                    ..p
+                })
+            };
+            Some((shift(selection.anchor)?, shift(selection.head)?))
+        });
+        match (moved, panes.get(&selection.pane)) {
+            (Some((anchor, head)), Some(pane)) => {
+                *selection = Selection {
+                    anchor,
+                    head,
+                    at: pane.scroll_mark(),
+                    ..*selection
+                };
+            }
+            _ => self.selection = None,
+        }
     }
 
     /// Scrolls `pane` back by `lines` (forward if negative), returning to
@@ -136,7 +188,7 @@ impl Client {
                 id,
                 Scrollback {
                     lines: target,
-                    history,
+                    at: pane.scroll_mark(),
                 },
             );
         }

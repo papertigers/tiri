@@ -4,6 +4,7 @@
 use std::io::{self, Write};
 
 use crossterm::{QueueableCommand, cursor, style, terminal};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
@@ -143,13 +144,72 @@ impl Frame {
         (&cell.sym, cell.wide, cell.style)
     }
 
-    /// Writes a string of narrow characters left to right.
+    /// Writes a string left to right, each character taking the columns a
+    /// terminal gives it: two for wide ones, and none for combining marks,
+    /// which join the character before them.
     pub fn put_str(&mut self, x: i32, y: i32, s: &str, style: Style) {
-        for (i, ch) in s.chars().enumerate() {
+        let mut col = x;
+        // The cell the last character went into, for marks that follow it.
+        let mut last: Option<usize> = None;
+        for ch in s.chars() {
             let mut buf = [0u8; 4];
-            self.put(x + i as i32, y, ch.encode_utf8(&mut buf), style);
+            let sym = &*ch.encode_utf8(&mut buf);
+            match char_width(ch) {
+                0 => {
+                    if let Some(i) = last {
+                        self.cells[i].sym.push(ch);
+                    }
+                }
+                2 => {
+                    self.put_wide(col, y, sym, style);
+                    // Clipped by the right edge, it was drawn as a blank.
+                    last = self.index(col, y).filter(|&i| self.cells[i].wide);
+                    col += 2;
+                }
+                _ => {
+                    self.put(col, y, sym, style);
+                    last = self.index(col, y);
+                    col += 1;
+                }
+            }
         }
     }
+}
+
+/// Whether printing `cell` moves the cursor exactly one column in any
+/// terminal: a single narrow character from before the symbol blocks.
+/// Those blocks on (U+2600 up) hold emoji and wide scripts, which terminals
+/// size differently, as they do characters with marks or variation
+/// selectors attached. Letters, line drawing and block shapes are before.
+fn advances_one(cell: &Cell) -> bool {
+    let mut chars = cell.sym.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => !cell.wide && ch < '\u{2600}' && ch.width() == Some(1),
+        _ => false,
+    }
+}
+
+/// The columns `ch` takes in a terminal. Control characters count as one,
+/// since they're drawn as a blank.
+fn char_width(ch: char) -> usize {
+    ch.width().unwrap_or(1)
+}
+
+/// The columns `s` takes when drawn with [`Frame::put_str`].
+pub fn text_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// As much of the start of `s` as fits in `max` columns.
+pub fn fit_width(s: &str, max: usize) -> &str {
+    let mut width = 0;
+    for (i, ch) in s.char_indices() {
+        width += char_width(ch);
+        if width > max {
+            return &s[..i];
+        }
+    }
+    s
 }
 
 /// Control characters would move the outer terminal's cursor behind the
@@ -219,8 +279,9 @@ impl Renderer {
                     current = Some(cell.style);
                 }
                 out.queue(style::Print(&cell.sym))?;
-                let advance = if cell.wide { 2 } else { 1 };
-                pos = Some((x + advance, y));
+                // Where terminals may disagree on how far that moved the
+                // cursor, the next cell says where it goes.
+                pos = advances_one(cell).then_some((x + 1, y));
             }
         }
 
@@ -268,6 +329,34 @@ fn color(c: Color) -> style::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_str_gives_characters_their_width() {
+        let mut f = Frame::new(8, 1);
+        f.put_str(0, 0, "a字e\u{301}b", Style::default());
+        let syms: Vec<&str> = f.cells.iter().map(|c| c.sym.as_str()).collect();
+        assert_eq!(syms, ["a", "字", "", "e\u{301}", "b", " ", " ", " "]);
+        assert!(f.cells[1].wide);
+        assert_eq!(text_width("a字e\u{301}b"), 5);
+        assert_eq!(fit_width("a字e\u{301}b", 2), "a");
+        assert_eq!(fit_width("a字e\u{301}b", 4), "a字e\u{301}");
+        assert_eq!(fit_width("ab", 5), "ab");
+    }
+
+    #[test]
+    fn the_cursor_is_placed_again_after_uncertain_widths() {
+        let mut out = Vec::new();
+        let mut f = Frame::new(12, 1);
+        f.put_str(0, 0, "a─b☺c字de\u{301}f", Style::default());
+        Renderer::default().draw(&mut out, &[], f, None).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        // Letters and line drawing run together. After a symbol, a wide
+        // character or one with a mark, the next cell is placed.
+        assert!(
+            out.contains("a─b☺\x1b[1;5Hc字\x1b[1;8Hde\u{301}\x1b[1;10Hf"),
+            "{out:?}"
+        );
+    }
 
     #[test]
     fn put_clips_outside_frame() {

@@ -111,6 +111,13 @@ impl Client {
             .is_none_or(|t| t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL);
         if stale {
             let image = thumbnail::rasterize(pane.term(), &self.palette, self.thumbnail_cell);
+            let Some(image) = image else {
+                // Too big for a thumbnail; the overview shows its text.
+                if self.thumbnails.remove(&id).is_some() {
+                    kitty::delete(&mut self.escapes, image_id);
+                }
+                return;
+            };
             self.thumbnails.insert(
                 id,
                 Thumbnail {

@@ -2,7 +2,7 @@
 //! the actions they map to.
 
 use anyhow::Result;
-use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::effects::Transition;
 use crate::input::encode_key;
@@ -28,12 +28,8 @@ impl App {
                 }
             } else {
                 // Holding Ctrl through, as in C-a C-n, works too.
-                let without_ctrl = Key::from_event(KeyEvent::new(
-                    event.code,
-                    event.modifiers - KeyModifiers::CONTROL,
-                ));
                 let action = (bindings.prefix_binds.get(key))
-                    .or_else(|| bindings.prefix_binds.get(without_ctrl));
+                    .or_else(|| bindings.prefix_binds.get(key.without_ctrl()?));
                 if let Some(action) = action {
                     self.run(client, action)?;
                 }

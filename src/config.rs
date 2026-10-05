@@ -7,16 +7,16 @@
 //! `tiri config default` prints for a starting point.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent};
 use knus::ast::{Literal, SpannedNode, TypeName};
 use knus::decode::{Context, Kind};
 use knus::errors::{DecodeError, ExpectedType};
 use knus::span::Spanned;
 use knus::traits::{DecodeScalar, ErrorSpan};
-use miette::{GraphicalReportHandler, GraphicalTheme};
+use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, LabeledSpan, SourceCode};
 
 use crate::keys::{Action, Bindings, Key, Table};
 use crate::render::Color;
@@ -43,39 +43,140 @@ impl Default for Config {
             binds: Table::default(),
             overview_binds: Table::default(),
         };
-        raw.resolve("default-config.kdl", empty)
-            .expect("the default config is valid")
+        raw.resolve(empty).expect("the default config is valid")
     }
 }
 
 impl Config {
     /// Reads the config at `path`; defaults if there's no file.
-    pub fn load(path: &Path) -> Result<Config> {
+    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+        let file = path.display().to_string();
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(e) => bail!("couldn't read {}: {e}", path.display()),
+            Err(e) => return Err(ConfigError::plain(&file, format!("couldn't read it: {e}"))),
         };
-        Config::parse(&path.display().to_string(), &text)
+        Config::parse(&file, &text)
     }
 
     /// Parses config `text`, naming it `file` in errors. Its key bindings
     /// add to and override the built-in ones.
-    pub fn parse(file: &str, text: &str) -> Result<Config> {
-        decode(file, text)?.resolve(file, Config::default().bindings)
+    pub fn parse(file: &str, text: &str) -> Result<Config, ConfigError> {
+        decode(file, text)?
+            .resolve(Config::default().bindings)
+            .map_err(|problem| ConfigError::plain(file, problem))
+    }
+}
+
+/// What's wrong with a config file.
+#[derive(Debug)]
+pub struct ConfigError {
+    /// The first problem on one line, for the status bar: the file's name,
+    /// the line if there is one, and what's wrong there.
+    pub summary: String,
+    /// Every problem, with the lines at fault.
+    report: String,
+}
+
+impl ConfigError {
+    /// A problem that isn't at any one place in the file.
+    fn plain(file: &str, problem: String) -> Self {
+        Self {
+            summary: format!("{}: {problem}", file_name(file)),
+            report: format!("{file}: {problem}"),
+        }
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.report)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+fn file_name(file: &str) -> &str {
+    Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file)
+}
+
+/// One of knus's errors, to be shown against the file's text. On its own
+/// it has no text to quote; and knus's own top-level error only says
+/// "error parsing KDL" above the list of them.
+struct InFile<'a> {
+    problem: &'a dyn Diagnostic,
+    text: &'a dyn SourceCode,
+}
+
+impl fmt::Debug for InFile<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(self.problem, f)
+    }
+}
+
+impl fmt::Display for InFile<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self.problem, f)
+    }
+}
+
+impl std::error::Error for InFile<'_> {}
+
+impl Diagnostic for InFile<'_> {
+    fn help<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+        self.problem.help()
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
+        self.problem.labels()
+    }
+
+    fn source_code(&self) -> Option<&dyn SourceCode> {
+        Some(self.text)
     }
 }
 
 /// Decodes config `text` without looking names up.
-fn decode(file: &str, text: &str) -> Result<RawConfig> {
+fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
     knus::parse(file, text).map_err(|e| {
-        // An error report showing the offending lines, as plain text: it
-        // reaches the user through the attaching client.
-        let mut report = String::new();
+        let problems: Vec<&dyn Diagnostic> = e.related().into_iter().flatten().collect();
+        let Some(first) = problems.first() else {
+            return ConfigError::plain(file, e.to_string());
+        };
+        let line = first
+            .labels()
+            .and_then(|mut labels| labels.next())
+            .map(|label| {
+                let before = &text.as_bytes()[..label.offset().min(text.len())];
+                before.iter().filter(|&&b| b == b'\n').count() + 1
+            });
+        let mut summary = match line {
+            Some(line) => format!("{}:{line}: {first}", file_name(file)),
+            None => format!("{}: {first}", file_name(file)),
+        };
+        if problems.len() > 1 {
+            summary += &format!(" (and {} more)", problems.len() - 1);
+        }
+
+        // Each problem with the lines at fault, as plain text: it goes to
+        // the server's log and to terminals.
         let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
-        match handler.render_report(&mut report, &e) {
-            Ok(()) => anyhow::anyhow!("{report}"),
-            Err(_) => anyhow::anyhow!("{file}: {e}"),
+        let mut report = format!("{file} has errors:\n");
+        for problem in &problems {
+            let shown = InFile {
+                problem: *problem,
+                text: e.source_code().unwrap_or(&text),
+            };
+            if handler.render_report(&mut report, &shown).is_err() {
+                report += &format!("  {problem}\n");
+            }
+        }
+        ConfigError {
+            summary,
+            report: report.trim_end().to_owned(),
         }
     })
 }
@@ -153,11 +254,11 @@ impl<S: ErrorSpan> knus::Decode<S> for RawBind {
 
 impl RawBinds {
     /// Applies these bindings on top of `table`.
-    fn apply_to(self, table: &mut Table, file: &str, section: &str) -> Result<()> {
+    fn apply_to(self, table: &mut Table, section: &str) -> Result<(), String> {
         let mut seen = HashSet::new();
         for bind in self.binds {
             if !seen.insert(bind.key) {
-                bail!("{file}: {section} has {} more than once", bind.key);
+                return Err(format!("{section} has {} more than once", bind.key));
             }
             table.set(bind.key, bind.action);
         }
@@ -191,36 +292,37 @@ struct RawTheme {
 
 impl RawConfig {
     /// Looks names up, and lays this config's bindings over `bindings`.
-    fn resolve(self, file: &str, mut bindings: Bindings) -> Result<Config> {
+    fn resolve(self, mut bindings: Bindings) -> Result<Config, String> {
         if let Some(ConfigKey(prefix)) = self.prefix {
             bindings.prefix = prefix;
         }
         self.prefix_binds
-            .apply_to(&mut bindings.prefix_binds, file, "prefix-binds")?;
-        self.binds.apply_to(&mut bindings.binds, file, "binds")?;
+            .apply_to(&mut bindings.prefix_binds, "prefix-binds")?;
+        self.binds.apply_to(&mut bindings.binds, "binds")?;
         self.overview_binds
-            .apply_to(&mut bindings.overview_binds, file, "overview-binds")?;
+            .apply_to(&mut bindings.overview_binds, "overview-binds")?;
 
         let mut defined: Vec<(String, Theme)> = Vec::new();
         for raw in self.themes {
             let taken =
                 Theme::named(&raw.name).is_some() || defined.iter().any(|(n, _)| *n == raw.name);
             if taken {
-                bail!("{file}: there's already a theme named {:?}", raw.name);
+                return Err(format!("there's already a theme named {:?}", raw.name));
             }
             // Themes can build on built-in ones, or ones defined above.
             let base = match &raw.based_on {
                 None => Theme::default(),
                 Some(name) => lookup(name, &defined)
-                    .ok_or_else(|| unknown_theme(file, "based-on", name, &defined))?,
+                    .ok_or_else(|| unknown_theme("based-on", name, &defined))?,
             };
             let name = raw.name.clone();
             defined.push((name, raw.apply_to(base)));
         }
         let theme = match &self.theme {
             None => Theme::default(),
-            Some(name) => lookup(name, &defined)
-                .ok_or_else(|| unknown_theme(file, "theme", name, &defined))?,
+            Some(name) => {
+                lookup(name, &defined).ok_or_else(|| unknown_theme("theme", name, &defined))?
+            }
         };
         Ok(Config { theme, bindings })
     }
@@ -255,17 +357,12 @@ fn lookup(name: &str, defined: &[(String, Theme)]) -> Option<Theme> {
         .or_else(|| Theme::named(name))
 }
 
-fn unknown_theme(
-    file: &str,
-    setting: &str,
-    name: &str,
-    defined: &[(String, Theme)],
-) -> anyhow::Error {
+fn unknown_theme(setting: &str, name: &str, defined: &[(String, Theme)]) -> String {
     let names: Vec<&str> = (Theme::ALL.iter().map(|(n, _)| *n))
         .chain(defined.iter().map(|(n, _)| n.as_str()))
         .collect();
-    anyhow::anyhow!(
-        "{file}: {setting} {name:?} isn't a theme; there's {}",
+    format!(
+        "{setting} {name:?} isn't a theme; there's {}",
         names.join(", ")
     )
 }
@@ -376,7 +473,7 @@ fn parse_hex(s: &str) -> Option<Color> {
 mod tests {
     use super::*;
 
-    fn parse(text: &str) -> Result<Config> {
+    fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse("config.kdl", text)
     }
 
@@ -460,6 +557,41 @@ mod tests {
         assert!(no_action.contains("needs one action"), "{no_action}");
         let bad_prefix = err(r#"prefix "Ctrl+""#);
         assert!(bad_prefix.contains("no key given"), "{bad_prefix}");
+    }
+
+    #[test]
+    fn errors_have_a_line_for_the_status_bar_and_a_full_report() {
+        let err = Config::parse(
+            "/home/me/.config/tiri/config.kdl",
+            "theme \"oxide\"\ndefine-theme \"x\" {\n    dim \"red\"\n    status-fg 300\n}\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.summary,
+            "config.kdl:3: colors are written \"#rrggbb\" (and 1 more)"
+        );
+        let report = err.to_string();
+        assert!(
+            report.starts_with("/home/me/.config/tiri/config.kdl has errors:\n"),
+            "{report}"
+        );
+        // Both problems, each quoting its line, and none of knus's wrapping.
+        assert!(
+            report.contains("dim \"red\"") && report.contains("status-fg 300"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("error parsing KDL") && !report.contains("Error:"),
+            "{report}"
+        );
+        assert!(!report.ends_with('\n'));
+
+        let err = Config::parse("/etc/config.kdl", "theme \"nope\"").unwrap_err();
+        assert_eq!(
+            err.summary,
+            "config.kdl: theme \"nope\" isn't a theme; there's default, oxide"
+        );
+        assert!(err.to_string().starts_with("/etc/config.kdl: theme"));
     }
 
     #[test]

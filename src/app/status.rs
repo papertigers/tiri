@@ -2,7 +2,7 @@
 //! right.
 
 use crate::layout::Visibility;
-use crate::render::{Frame, Style};
+use crate::render::{Frame, Style, fit_width, text_width};
 
 use crate::keys::Action::{self, *};
 use crate::keys::{Bindings, Key, Table, hint_keys};
@@ -110,7 +110,22 @@ impl App {
         let mut x = 0;
         for segment in self.status_segments(client) {
             frame.put_str(x, y, &segment.text, segment.style);
-            x += segment.text.chars().count() as i32;
+            x += text_width(&segment.text) as i32;
+        }
+
+        let room = (i32::from(client.width) - x - 2).max(0) as usize;
+        if let Some(notice) = &client.notice {
+            // In the colors of the active workspace's number, to stand out.
+            let style = Style {
+                fg: theme.status_active_fg,
+                bg: theme.status_active_bg,
+                bold: true,
+                ..base
+            };
+            let text = format!(" {} ", fit_width(&notice.text, room.saturating_sub(2)));
+            let notice_x = i32::from(client.width) - text_width(&text) as i32;
+            frame.put_str(notice_x, y, &text, style);
+            return;
         }
 
         let overview = self.workspaces.in_overview(client.id);
@@ -121,9 +136,8 @@ impl App {
         } else {
             normal_hints(&self.config.bindings)
         };
-        let room = (i32::from(client.width) - x - 2).max(0) as usize;
         let hint = fit_hints(&hints, room);
-        let hint_x = i32::from(client.width) - hint.chars().count() as i32;
+        let hint_x = i32::from(client.width) - text_width(&hint) as i32;
         if !hint.is_empty() {
             frame.put_str(hint_x, y, &hint, base);
         }
@@ -136,7 +150,7 @@ fn fit_hints(hints: &[String], room: usize) -> String {
     let mut out = String::new();
     for hint in hints {
         let sep = if out.is_empty() { "" } else { "  " };
-        if out.chars().count() + sep.len() + hint.chars().count() + 1 > room {
+        if text_width(&out) + sep.len() + text_width(hint) + 1 > room {
             break;
         }
         out.push_str(sep);

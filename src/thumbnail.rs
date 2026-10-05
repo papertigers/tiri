@@ -98,13 +98,32 @@ impl Image {
     }
 }
 
+/// The most pixels a thumbnail may have: 32 MB of RGBA.
+const MAX_PIXELS: usize = 8 << 20;
+
+/// The cell size to draw a `cols` x `rows` screen at, given the size the
+/// terminal's cell shape asks for: that if the image stays within
+/// [`MAX_PIXELS`], otherwise the nearest shape 8 pixels across. None if
+/// even that would be too big.
+fn fit_cell(cell_size: CellSize, cols: usize, rows: usize) -> Option<CellSize> {
+    let (w, h) = cell_size;
+    let rounded = (8, ((8 * h + w / 2) / w).max(1));
+    [cell_size, rounded].into_iter().find(|&(w, h)| {
+        let pixels = (cols.checked_mul(w)).and_then(|x| x.checked_mul(rows.checked_mul(h)?));
+        pixels.is_some_and(|p| p <= MAX_PIXELS)
+    })
+}
+
 /// Draws `term`'s screen in `palette`, the colors of the terminal the
-/// thumbnail is for, with cells `cell_height` pixels tall. The default
-/// background is left transparent so that terminal's own background shows
-/// through.
-pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> Image {
+/// thumbnail is for, with cells of `cell_size` or smaller (see
+/// [`fit_cell`]). The default background is left transparent so that
+/// terminal's own background shows through. None if the screen is too big
+/// for a thumbnail.
+pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> Option<Image> {
     let (rows, cols) = (term.screen_lines(), term.columns());
+    let cell_size = fit_cell(cell_size, cols, rows)?;
     let (cell_width, cell_height) = cell_size;
+    // Within MAX_PIXELS, so each side fits a u32.
     let mut image = Image::new((cols * cell_width) as u32, (rows * cell_height) as u32);
     let colors = term.colors();
     for row in 0..rows {
@@ -121,7 +140,7 @@ pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> I
             );
         }
     }
-    image
+    Some(image)
 }
 
 fn draw_cell(
@@ -271,7 +290,19 @@ mod tests {
     }
 
     fn rasterize_default<T>(term: &Term<T>) -> Image {
-        rasterize(term, &Palette::default(), DEFAULT_CELL)
+        rasterize(term, &Palette::default(), DEFAULT_CELL).expect("small enough")
+    }
+
+    #[test]
+    fn big_screens_get_smaller_cells_or_no_thumbnail() {
+        // An ordinary pane keeps the exact shape.
+        assert_eq!(fit_cell((17, 41), 80, 24), Some((17, 41)));
+        // A big one at a fine shape is rounded to 8 across.
+        assert_eq!(fit_cell((17, 41), 250, 70), Some((8, 19)));
+        assert_eq!(fit_cell((8, 17), 370, 87), Some((8, 17)));
+        // The biggest screen a client may claim gets none.
+        assert_eq!(fit_cell((32, 127), 1000, 500), None);
+        assert_eq!(fit_cell((8, 16), 1000, 500), None);
     }
 
     #[test]
@@ -287,7 +318,7 @@ mod tests {
         assert_eq!(cell_size_for(Some((250, 509))), (8, 16));
         assert_eq!(cell_size_for(Some((255, 1))), (8, 16));
         assert_eq!(cell_size_for(Some((1000, 2000))), (8, 16));
-        let image = rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20));
+        let image = rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20)).unwrap();
         assert_eq!((image.width, image.height), (27, 40));
     }
 
@@ -298,7 +329,8 @@ mod tests {
             &term_with(2, 1, "\u{2500}\u{2500}".as_bytes()),
             &Palette::default(),
             (9, 20),
-        );
+        )
+        .unwrap();
         let lit = (0..18)
             .filter(|&x| (0..20).any(|y| pixel(&image, x, y)[3] == 0xff))
             .count();
@@ -315,7 +347,8 @@ mod tests {
             &term_with(1, 1, b"L"),
             &Palette::from_reported(&reported),
             DEFAULT_CELL,
-        );
+        )
+        .unwrap();
         assert_eq!(pixel(&image, 0, 0), [1, 2, 3, 0xff]);
     }
 

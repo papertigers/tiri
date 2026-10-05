@@ -7,6 +7,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::input::encode_mouse;
 use crate::layout::PaneId;
+use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
 
 use super::client_state::Drag;
@@ -41,7 +42,7 @@ impl App {
         if y == i32::from(client.height) - 1 {
             let mut left = 0;
             for segment in self.status_segments(client) {
-                let right = left + segment.text.chars().count() as i32;
+                let right = left + text_width(&segment.text) as i32;
                 if (left..right).contains(&x) {
                     return segment.target.map_or(Hit::Nothing, Hit::Status);
                 }
@@ -117,6 +118,7 @@ impl App {
     /// Handles a mouse event from `client`.
     pub fn mouse(&mut self, client: &mut Client, event: MouseEvent) {
         self.lay_out_for(client);
+        client.follow_selection(&self.panes);
         let (x, y) = (i32::from(event.column), i32::from(event.row));
         let overview = self.workspaces.in_overview(client.id);
         let shift = event.modifiers.contains(KeyModifiers::SHIFT);
@@ -248,6 +250,7 @@ impl App {
                         pane: id,
                         anchor,
                         head,
+                        at: pane.scroll_mark(),
                     });
                 }
             }

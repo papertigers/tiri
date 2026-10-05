@@ -146,7 +146,11 @@ fn relay(stream: &mut UnixStream, decoder: &mut Decoder, socket: &Path) -> Resul
             Some(ServerMsg::Exit(reason)) => return Ok(reason),
             Some(ServerMsg::Error(e)) => bail!(e),
             Some(_) => {}
-            None => return Ok(ExitReason::ServerExited),
+            // A server that's shutting down says so first.
+            None => bail!(
+                "the tiri server went away unexpectedly; its log may say why: {}",
+                socket::log_path(socket).display()
+            ),
         }
     }
 }

@@ -52,6 +52,8 @@ struct Connection {
     closing: bool,
     /// The other end hung up, or the connection failed.
     dead: bool,
+    /// A frame was held back while this was behind, so it's owed one.
+    owed_frame: bool,
 }
 
 impl Connection {
@@ -64,6 +66,7 @@ impl Connection {
             client: None,
             closing: false,
             dead: false,
+            owed_frame: false,
         }
     }
 
@@ -200,6 +203,7 @@ fn event_loop(
     let mut kill = false;
     let mut animating = false;
     let mut last_tick = Instant::now();
+    let mut last_draw = Instant::now();
     let mut accept_paused_until: Option<Instant> = None;
 
     loop {
@@ -215,7 +219,7 @@ fn event_loop(
             .filter_map(|c| c.client.as_ref())
             .filter_map(|client| app.next_deadline(client));
         let deadline = [
-            animating.then(|| Instant::now() + FRAME),
+            animating.then(|| last_draw + FRAME),
             (!had_panes).then_some(started + STARTUP_GRACE),
             accept_paused_until,
             app.reap_deadline(),
@@ -305,7 +309,9 @@ fn event_loop(
         app.reap_exited();
 
         had_panes |= !app.is_empty();
-        let abandoned = !had_panes && connections.is_empty() && started.elapsed() > STARTUP_GRACE;
+        // Nobody attached in time. Connections that never said hello don't
+        // keep the server alive; shutting down tells them it's gone.
+        let abandoned = !had_panes && started.elapsed() >= STARTUP_GRACE;
         if kill || app.quit || (had_panes && app.is_empty()) || abandoned {
             return Ok(());
         }
@@ -321,10 +327,39 @@ fn event_loop(
         last_tick = now;
         animating = app.tick(dt.max(Duration::from_millis(1)));
 
+        // Draw when something may have changed: a pane or a client said
+        // something, a deadline passed, an animation's next frame is due,
+        // or a client that was behind has caught up. Waking only because a
+        // socket can take more output isn't a reason: drawing then would
+        // answer a slow client with more frames.
+        let changed = events.is_empty()
+            || events.iter().any(|event| match event.key {
+                LISTENER_KEY => false,
+                key if key >= CONNECTION_KEY_BASE => event.readable,
+                _ => true,
+            });
+        let frame_due = animating && now.duration_since(last_draw) >= FRAME;
+        let caught_up = (connections.values()).any(|c| c.owed_frame && c.wants_frames());
+        let drawing = changed || frame_due || caught_up;
+        if drawing {
+            last_draw = now;
+        }
+
         for connection in connections.values_mut() {
-            if !connection.wants_frames() || connection.dead {
+            if connection.dead || connection.client.is_none() {
                 continue;
             }
+            if !drawing || !connection.wants_frames() {
+                connection.owed_frame |= drawing;
+                // Effects still running need their next frame in time.
+                animating |= connection.wants_frames()
+                    && connection
+                        .client
+                        .as_ref()
+                        .is_some_and(Client::effects_running);
+                continue;
+            }
+            connection.owed_frame = false;
             let Some(client) = connection.client.as_mut() else {
                 continue;
             };
@@ -436,6 +471,8 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 _ => Ok(()),
             };
             if let Err(e) = result {
+                // Otherwise the key just seems to do nothing.
+                client.notify(format!("{e:#}"));
                 log::error!("{}: {e:#}", connection.name());
             }
         }

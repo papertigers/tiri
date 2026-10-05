@@ -108,10 +108,22 @@ impl App {
             cell_pixels,
         } = hello;
         let (width, height) = clamp_size(width, height);
-        // Edits to the config apply from the next attach, for everyone.
-        if let Some(path) = &self.config_path {
-            self.config = Config::load(path)?;
-        }
+        // Edits to the config apply from the next attach, for everyone. A
+        // config with mistakes is left out, with a word to whoever attached:
+        // refusing would shut them out of their own panes.
+        let config_error = self
+            .config_path
+            .as_ref()
+            .and_then(|path| match Config::load(path) {
+                Ok(config) => {
+                    self.config = config;
+                    None
+                }
+                Err(e) => {
+                    log::warn!("keeping the config as it was: {e}");
+                    Some(e.summary)
+                }
+            });
         let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
@@ -151,12 +163,20 @@ impl App {
             last_click: None,
             effects: Effects::default(),
             transition: None,
+            notice: None,
         };
+        if let Some(error) = config_error {
+            client.notify(format!("{error}; config not applied"));
+        }
         self.lay_out_for(&client);
         if (matches!(target, Target::New(_)) || self.panes.is_empty())
             && let Err(e) = self.open_column(&mut client)
         {
             self.detach(&mut client);
+            if let Target::New(name) = &target {
+                // Not left behind, empty, for the next try to trip over.
+                self.workspaces.remove_named(name);
+            }
             return Err(e);
         }
         Ok(client)
@@ -302,8 +322,8 @@ impl App {
     }
 
     /// The next time something needs doing for `client` without any input:
-    /// a pane's synchronized update timing out, or a thumbnail due for a
-    /// redraw.
+    /// a pane's synchronized update timing out, a thumbnail due for a
+    /// redraw, or a notice due to come down.
     pub fn next_deadline(&self, client: &Client) -> Option<Instant> {
         let stale_thumbnails = client.thumbnails.iter().filter_map(|(id, thumb)| {
             let pane = self.panes.get(id)?;
@@ -313,6 +333,7 @@ impl App {
             .values()
             .filter_map(Pane::sync_deadline)
             .chain(stale_thumbnails)
+            .chain(client.notice.as_ref().map(|notice| notice.until))
             .min()
     }
 

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::effects::Transition;
 use crate::kitty;
-use crate::render::{Frame, Style};
+use crate::render::{Frame, Style, fit_width, text_width};
 
 use super::geometry::PaneBox;
 use super::screen::{content_top, draw_screen};
@@ -16,6 +16,10 @@ impl App {
     /// Composes `client`'s view of the workspaces plus its status bar.
     /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
+        client.follow_selection(&self.panes);
+        if (client.notice.as_ref()).is_some_and(|notice| notice.until <= Instant::now()) {
+            client.notice = None;
+        }
         let visible = self.visible_panes(client);
 
         let thumbnails = self.showing_thumbnails(client);
@@ -131,11 +135,8 @@ impl App {
             } else {
                 format!(" {number}: {} ", pane.title())
             };
-            let title: String = title
-                .chars()
-                .take(w.saturating_sub(4).max(0) as usize)
-                .collect();
-            frame.put_str(x + 2, y, &title, border);
+            let room = usize::try_from(w - 4).unwrap_or(0);
+            frame.put_str(x + 2, y, fit_width(&title, room), border);
 
             let top = content_top(pane, h - 2, scrolled);
             match client.thumbnails.get(&id) {
@@ -228,7 +229,7 @@ impl App {
             (false, true) => "empty workspace: C-a n opens a column",
             (false, false) => "empty workspace",
         };
-        let hint_width = hint.chars().count() as i32;
+        let hint_width = text_width(hint) as i32;
         let middle = top + row_height / 2;
         if overview {
             // A box the size of a default column, where one would open.
@@ -259,7 +260,7 @@ impl App {
             ..Style::fg(self.config.theme.status_fg)
         };
         let mut note = |y: i32, text: String| {
-            let x = i32::from(client.width) - text.chars().count() as i32 - 1;
+            let x = i32::from(client.width) - text_width(&text) as i32 - 1;
             frame.put_str(x, y, &text, style);
         };
         if above > 0 {

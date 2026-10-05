@@ -2,8 +2,9 @@
 //! the tables for each mode.
 //!
 //! Keys are normalized to what a terminal can tell apart: a shifted letter
-//! is just the capital (`Shift+h`, `Shift+H` and `H` are one key), and
-//! Ctrl with a letter ignores case, since terminals send both the same.
+//! is just the capital (`Shift+h`, `Shift+H` and `H` are one key), Ctrl
+//! with a letter ignores case, since terminals send both the same, and
+//! Ctrl with a symbol is the one control character terminals send for it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -27,7 +28,7 @@ impl Key {
                 // A character says whether Shift was down by its case.
                 mods.remove(KeyModifiers::SHIFT);
                 if mods.contains(KeyModifiers::CONTROL) {
-                    KeyCode::Char(c.to_ascii_lowercase())
+                    KeyCode::Char(control_char(c))
                 } else {
                     KeyCode::Char(c)
                 }
@@ -45,6 +46,24 @@ impl Key {
     /// The key a terminal reported.
     pub fn from_event(event: KeyEvent) -> Self {
         Self::new(event.code, event.modifiers)
+    }
+
+    /// The key this would be with Ctrl let go, for typing a binding after
+    /// the prefix with Ctrl still held. Terminals send Ctrl+i, Ctrl+m and
+    /// Ctrl+[ as Tab, Enter and Escape, so those count as i, m and [.
+    pub fn without_ctrl(self) -> Option<Key> {
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            return Some(Key::new(self.code, self.mods - KeyModifiers::CONTROL));
+        }
+        let c = match self.code {
+            KeyCode::Tab => 'i',
+            KeyCode::Enter => 'm',
+            KeyCode::Esc => '[',
+            _ => return None,
+        };
+        self.mods
+            .is_empty()
+            .then(|| Key::new(KeyCode::Char(c), self.mods))
     }
 
     /// A single character typed with no modifiers but Shift, if that's
@@ -94,6 +113,21 @@ impl Key {
     /// The key written compactly for the status bar, as in "C-a" or "Alt-⏎".
     pub fn short(self) -> String {
         self.short_mods() + &self.short_name()
+    }
+}
+
+/// The character Ctrl+`c` is known by. Terminals send one control
+/// character for several keys (0x1F for Ctrl+_, Ctrl+/ and Ctrl+7, say),
+/// and crossterm reports 0x1C to 0x1F as Ctrl+4 to Ctrl+7, so each group
+/// goes by the name it has in ASCII: `\`, `]`, `^`, `_`, and Space for NUL.
+fn control_char(c: char) -> char {
+    match c {
+        '4' | '\\' => '\\',
+        '5' | ']' => ']',
+        '6' | '^' => '^',
+        '7' | '_' | '/' => '_',
+        '2' | '@' | ' ' => ' ',
+        c => c.to_ascii_lowercase(),
     }
 }
 
@@ -161,6 +195,19 @@ impl FromStr for Key {
                 } else {
                     c
                 };
+                if mods.contains(KeyModifiers::CONTROL) {
+                    let sent_as = match c.to_ascii_lowercase() {
+                        'i' => Some("Tab"),
+                        'm' => Some("Enter"),
+                        '[' | '3' => Some("Escape"),
+                        _ => None,
+                    };
+                    if let Some(name) = sent_as {
+                        return Err(format!(
+                            "terminals send Ctrl+{c} as {name}, so bind {name} instead"
+                        ));
+                    }
+                }
                 KeyCode::Char(c)
             }
             (None, _) => return Err("no key given".to_owned()),
@@ -354,6 +401,44 @@ mod tests {
             event(KeyCode::Char('a'), KeyModifiers::CONTROL)
         );
         assert_eq!(key("Ctrl+A"), key("ctrl+a"));
+    }
+
+    #[test]
+    fn ctrl_symbols_are_the_control_character_terminals_send() {
+        // crossterm reports 0x1D, which Ctrl+] sends, as Ctrl+5.
+        assert_eq!(
+            key("Ctrl+]"),
+            event(KeyCode::Char('5'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            key("Ctrl+\\"),
+            event(KeyCode::Char('4'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            key("Ctrl+/"),
+            event(KeyCode::Char('7'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(key("Ctrl+/"), key("Ctrl+_"));
+        assert_eq!(
+            key("Ctrl+Space"),
+            event(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        );
+        assert_eq!(key("Ctrl+@"), key("Ctrl+Space"));
+        assert_eq!(key("Ctrl+]").to_string(), "Ctrl+]");
+        // These three arrive as other keys entirely.
+        let err = |s: &str| s.parse::<Key>().unwrap_err();
+        assert!(err("Ctrl+i").contains("bind Tab instead"));
+        assert!(err("Ctrl+[").contains("bind Escape instead"));
+    }
+
+    #[test]
+    fn ctrl_held_after_the_prefix() {
+        assert_eq!(key("Ctrl+n").without_ctrl(), Some(key("n")));
+        assert_eq!(key("Ctrl+]").without_ctrl(), Some(key("]")));
+        assert_eq!(key("Tab").without_ctrl(), Some(key("i")));
+        assert_eq!(key("Escape").without_ctrl(), Some(key("[")));
+        assert_eq!(key("n").without_ctrl(), None);
+        assert_eq!(key("Alt+Enter").without_ctrl(), None);
     }
 
     #[test]

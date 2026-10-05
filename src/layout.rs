@@ -61,6 +61,15 @@ impl Column {
         self.panes[self.focus]
     }
 
+    /// Focuses the pane at `row`. Moving off a fullscreen pane would focus
+    /// one it hides, so that ends fullscreen.
+    fn set_focus(&mut self, row: usize) {
+        if row != self.focus {
+            self.fullscreen = None;
+            self.focus = row;
+        }
+    }
+
     /// Takes out the pane at `idx`, keeping focus on the same pane if it
     /// stays, or on its neighbor if it was the one removed.
     fn take(&mut self, idx: usize) -> PaneId {
@@ -247,19 +256,13 @@ impl Strip {
 
     pub fn focus_up(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
-            // Moving around a fullscreen pane's stack would mean focusing
-            // panes it hides, so that ends fullscreen.
-            col.fullscreen = None;
-            col.focus = col.focus.saturating_sub(1);
+            col.set_focus(col.focus.saturating_sub(1));
         }
     }
 
     pub fn focus_down(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
-            // Moving around a fullscreen pane's stack would mean focusing
-            // panes it hides, so that ends fullscreen.
-            col.fullscreen = None;
-            col.focus = (col.focus + 1).min(col.panes.len() - 1);
+            col.set_focus((col.focus + 1).min(col.panes.len() - 1));
         }
     }
 
@@ -336,7 +339,7 @@ impl Strip {
         if self.columns[right].panes.len() > 1 {
             self.columns[right].take(0);
         } else {
-            self.columns.remove(right);
+            self.remove_column(right);
         }
         let column = &mut self.columns[self.focus];
         column.fullscreen = None;
@@ -400,7 +403,7 @@ impl Strip {
         let Some((col, row)) = self.locate(pane) else {
             return false;
         };
-        self.columns[col].focus = row;
+        self.columns[col].set_focus(row);
         self.set_focus(col);
         true
     }
@@ -857,6 +860,33 @@ mod tests {
         assert_eq!(split_heights(10, 3), [4, 3, 3]);
         assert_eq!(split_heights(9, 3), [3, 3, 3]);
         assert_eq!(split_heights(5, 1), [5]);
+    }
+
+    #[test]
+    fn consuming_the_last_column_leaves_no_gap_on_the_right() {
+        let mut strip = strip_with(3, 100);
+        assert_eq!(strip.target_offset, 50);
+        strip.focus_left();
+        strip.consume_into_column(); // [0] [1 2], which all fits
+        assert_eq!(layout(&strip), [vec![0], vec![1, 2]]);
+        assert_eq!(strip.target_offset, 0);
+    }
+
+    #[test]
+    fn fullscreen_survives_focus_that_cannot_move() {
+        let mut strip = strip_with(1, 100);
+        strip.toggle_fullscreen();
+        strip.focus_down();
+        strip.focus_up();
+        assert_eq!(strip.columns()[0].fullscreen(), Some(PaneId(0)));
+
+        let mut strip = strip_with(2, 100);
+        strip.consume_or_expel_left(); // [0 1], on 1
+        strip.toggle_fullscreen();
+        strip.focus_down(); // already at the bottom
+        assert_eq!(strip.columns()[0].fullscreen(), Some(PaneId(1)));
+        strip.focus_up();
+        assert_eq!(strip.columns()[0].fullscreen(), None);
     }
 
     #[test]

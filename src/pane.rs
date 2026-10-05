@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
@@ -49,6 +49,21 @@ pub struct Pane {
     /// The colors to answer the program's color queries with: those of
     /// the client most recently used.
     palette: Palette,
+    /// How far the screen has scrolled, for [`Self::scroll_mark`].
+    scroll: ScrollMark,
+    /// The most lines of history the emulator keeps.
+    history_limit: usize,
+}
+
+/// A moment in a pane's scrolling. What a client has scrolled back to, or
+/// selected, is so many lines above the live screen; as output arrives
+/// those lines move up, and [`Pane::scrolled_since`] says how far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollMark {
+    /// Lines scrolled off the top of the screen into history, in total.
+    lines: u64,
+    /// Bumped when history is cleared, which leaves nothing to follow.
+    epoch: u64,
 }
 
 impl Pane {
@@ -64,10 +79,10 @@ impl Pane {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TIRI", "1");
         cmd.cwd(cwd);
-        let child = pair.slave.spawn_command(cmd).with_context(|| {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "a shell".to_owned());
-            format!("couldn't start {shell} in {}", cwd.display())
-        })?;
+        // The shell portable-pty will pick: $SHELL, or the user's own.
+        let shell = cmd.get_shell();
+        let child = (pair.slave.spawn_command(cmd))
+            .with_context(|| format!("couldn't start {shell} in {}", cwd.display()))?;
         // Drop our copy of the subsidiary side so reads see EOF when the child exits.
         drop(pair.slave);
 
@@ -85,8 +100,10 @@ impl Pane {
             .unwrap_or_else(|| "sh".to_owned());
 
         let term_events = Rc::default();
+        let config = Config::default();
+        let history_limit = config.scrolling_history;
         let term = Term::new(
-            Config::default(),
+            config,
             &Size { rows, cols },
             Listener(Rc::clone(&term_events)),
         );
@@ -104,6 +121,8 @@ impl Pane {
             generation: 0,
             copied: Vec::new(),
             palette: Palette::default(),
+            scroll: ScrollMark::default(),
+            history_limit,
         })
     }
 
@@ -219,8 +238,47 @@ impl Pane {
 
     fn process(&mut self, bytes: &[u8]) {
         self.generation += 1;
-        self.parser.advance(&mut self.term, bytes);
+        self.track_scroll(|pane| pane.parser.advance(&mut pane.term, bytes));
         self.handle_term_events();
+    }
+
+    /// Runs `feed`, which gives the emulator output, and counts the lines
+    /// that scrolls into history.
+    fn track_scroll(&mut self, feed: impl FnOnce(&mut Self)) {
+        let alt_screen = |pane: &Self| pane.term.mode().contains(TermMode::ALT_SCREEN);
+        let (before, was_alt) = (self.history_size(), alt_screen(self));
+        // History growing counts them, until it's full and stops growing.
+        // The grid's display offset still can then: once it's scrolled
+        // back at all, it follows the text up line for line. So scroll it
+        // back one line as a probe. Nothing draws from the display offset.
+        if before > 0 {
+            self.term.grid_mut().scroll_display(Scroll::Delta(1));
+        }
+        feed(self);
+        let probe = self.term.grid().display_offset().saturating_sub(1);
+        self.term.grid_mut().scroll_display(Scroll::Bottom);
+
+        let after = self.history_size();
+        if was_alt || alt_screen(self) {
+            // The alternate screen has no history to scroll into.
+        } else if after < before {
+            self.scroll.epoch += 1;
+        } else if before > 0 && after >= self.history_limit {
+            self.scroll.lines += (after - before).max(probe) as u64;
+        } else {
+            self.scroll.lines += (after - before) as u64;
+        }
+    }
+
+    /// Now, for measuring scrolling from with [`Self::scrolled_since`].
+    pub fn scroll_mark(&self) -> ScrollMark {
+        self.scroll
+    }
+
+    /// How many lines have scrolled into history since `mark`, or None if
+    /// history was cleared since, taking what was there with it.
+    pub fn scrolled_since(&self, mark: ScrollMark) -> Option<usize> {
+        (mark.epoch == self.scroll.epoch).then(|| (self.scroll.lines - mark.lines) as usize)
     }
 
     /// When the child is mid synchronized update, the time at which we stop
@@ -233,7 +291,7 @@ impl Pane {
     pub fn expire_sync(&mut self, now: Instant) {
         if self.sync_deadline().is_some_and(|deadline| deadline <= now) {
             self.generation += 1;
-            self.parser.stop_sync(&mut self.term);
+            self.track_scroll(|pane| pane.parser.stop_sync(&mut pane.term));
             self.handle_term_events();
         }
     }
@@ -364,5 +422,55 @@ impl Dimensions for Size {
 
     fn columns(&self) -> usize {
         usize::from(self.cols)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pane whose shell is left alone: the tests feed its emulator directly.
+    fn pane() -> Pane {
+        Pane::spawn(5, 20, Path::new("/")).expect("a shell starts")
+    }
+
+    fn close(pane: Pane) {
+        pane.kill();
+        let _ = pane.into_child().wait();
+    }
+
+    #[test]
+    fn counts_lines_scrolled_into_history_even_once_its_full() {
+        let mut pane = pane();
+        let start = pane.scroll_mark();
+        pane.process("line\r\n".repeat(30).as_bytes());
+        assert_eq!(pane.scrolled_since(start), Some(pane.history_size()));
+        assert!(pane.history_size() > 20);
+
+        // Fill history, in pieces as output arrives.
+        for _ in 0..(pane.history_limit / 100 + 1) {
+            pane.process("line\r\n".repeat(100).as_bytes());
+        }
+        assert_eq!(pane.history_size(), pane.history_limit);
+        let full = pane.scroll_mark();
+        pane.process("line\r\n".repeat(7).as_bytes());
+        assert_eq!(pane.history_size(), pane.history_limit);
+        assert_eq!(pane.scrolled_since(full), Some(7));
+        assert_eq!(
+            pane.term.grid().display_offset(),
+            0,
+            "the probe is put back"
+        );
+
+        // On the alternate screen nothing scrolls into history.
+        pane.process(b"\x1b[?1049h");
+        pane.process("line\r\n".repeat(9).as_bytes());
+        pane.process(b"\x1b[?1049l");
+        assert_eq!(pane.scrolled_since(full), Some(7));
+
+        // Clearing history leaves nothing to measure from.
+        pane.process(b"\x1b[3J");
+        assert_eq!(pane.scrolled_since(full), None);
+        close(pane);
     }
 }

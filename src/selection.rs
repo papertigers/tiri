@@ -6,6 +6,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 
 use crate::layout::PaneId;
+use crate::pane::ScrollMark;
 
 /// A cell in a pane's content. Line 0 is the top of the live screen;
 /// negative lines are in its scrollback.
@@ -22,6 +23,9 @@ pub struct Selection {
     pub pane: PaneId,
     pub anchor: Point,
     pub head: Point,
+    /// When `anchor` and `head` were measured: output since has moved the
+    /// text they're on further up.
+    pub at: ScrollMark,
 }
 
 impl Selection {
@@ -241,6 +245,7 @@ mod tests {
             pane,
             anchor: at(2, 5),
             head: at(1, 7),
+            at: ScrollMark::default(),
         };
         assert_eq!(sel.bounds(), (at(1, 7), at(2, 5)));
         assert!(sel.contains(pane, at(1, 9)));
