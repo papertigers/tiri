@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use crossterm::event::Event;
 use polling::{Event as PollEvent, Events, Poller};
 
 use crate::app::{App, Client};
+use crate::config;
 use crate::protocol::{ClientMsg, Decoder, ExitReason, ServerMsg, encode};
 
 /// Pane PTYs are keyed by pane id, which is a u32; these sit above them.
@@ -140,7 +141,12 @@ pub fn run(socket: &Path) -> Result<()> {
         .with_context(|| format!("couldn't listen on {}", socket.display()))?;
     listener.set_nonblocking(true)?;
     log::info!("listening on {}", socket.display());
-    let result = serve(&listener);
+    let config_path = config::default_path();
+    match &config_path {
+        Some(path) => log::info!("config: {}", path.display()),
+        None => log::warn!("no $HOME or $XDG_CONFIG_HOME, so no config file"),
+    }
+    let result = serve(&listener, config_path);
     let _ = std::fs::remove_file(socket);
     if let Err(e) = &result {
         log::error!("stopping: {e:#}");
@@ -166,12 +172,12 @@ fn init_logging() {
         .init();
 }
 
-fn serve(listener: &UnixListener) -> Result<()> {
+fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
     let poller = Arc::new(Poller::new().context("couldn't create a poller")?);
     // SAFETY: deleted from the poller before `serve` returns.
     unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY)) }
         .context("couldn't watch the socket")?;
-    let mut app = App::new(Arc::clone(&poller));
+    let mut app = App::new(Arc::clone(&poller), config_path);
     let mut connections = HashMap::new();
     let result = event_loop(listener, &poller, &mut app, &mut connections);
     // However the loop ended, panes are killed and clients told.
@@ -387,7 +393,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
         ClientMsg::Hello(hello) if connection.client.is_none() => {
             log::info!(
                 "{}: attaching: {}x{} cells, cell pixels {:?}, \
-                 kitty overview {}, foreground {:?}, background {:?}, theme {:?}",
+                 kitty overview {}, foreground {:?}, background {:?}",
                 connection.name(),
                 hello.width,
                 hello.height,
@@ -395,7 +401,6 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 hello.kitty_overview,
                 hello.colors.foreground,
                 hello.colors.background,
-                hello.theme,
             );
             match app.attach(hello) {
                 Ok(client) => {

@@ -1,0 +1,36 @@
+// tiri's config, in KDL (https://kdl.dev), like niri's.
+//
+// tiri reads it from $XDG_CONFIG_HOME/tiri/config.kdl, or
+// ~/.config/tiri/config.kdl, each time a terminal attaches, so changes
+// apply from the next attach. Everything set here is what tiri does
+// without a config; print this again with `tiri config default`.
+//
+// A node starting with /- is commented out: remove the /- to use it.
+
+// The theme for tiri's own borders, status bar and hints. Pane contents
+// keep their programs' and your terminal's colors whatever the theme.
+//
+// Built in are "default", which uses your terminal's palette, and "oxide".
+// Or name a theme defined below.
+theme "default"
+
+// A theme of your own. Colors are "#rrggbb", or 0 to 255 for a color from
+// your terminal's palette. Anything left out comes from the theme named in
+// `based-on`, or from "default" if there's none. Define as many as you
+// like; themes may build on ones defined above them.
+//
+// These are the default theme's colors.
+/-define-theme "mine" based-on="default" {
+    // The focused pane's border, and its marker in the status bar.
+    focused-border 12
+    unfocused-border 8
+    status-fg 250
+    status-bg 236
+    // The active workspace's number in the status bar.
+    status-active-fg 236
+    status-active-bg 250
+    // Hints, empty workspaces, and columns scrolled out of view.
+    dim 242
+    // Behind selected text; "reverse" swaps the text's own colors instead.
+    selection-bg "reverse"
+}

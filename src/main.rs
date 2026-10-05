@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod colors;
+mod config;
 mod effects;
 mod input;
 mod kitty;
@@ -51,29 +52,52 @@ enum Command {
     Ls,
     /// Kill the server and every pane in it
     KillServer,
+    /// Work with the config file
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Run the server (started for you by the other commands)
     #[command(hide = true)]
     Server,
 }
 
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the default config, commented, as a starting point
+    ///
+    /// For example: tiri config default > ~/.config/tiri/config.kdl
+    Default,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (socket, default) = match cli
-        .socket
-        .or_else(|| std::env::var_os("TIRI_SOCKET").map(PathBuf::from))
+    match cli.command.unwrap_or(Command::Attach { name: None }) {
+        Command::Attach { name } => client::attach(
+            &socket_path(cli.socket)?,
+            name.map_or(Target::Default, Target::Existing),
+        ),
+        Command::New { name } => client::attach(&socket_path(cli.socket)?, Target::New(name)),
+        Command::Ls => client::list(&socket_path(cli.socket)?),
+        Command::KillServer => client::kill_server(&socket_path(cli.socket)?),
+        Command::Server => server::run(&socket_path(cli.socket)?),
+        Command::Config {
+            command: ConfigCommand::Default,
+        } => {
+            print!("{}", config::DEFAULT);
+            Ok(())
+        }
+    }
+}
+
+/// The server's socket: `--socket`, then $TIRI_SOCKET, then the default,
+/// with its directory made ready.
+fn socket_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+    let (socket, default) = match arg.or_else(|| std::env::var_os("TIRI_SOCKET").map(PathBuf::from))
     {
         Some(path) => (path, false),
         None => (socket::default_path(), true),
     };
     socket::prepare_dir(&socket, default)?;
-
-    match cli.command.unwrap_or(Command::Attach { name: None }) {
-        Command::Attach { name } => {
-            client::attach(&socket, name.map_or(Target::Default, Target::Existing))
-        }
-        Command::New { name } => client::attach(&socket, Target::New(name)),
-        Command::Ls => client::list(&socket),
-        Command::KillServer => client::kill_server(&socket),
-        Command::Server => server::run(&socket),
-    }
+    Ok(socket)
 }

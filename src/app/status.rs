@@ -25,7 +25,7 @@ impl App {
     /// markers for the active workspace's columns. Shared by drawing and
     /// by working out what a click on the bar hit.
     pub(super) fn status_segments(&self, client: &Client) -> Vec<Segment> {
-        let theme = &client.theme;
+        let theme = &self.theme;
         let base = Style {
             bg: theme.status_bg,
             ..Style::fg(theme.status_fg)
@@ -98,7 +98,7 @@ impl App {
 
     pub(super) fn draw_status(&self, client: &Client, frame: &mut Frame) {
         let y = i32::from(client.height) - 1;
-        let theme = &client.theme;
+        let theme = &self.theme;
         let base = Style {
             bg: theme.status_bg,
             ..Style::fg(theme.status_fg)

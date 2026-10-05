@@ -108,10 +108,10 @@ impl App {
             let border = if focused {
                 Style {
                     bold: true,
-                    ..Style::fg(client.theme.focused_border)
+                    ..Style::fg(self.theme.focused_border)
                 }
             } else {
-                Style::fg(client.theme.unfocused_border)
+                Style::fg(self.theme.unfocused_border)
             };
             draw_box(&mut frame, x, y, w, h, border);
             let number = if stacked {
@@ -159,7 +159,7 @@ impl App {
                     h - 2,
                     top,
                     client.selection.as_ref(),
-                    client.theme.selection_bg,
+                    self.theme.selection_bg,
                 ),
             }
 
@@ -206,10 +206,10 @@ impl App {
         let style = if active {
             Style {
                 bold: true,
-                ..Style::fg(client.theme.focused_border)
+                ..Style::fg(self.theme.focused_border)
             }
         } else {
-            Style::fg(client.theme.dim)
+            Style::fg(self.theme.dim)
         };
         if overview {
             frame.put_str(
@@ -239,7 +239,7 @@ impl App {
             frame.put_str(x + (w - hint_width) / 2, middle, hint, style);
         } else {
             let x = (i32::from(client.width) - hint_width) / 2;
-            frame.put_str(x, middle, hint, Style::fg(client.theme.dim));
+            frame.put_str(x, middle, hint, Style::fg(self.theme.dim));
         }
     }
 
@@ -255,8 +255,8 @@ impl App {
             .filter(|&ws| self.row_top(client, ws) >= area)
             .collect();
         let style = Style {
-            bg: client.theme.status_bg,
-            ..Style::fg(client.theme.status_fg)
+            bg: self.theme.status_bg,
+            ..Style::fg(self.theme.status_fg)
         };
         let mut note = |y: i32, text: String| {
             let x = i32::from(client.width) - text.chars().count() as i32 - 1;

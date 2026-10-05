@@ -14,6 +14,7 @@ mod thumbnails;
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use polling::{Event as PollEvent, Poller};
 use portable_pty::Child;
 
 use crate::colors::Palette;
+use crate::config::Config;
 use crate::effects::Effects;
 use crate::layout::{PaneId, split_heights};
 use crate::pane::Pane;
@@ -68,12 +70,19 @@ pub struct App {
     size_owner: Option<ClientId>,
     /// Children of closed panes, kept until they've exited and been reaped.
     exited: Vec<Box<dyn Child + Send + Sync>>,
+    /// The config file, re-read as each client attaches; None to use only
+    /// what's built in.
+    config_path: Option<PathBuf>,
+    /// The colors of tiri's own borders, status bar and hints, from the
+    /// config.
+    theme: Theme,
     pub quit: bool,
 }
 
 impl App {
     /// Starts with no panes; the first client to attach gets a shell.
-    pub fn new(poller: Arc<Poller>) -> Self {
+    /// The config is read from `config_path` as clients attach.
+    pub fn new(poller: Arc<Poller>, config_path: Option<PathBuf>) -> Self {
         let layout_size = (80, 24);
         Self {
             workspaces: Workspaces::new(layout_size.0, &[]),
@@ -84,6 +93,8 @@ impl App {
             layout_size,
             size_owner: None,
             exited: Vec::new(),
+            config_path,
+            theme: Theme::default(),
             quit: false,
         }
     }
@@ -99,16 +110,12 @@ impl App {
             kitty_overview,
             colors,
             cell_pixels,
-            theme,
         } = hello;
         let (width, height) = clamp_size(width, height);
-        let theme = match theme.as_deref() {
-            None | Some("") => Theme::default(),
-            Some(name) => Theme::named(name).with_context(|| {
-                let names: Vec<_> = Theme::ALL.iter().map(|(n, _)| *n).collect();
-                format!("no theme named {name:?}; there's {}", names.join(", "))
-            })?,
-        };
+        // Edits to the config apply from the next attach, for everyone.
+        if let Some(path) = &self.config_path {
+            self.theme = Config::load(path)?.theme;
+        }
         let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
@@ -135,7 +142,6 @@ impl App {
             height,
             cwd,
             palette: Palette::from_reported(&colors),
-            theme,
             thumbnail_cell: thumbnail::cell_size_for(cell_pixels),
             detach_requested: false,
             prefix_pending: false,

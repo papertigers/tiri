@@ -21,3 +21,5 @@ tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "
 ratatui-core = "0.1.2"
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }
+knus = "3.4.0"
+miette = { version = "7.6.0", default-features = false, features = ["fancy-no-syscall"] }

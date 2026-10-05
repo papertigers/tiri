@@ -45,7 +45,6 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
             kitty_overview,
             colors: terminal_info.colors,
             cell_pixels,
-            theme: std::env::var("TIRI_THEME").ok(),
         }),
     )?;
     let mut decoder = Decoder::default();
