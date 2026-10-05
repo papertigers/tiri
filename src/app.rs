@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
@@ -12,9 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::Event;
 use crate::input::encode_key;
+use crate::kitty;
 use crate::layout::{PaneId, Strip, Visibility};
 use crate::pane::Pane;
 use crate::render::{Color, Frame, Style};
+use crate::thumbnail;
 
 /// The prefix key, tmux-style: Ctrl-a, then a command key.
 const PREFIX: char = 'a';
@@ -24,6 +25,11 @@ const FOCUSED_BORDER: Color = Color::Idx(12);
 const UNFOCUSED_BORDER: Color = Color::Idx(8);
 const STATUS_BG: Color = Color::Idx(236);
 const STATUS_FG: Color = Color::Idx(250);
+
+/// Kitty image ids for overview thumbnails are this plus the pane id.
+const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
+/// Thumbnails of busy panes are redrawn at most this often.
+const THUMBNAIL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -39,7 +45,17 @@ enum Action {
     Close,
     ToggleOverview,
     ExitOverview,
+    ToggleThumbnails,
     Quit,
+}
+
+/// An overview thumbnail uploaded to the outer terminal.
+struct Thumbnail {
+    /// Placement size in cells.
+    size: (u16, u16),
+    /// The pane's generation when this was drawn.
+    generation: u64,
+    uploaded: Instant,
 }
 
 pub struct App {
@@ -50,6 +66,11 @@ pub struct App {
     width: u16,
     height: u16,
     prefix_pending: bool,
+    /// Whether the overview shows kitty graphics thumbnails instead of text.
+    kitty_overview: bool,
+    thumbnails: HashMap<PaneId, Thumbnail>,
+    /// Graphics protocol commands to send before the next frame.
+    graphics: Vec<u8>,
     pub quit: bool,
 }
 
@@ -63,6 +84,9 @@ impl App {
             width,
             height,
             prefix_pending: false,
+            kitty_overview: std::env::var_os("TIRI_KITTY_OVERVIEW").is_some(),
+            thumbnails: HashMap::new(),
+            graphics: Vec::new(),
             quit: false,
         };
         app.open_column()?;
@@ -116,9 +140,23 @@ impl App {
         }
     }
 
-    /// The earliest time a pane's synchronized update times out.
-    pub fn sync_deadline(&self) -> Option<Instant> {
-        self.panes.values().filter_map(Pane::sync_deadline).min()
+    /// The next time something needs doing without any input: a pane's
+    /// synchronized update timing out, or a thumbnail due for a redraw.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let stale_thumbnails = self.thumbnails.iter().filter_map(|(id, thumb)| {
+            let pane = self.panes.get(id)?;
+            (pane.generation() != thumb.generation).then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
+        });
+        self.panes
+            .values()
+            .filter_map(Pane::sync_deadline)
+            .chain(stale_thumbnails)
+            .min()
+    }
+
+    /// Graphics commands to write before drawing the next frame.
+    pub fn take_graphics(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.graphics)
     }
 
     pub fn expire_syncs(&mut self, now: Instant) {
@@ -131,6 +169,9 @@ impl App {
         if let Some(mut pane) = self.panes.remove(&id) {
             pane.reap();
         }
+        if self.thumbnails.remove(&id).is_some() {
+            kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
+        }
         self.strip.remove(id);
     }
 
@@ -138,6 +179,66 @@ impl App {
         for pane in self.panes.values_mut() {
             pane.kill();
         }
+        self.clear_thumbnails();
+    }
+
+    fn clear_thumbnails(&mut self) {
+        for (id, _) in self.thumbnails.drain() {
+            kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
+        }
+    }
+
+    /// Thumbnails show once the overview has settled, since a placement's
+    /// size is fixed and the boxes change size while zooming.
+    fn showing_thumbnails(&self) -> bool {
+        self.kitty_overview && self.strip.in_overview() && !self.strip.is_animating()
+    }
+
+    /// Uploads a thumbnail of `id` sized `size` cells if there's none yet, it
+    /// changed size, or the pane changed and the last upload isn't too recent.
+    fn refresh_thumbnail(&mut self, id: PaneId, size: (u16, u16), now: Instant) {
+        let Some(pane) = self.panes.get(&id) else {
+            return;
+        };
+        let generation = pane.generation();
+        let fresh = self.thumbnails.get(&id).is_some_and(|t| {
+            t.size == size && (t.generation == generation || now < t.uploaded + THUMBNAIL_INTERVAL)
+        });
+        if fresh {
+            return;
+        }
+        let image = thumbnail::rasterize(pane.term());
+        kitty::upload(
+            &mut self.graphics,
+            THUMBNAIL_ID_BASE + id.0,
+            &image,
+            size.0,
+            size.1,
+        );
+        self.thumbnails.insert(
+            id,
+            Thumbnail {
+                size,
+                generation,
+                uploaded: now,
+            },
+        );
+    }
+
+    /// Where column `idx` is drawn: x, y, width, height, including its border.
+    fn column_box(&self, idx: usize) -> (i32, i32, i32, i32) {
+        let pane_height = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
+        // Columns shrink vertically with the zoom, centered in the pane area.
+        let h = ((f64::from(pane_height) * self.strip.zoom()).round() as i32)
+            .clamp(pane_height.min(3), pane_height);
+        let (x, w) = self.strip.column_span(idx);
+        (x, (pane_height - h) / 2, w, h)
+    }
+
+    /// The inner size of a column's box in cells, as a thumbnail placement.
+    fn thumbnail_size(w: i32, h: i32) -> (u16, u16) {
+        let clamp = |n: i32| (n.max(1) as u16).min(kitty::MAX_CELLS);
+        (clamp(w - 2), clamp(h - 2))
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -218,6 +319,7 @@ impl App {
             }
             Action::ToggleOverview => self.strip.set_overview(!self.strip.in_overview()),
             Action::ExitOverview => self.strip.set_overview(false),
+            Action::ToggleThumbnails => self.kitty_overview = !self.kitty_overview,
             Action::Quit => self.quit = true,
         }
         Ok(())
@@ -225,22 +327,34 @@ impl App {
 
     /// Composes the visible slice of the strip plus the status bar. Returns
     /// the frame and where the cursor should be shown, if anywhere.
-    pub fn draw(&self) -> (Frame, Option<(u16, u16)>) {
+    pub fn draw(&mut self) -> (Frame, Option<(u16, u16)>) {
+        let visible: Vec<usize> = (0..self.strip.columns().len())
+            .filter(|&idx| {
+                let (x, _, w, _) = self.column_box(idx);
+                x + w > 0 && x < i32::from(self.width)
+            })
+            .collect();
+
+        let thumbnails = self.showing_thumbnails();
+        if thumbnails {
+            let now = Instant::now();
+            for &idx in &visible {
+                let (_, _, w, h) = self.column_box(idx);
+                let id = self.strip.columns()[idx].pane;
+                self.refresh_thumbnail(id, Self::thumbnail_size(w, h), now);
+            }
+        } else if !(self.kitty_overview && self.strip.in_overview()) && !self.thumbnails.is_empty()
+        {
+            self.clear_thumbnails();
+        }
+
         let mut frame = Frame::new(self.width, self.height);
-        let pane_height = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
-        let zoom = self.strip.zoom();
-        // Columns shrink vertically with the zoom, centered in the pane area.
-        let h =
-            ((f64::from(pane_height) * zoom).round() as i32).clamp(pane_height.min(3), pane_height);
-        let y = (pane_height - h) / 2;
-        let show_cursor = !self.strip.in_overview() && zoom == 1.0;
+        let show_cursor = !self.strip.in_overview() && self.strip.zoom() == 1.0;
         let mut cursor = None;
 
-        for (idx, col) in self.strip.columns().iter().enumerate() {
-            let (x, w) = self.strip.column_span(idx);
-            if x + w <= 0 || x >= i32::from(self.width) {
-                continue;
-            }
+        for idx in visible {
+            let col = self.strip.columns()[idx];
+            let (x, y, w, h) = self.column_box(idx);
             let Some(pane) = self.panes.get(&col.pane) else {
                 continue;
             };
@@ -261,7 +375,21 @@ impl App {
                 .collect();
             frame.put_str(x + 2, y, &title, border);
 
-            let first_row = draw_screen(&mut frame, pane, x + 1, y + 1, w - 2, h - 2);
+            let thumbnail = self.thumbnails.get(&col.pane);
+            let first_row = match thumbnail {
+                Some(thumb) if thumbnails => {
+                    let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + col.pane.0));
+                    let (cols, rows) = thumb.size;
+                    for row in 0..rows {
+                        for c in 0..cols {
+                            let cell = kitty::placeholder(row, c);
+                            frame.put(x + 1 + i32::from(c), y + 1 + i32::from(row), &cell, style);
+                        }
+                    }
+                    0
+                }
+                _ => draw_screen(&mut frame, pane, x + 1, y + 1, w - 2, h - 2),
+            };
 
             if focused && show_cursor && pane.cursor_visible() {
                 let (row, c) = pane.cursor();
@@ -316,8 +444,10 @@ impl App {
 
         let hint = if self.prefix_pending {
             "C-a: n new  h/l focus  H/L move  r width  c center  o overview  x close  q quit "
+        } else if self.strip.in_overview() && self.kitty_overview {
+            "OVERVIEW (kitty)  h/l select  H/L move  x close  t text  ⏎/o/Esc open "
         } else if self.strip.in_overview() {
-            "OVERVIEW  h/l select  H/L move  x close  ⏎/o/Esc open "
+            "OVERVIEW  h/l select  H/L move  x close  t thumbnails  ⏎/o/Esc open "
         } else {
             "C-a or Alt: n/⏎ new  h/l focus  r width  c center  o overview "
         };
@@ -365,6 +495,7 @@ fn overview_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Action::NewColumn,
         KeyCode::Char('r') => Action::CycleWidth,
         KeyCode::Char('x') => Action::Close,
+        KeyCode::Char('t') => Action::ToggleThumbnails,
         KeyCode::Char('o') | KeyCode::Enter | KeyCode::Esc => Action::ExitOverview,
         _ => return None,
     };

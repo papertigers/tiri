@@ -1,8 +1,10 @@
 mod app;
 mod input;
+mod kitty;
 mod layout;
 mod pane;
 mod render;
+mod thumbnail;
 
 use std::io::{self, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -53,7 +55,7 @@ fn run() -> Result<()> {
         // update times out, whichever is sooner.
         let deadline = [
             animating.then(|| Instant::now() + FRAME),
-            app.sync_deadline(),
+            app.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -100,10 +102,13 @@ fn run() -> Result<()> {
         animating = app.strip_mut().tick(dt.max(Duration::from_millis(1)));
 
         let (frame, cursor) = app.draw();
+        stdout.write_all(&app.take_graphics())?;
         renderer.draw(&mut stdout, frame, cursor)?;
     }
 
     app.shutdown();
+    stdout.write_all(&app.take_graphics())?;
+    stdout.flush()?;
     Ok(())
 }
 

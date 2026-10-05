@@ -45,6 +45,8 @@ pub struct Pane {
     child: Box<dyn Child + Send + Sync>,
     title: Option<String>,
     fallback_title: String,
+    /// Bumped whenever the screen may have changed.
+    generation: u64,
 }
 
 impl Pane {
@@ -107,6 +109,7 @@ impl Pane {
             child,
             title: None,
             fallback_title,
+            generation: 0,
         })
     }
 
@@ -145,7 +148,16 @@ impl Pane {
     }
 
     /// Feeds output from the child into the emulator.
+    pub fn term(&self) -> &Term<impl EventListener> {
+        &self.term
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn process(&mut self, bytes: &[u8]) {
+        self.generation += 1;
         self.parser.advance(&mut self.term, bytes);
         self.handle_term_events();
     }
@@ -159,6 +171,7 @@ impl Pane {
     /// Applies a synchronized update that has run past its deadline.
     pub fn expire_sync(&mut self, now: Instant) {
         if self.sync_deadline().is_some_and(|deadline| deadline <= now) {
+            self.generation += 1;
             self.parser.stop_sync(&mut self.term);
             self.handle_term_events();
         }
@@ -205,6 +218,7 @@ impl Pane {
         if self.size() == (rows, cols) {
             return;
         }
+        self.generation += 1;
         self.term.resize(Size { rows, cols });
         let _ = self.master.resize(pty_size(rows, cols));
     }

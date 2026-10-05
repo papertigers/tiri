@@ -259,6 +259,12 @@ impl Strip {
         (offset, zoom)
     }
 
+    /// Whether the viewport is still scrolling or zooming toward its target.
+    pub fn is_animating(&self) -> bool {
+        let (offset, zoom) = self.view_target();
+        offset != self.offset || zoom != self.zoom
+    }
+
     /// Advances the scroll and zoom animations. Returns true while still moving.
     pub fn tick(&mut self, dt: Duration) -> bool {
         let (offset, zoom) = self.view_target();
