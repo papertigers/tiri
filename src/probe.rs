@@ -11,16 +11,14 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use serde::{Deserialize, Serialize};
-
 use crate::colors::{ReportedColors, Rgb};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 /// Gives up on a terminal that doesn't answer even the attributes request.
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What a client's terminal said about itself.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalInfo {
     pub kitty_graphics: bool,
     pub colors: ReportedColors,

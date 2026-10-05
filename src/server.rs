@@ -171,7 +171,7 @@ fn serve(listener: &UnixListener) -> Result<()> {
     // SAFETY: deleted from the poller before `serve` returns.
     unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY)) }
         .context("couldn't watch the socket")?;
-    let mut app = App::new(&[], Arc::clone(&poller));
+    let mut app = App::new(Arc::clone(&poller));
     let mut connections = HashMap::new();
     let result = event_loop(listener, &poller, &mut app, &mut connections);
     // However the loop ended, panes are killed and clients told.

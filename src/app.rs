@@ -3,7 +3,7 @@
 //! terminal's own state (its size, its drawing, and its view of the
 //! workspaces). Keybindings and drawing act on behalf of a client.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use polling::{Event as PollEvent, Poller};
 use portable_pty::Child;
 
 use crate::colors::Palette;
-use crate::effects::{Anchor, Effects, Transition};
+use crate::effects::{Effects, Transition};
 use crate::input::{encode_key, encode_mouse};
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
@@ -49,6 +49,11 @@ const DIM_TEXT: Color = Color::Idx(242);
 
 /// Kitty image ids for overview thumbnails are this plus the pane id.
 const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
+
+/// The kitty image id of pane `id`'s thumbnail.
+fn image_id(id: PaneId) -> u32 {
+    THUMBNAIL_ID_BASE + id.0
+}
 /// Thumbnails of busy panes are redrawn at most this often.
 const THUMBNAIL_INTERVAL: Duration = Duration::from_millis(250);
 /// How often to check on closed panes' children until they've exited.
@@ -124,6 +129,25 @@ const WHEEL_LINES: i32 = 3;
 /// triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 
+/// Where a pane is drawn on a client's screen, borders included.
+#[derive(Debug, Clone, Copy)]
+struct PaneBox {
+    id: PaneId,
+    /// The workspace and column it's in.
+    ws: usize,
+    column: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl PaneBox {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        (self.x..self.x + self.w).contains(&x) && (self.y..self.y + self.h).contains(&y)
+    }
+}
+
 /// An overview thumbnail uploaded to a client's terminal.
 struct Thumbnail {
     /// Placement size in cells.
@@ -133,36 +157,31 @@ struct Thumbnail {
     uploaded: Instant,
     /// The image as drawn, kept for fading it in.
     image: thumbnail::Image,
-    /// The opacity it was last uploaded at, in steps of [`OPACITY_STEPS`].
-    opacity: u8,
+    /// The opacity it was last uploaded at, in steps of [`OPACITY_STEPS`];
+    /// None until it's been uploaded.
+    opacity: Option<u8>,
 }
 
-/// Uploads `thumb` as image `image_id` if it's not already there at
-/// `opacity` (rounded to a few steps), and places it at `size` cells if it
-/// isn't already.
-fn upload(
-    escapes: &mut Vec<u8>,
-    image_id: u32,
-    thumb: &mut Thumbnail,
-    size: (u16, u16),
-    opacity: f32,
-) {
-    let step = (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
-    let uploading = thumb.opacity != step;
-    if uploading {
-        if step == OPACITY_STEPS {
-            kitty::transmit(escapes, image_id, &thumb.image);
-        } else {
-            let faded = thumb
-                .image
-                .with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
-            kitty::transmit(escapes, image_id, &faded);
+impl Thumbnail {
+    /// Shows this as image `image_id`: uploads it if it's not already there
+    /// at `opacity` (rounded to a few steps), and places it at `size` cells
+    /// if it isn't already.
+    fn show(&mut self, escapes: &mut Vec<u8>, image_id: u32, size: (u16, u16), opacity: f32) {
+        let step = (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
+        let uploading = self.opacity != Some(step);
+        if uploading {
+            if step == OPACITY_STEPS {
+                kitty::transmit(escapes, image_id, &self.image);
+            } else {
+                let faded = (self.image).with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
+                kitty::transmit(escapes, image_id, &faded);
+            }
+            self.opacity = Some(step);
         }
-        thumb.opacity = step;
-    }
-    if uploading || thumb.size != size {
-        kitty::place(escapes, image_id, size.0, size.1);
-        thumb.size = size;
+        if uploading || self.size != size {
+            kitty::place(escapes, image_id, size.0, size.1);
+            self.size = size;
+        }
     }
 }
 
@@ -304,7 +323,7 @@ impl Client {
 
     fn clear_thumbnails(&mut self) {
         for (id, _) in self.thumbnails.drain() {
-            kitty::delete(&mut self.escapes, THUMBNAIL_ID_BASE + id.0);
+            kitty::delete(&mut self.escapes, image_id(id));
         }
     }
 
@@ -314,7 +333,7 @@ impl Client {
         self.thumbnails.retain(|id, _| {
             let kept = keep(id);
             if !kept {
-                kitty::delete(escapes, THUMBNAIL_ID_BASE + id.0);
+                kitty::delete(escapes, image_id(*id));
             }
             kept
         });
@@ -335,7 +354,7 @@ impl Client {
         let Some(pane) = panes.get(&id) else {
             return;
         };
-        let image_id = THUMBNAIL_ID_BASE + id.0;
+        let image_id = image_id(id);
         let generation = pane.generation();
         let stale = self
             .thumbnails
@@ -350,13 +369,12 @@ impl Client {
                     generation,
                     uploaded: now,
                     image,
-                    // Not uploaded yet.
-                    opacity: u8::MAX,
+                    opacity: None,
                 },
             );
         }
         let thumb = self.thumbnails.get_mut(&id).expect("inserted if missing");
-        upload(&mut self.escapes, image_id, thumb, size, opacity);
+        thumb.show(&mut self.escapes, image_id, size, opacity);
     }
 
     /// Re-uploads the thumbnails already shown at `opacity`, as the overview
@@ -364,13 +382,7 @@ impl Client {
     fn fade_thumbnails(&mut self, opacity: f32) {
         for (id, thumb) in &mut self.thumbnails {
             let size = thumb.size;
-            upload(
-                &mut self.escapes,
-                THUMBNAIL_ID_BASE + id.0,
-                thumb,
-                size,
-                opacity,
-            );
+            thumb.show(&mut self.escapes, image_id(*id), size, opacity);
         }
     }
 
@@ -409,12 +421,11 @@ pub struct App {
 }
 
 impl App {
-    /// Starts with a named workspace for each of `names` (plus the usual
-    /// empty one). The first client to attach gets a shell.
-    pub fn new(names: &[String], poller: Arc<Poller>) -> Self {
+    /// Starts with no panes; the first client to attach gets a shell.
+    pub fn new(poller: Arc<Poller>) -> Self {
         let layout_size = (80, 24);
         Self {
-            workspaces: Workspaces::new(layout_size.0, names),
+            workspaces: Workspaces::new(layout_size.0, &[]),
             panes: HashMap::new(),
             next_pane: 0,
             next_client: 0,
@@ -520,8 +531,8 @@ impl App {
         self.panes.is_empty()
     }
 
-    /// Advances every client's scroll, slide and zoom animations. Returns
-    /// true while anything still moves.
+    /// Advances every client's scroll and slide animations. Returns true
+    /// while anything still moves.
     pub fn tick(&mut self, dt: Duration) -> bool {
         self.workspaces.tick(dt)
     }
@@ -553,26 +564,18 @@ impl App {
     /// Where pane `id` is on `client`'s screen, clipped to the pane area.
     fn pane_area(&self, client: &Client, id: PaneId) -> Option<ratatui_core::layout::Rect> {
         let screen = (i32::from(client.width), client.area_height());
-        for ws in self.visible_workspaces(client) {
-            for idx in self.visible_columns(client, ws) {
-                for (pane, x, y, w, h) in self.pane_boxes(client, ws, idx) {
-                    if pane != id {
-                        continue;
-                    }
-                    let (left, top) = (x.max(0), y.max(0));
-                    let (right, bottom) = ((x + w).min(screen.0), (y + h).min(screen.1));
-                    return (right > left && bottom > top).then(|| {
-                        ratatui_core::layout::Rect::new(
-                            left as u16,
-                            top as u16,
-                            (right - left) as u16,
-                            (bottom - top) as u16,
-                        )
-                    });
-                }
-            }
-        }
-        None
+        let PaneBox { x, y, w, h, .. } =
+            (self.visible_panes(client).into_iter()).find(|b| b.id == id)?;
+        let (left, top) = (x.max(0), y.max(0));
+        let (right, bottom) = ((x + w).min(screen.0), (y + h).min(screen.1));
+        (right > left && bottom > top).then(|| {
+            ratatui_core::layout::Rect::new(
+                left as u16,
+                top as u16,
+                (right - left) as u16,
+                (bottom - top) as u16,
+            )
+        })
     }
 
     /// Lays panes out for `client`'s terminal size, making it the client
@@ -704,14 +707,13 @@ impl App {
         }
     }
 
-    /// Thumbnails show whenever the view is zoomed out, which is whenever the
-    /// overview is open.
+    /// Thumbnails show in the overview, if the client's terminal can.
     fn showing_thumbnails(&self, client: &Client) -> bool {
-        client.kitty_overview && self.workspaces.zoom(client.id) < 1.0
+        client.kitty_overview && self.workspaces.in_overview(client.id)
     }
 
     /// The height of a workspace row on `client`'s screen: its whole pane
-    /// area, or less as its overview zooms out.
+    /// area, or less in the overview.
     fn row_height(&self, client: &Client) -> i32 {
         let area = client.area_height();
         ((f64::from(area) * self.workspaces.zoom(client.id)).round() as i32)
@@ -720,15 +722,11 @@ impl App {
 
     /// Where workspace `ws`'s row starts on `client`'s screen. Its active
     /// workspace is centered; the others stack above and below it, sliding
-    /// as the active one changes. Zoomed out, a line between rows holds
-    /// their labels.
+    /// as the active one changes. In the overview, a line between rows
+    /// holds their labels.
     fn row_top(&self, client: &Client, ws: usize) -> i32 {
         let (area, row) = (client.area_height(), self.row_height(client));
-        let gap = if self.workspaces.zoom(client.id) < 1.0 {
-            1
-        } else {
-            0
-        };
+        let gap = i32::from(self.workspaces.in_overview(client.id));
         let pitch = f64::from(row + gap);
         let from_active = ws as f64 - self.workspaces.y(client.id);
         (area - row) / 2 + (from_active * pitch).round() as i32
@@ -762,27 +760,42 @@ impl App {
     }
 
     /// Where each pane in column `idx` of workspace `ws` is drawn, top to
-    /// bottom, borders included: the column's box split among its panes.
-    fn pane_boxes(
-        &self,
-        client: &Client,
-        ws: usize,
-        idx: usize,
-    ) -> Vec<(PaneId, i32, i32, i32, i32)> {
+    /// bottom: the column's box split among its panes.
+    fn pane_boxes(&self, client: &Client, ws: usize, idx: usize) -> Vec<PaneBox> {
         let (x, mut y, w, h) = self.column_box(client, ws, idx);
         let column = &self.workspaces.list()[ws].strip().columns()[idx];
+        let pane_box = |id, y, h| PaneBox {
+            id,
+            ws,
+            column: idx,
+            x,
+            y,
+            w,
+            h,
+        };
         // A fullscreen pane has its column to itself; the rest are hidden.
         if let Some(id) = column.fullscreen() {
-            return vec![(id, x, y, w, h)];
+            return vec![pane_box(id, y, h)];
         }
         let panes = column.panes();
         panes
             .iter()
             .zip(split_heights(h, panes.len()))
             .map(|(&id, h)| {
-                let pane_box = (id, x, y, w, h);
+                let b = pane_box(id, y, h);
                 y += h;
-                pane_box
+                b
+            })
+            .collect()
+    }
+
+    /// Every pane at least partly on `client`'s screen, by workspace and
+    /// column.
+    fn visible_panes(&self, client: &Client) -> Vec<PaneBox> {
+        (self.visible_workspaces(client).into_iter())
+            .flat_map(|ws| {
+                (self.visible_columns(client, ws).into_iter())
+                    .flat_map(move |idx| self.pane_boxes(client, ws, idx))
             })
             .collect()
     }
@@ -861,25 +874,20 @@ impl App {
             }
             return Hit::Nothing;
         }
+        if let Some(b) = (self.visible_panes(client).into_iter()).find(|b| b.contains(x, y)) {
+            let (id, (cx, cy)) = (b.id, (x - b.x - 1, y - b.y - 1));
+            let inside = (0..b.w - 2).contains(&cx) && (0..b.h - 2).contains(&cy);
+            let inner = self.panes.get(&id).filter(|_| inside).map(|pane| {
+                let top = content_top(pane, b.h - 2, client.scrolled(id, pane));
+                let point = Point {
+                    line: top + cy,
+                    col: cx as u16,
+                };
+                (cx as u16, cy as u16, point)
+            });
+            return Hit::Pane { id, inner };
+        }
         for ws in self.visible_workspaces(client) {
-            for idx in self.visible_columns(client, ws) {
-                for (id, bx, by, w, h) in self.pane_boxes(client, ws, idx) {
-                    if !(bx..bx + w).contains(&x) || !(by..by + h).contains(&y) {
-                        continue;
-                    }
-                    let (cx, cy) = (x - bx - 1, y - by - 1);
-                    let inside = (0..w - 2).contains(&cx) && (0..h - 2).contains(&cy);
-                    let inner = self.panes.get(&id).filter(|_| inside).map(|pane| {
-                        let top = content_top(pane, h - 2, client.scrolled(id, pane));
-                        let point = Point {
-                            line: top + cy,
-                            col: cx as u16,
-                        };
-                        (cx as u16, cy as u16, point)
-                    });
-                    return Hit::Pane { id, inner };
-                }
-            }
             let top = self.row_top(client, ws);
             let in_row = (top..top + self.row_height(client)).contains(&y);
             if in_row && self.workspaces.list()[ws].is_empty() {
@@ -901,25 +909,17 @@ impl App {
         y: i32,
     ) -> Option<(u16, u16, Point, i32)> {
         let pane = self.panes.get(&id)?;
-        for ws in self.visible_workspaces(client) {
-            for idx in self.visible_columns(client, ws) {
-                for (pane_id, bx, by, w, h) in self.pane_boxes(client, ws, idx) {
-                    if pane_id != id || w < 3 || h < 3 {
-                        continue;
-                    }
-                    let cx = (x - bx - 1).clamp(0, w - 3);
-                    let raw_y = y - by - 1;
-                    let cy = raw_y.clamp(0, h - 3);
-                    let top = content_top(pane, h - 2, client.scrolled(id, pane));
-                    let point = Point {
-                        line: top + cy,
-                        col: cx as u16,
-                    };
-                    return Some((cx as u16, cy as u16, point, (raw_y - cy).signum()));
-                }
-            }
-        }
-        None
+        let b = (self.visible_panes(client).into_iter())
+            .find(|b| b.id == id && b.w >= 3 && b.h >= 3)?;
+        let cx = (x - b.x - 1).clamp(0, b.w - 3);
+        let raw_y = y - b.y - 1;
+        let cy = raw_y.clamp(0, b.h - 3);
+        let top = content_top(pane, b.h - 2, client.scrolled(id, pane));
+        let point = Point {
+            line: top + cy,
+            col: cx as u16,
+        };
+        Some((cx as u16, cy as u16, point, (raw_y - cy).signum()))
     }
 
     /// Passes a mouse event to pane `id`'s program at (`col`, `row`) within
@@ -1153,34 +1153,13 @@ impl App {
             Action::FocusDown => self.workspaces.active_mut(id).focus_down(),
             Action::MoveUp => self.workspaces.active_mut(id).move_up(),
             Action::MoveDown => self.workspaces.active_mut(id).move_down(),
-            Action::ConsumeOrExpelLeft => {
-                self.workspaces.active_mut(id).consume_or_expel_left();
-                self.resize_panes();
-            }
-            Action::ConsumeOrExpelRight => {
-                self.workspaces.active_mut(id).consume_or_expel_right();
-                self.resize_panes();
-            }
-            Action::ConsumeIntoColumn => {
-                self.workspaces.active_mut(id).consume_into_column();
-                self.resize_panes();
-            }
-            Action::ExpelFromColumn => {
-                self.workspaces.active_mut(id).expel_from_column();
-                self.resize_panes();
-            }
-            Action::CycleWidth => {
-                self.workspaces.active_mut(id).cycle_width();
-                self.resize_panes();
-            }
-            Action::ToggleMaximized => {
-                self.workspaces.active_mut(id).toggle_maximized();
-                self.resize_panes();
-            }
-            Action::ToggleFullscreen => {
-                self.workspaces.active_mut(id).toggle_fullscreen();
-                self.resize_panes();
-            }
+            Action::ConsumeOrExpelLeft => self.workspaces.active_mut(id).consume_or_expel_left(),
+            Action::ConsumeOrExpelRight => self.workspaces.active_mut(id).consume_or_expel_right(),
+            Action::ConsumeIntoColumn => self.workspaces.active_mut(id).consume_into_column(),
+            Action::ExpelFromColumn => self.workspaces.active_mut(id).expel_from_column(),
+            Action::CycleWidth => self.workspaces.active_mut(id).cycle_width(),
+            Action::ToggleMaximized => self.workspaces.active_mut(id).toggle_maximized(),
+            Action::ToggleFullscreen => self.workspaces.active_mut(id).toggle_fullscreen(),
             Action::Center => self.workspaces.active_mut(id).center_focused(),
             Action::Close => {
                 if let Some(pane_id) = self.workspaces.focused(id) {
@@ -1203,39 +1182,30 @@ impl App {
             Action::Detach => client.detach_requested = true,
             Action::Quit => self.quit = true,
         }
+        // Whatever changed, panes' PTYs follow their boxes' sizes.
+        self.resize_panes();
         Ok(())
     }
 
     /// Composes `client`'s view of the workspaces plus its status bar.
     /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
-        let visible: Vec<(usize, usize)> = (self.visible_workspaces(client).into_iter())
-            .flat_map(|ws| {
-                self.visible_columns(client, ws)
-                    .into_iter()
-                    .map(move |idx| (ws, idx))
-            })
-            .collect();
+        let visible = self.visible_panes(client);
 
         let thumbnails = self.showing_thumbnails(client);
+        // Thumbnails are fully opaque unless the overview is fading.
+        let opacity = (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
         if thumbnails {
             let now = Instant::now();
-            // Fully opaque unless the overview is fading in.
-            let opacity = (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
-            let mut drawn = HashSet::new();
-            for &(ws, idx) in &visible {
-                for (id, _, _, w, h) in self.pane_boxes(client, ws, idx) {
-                    let size = Client::thumbnail_size(w, h);
-                    client.refresh_thumbnail(&self.panes, id, size, opacity, now);
-                    drawn.insert(id);
-                }
+            for b in &visible {
+                let size = Client::thumbnail_size(b.w, b.h);
+                client.refresh_thumbnail(&self.panes, b.id, size, opacity, now);
             }
             // Panes scrolled out of view would otherwise keep asking for
             // redraws they never get.
-            client.retain_thumbnails(|id| drawn.contains(id));
-        } else if let Some(transition) = &client.transition {
+            client.retain_thumbnails(|id| visible.iter().any(|b| b.id == *id));
+        } else if client.transition.is_some() {
             // The overview fading out: its thumbnails fade with it.
-            let opacity = transition.image_opacity();
             client.retain_thumbnails(|id| self.panes.contains_key(id));
             client.fade_thumbnails(opacity);
         } else {
@@ -1249,10 +1219,8 @@ impl App {
         }
 
         let (mut frame, cursor) = self.compose(client, &visible, thumbnails);
-        let areas: Vec<_> = (client.effects.anchors().into_iter())
-            .map(|anchor| match anchor {
-                Anchor::Pane(id) => (anchor, self.pane_area(client, id)),
-            })
+        let areas: Vec<_> = (client.effects.panes().into_iter())
+            .map(|id| (id, self.pane_area(client, id)))
             .collect();
         let palette = client.palette;
         let now = Instant::now();
@@ -1280,11 +1248,7 @@ impl App {
         self.workspaces.set_overview(client.id, on);
         self.workspaces.snap(client.id);
         if let Some(from) = client.renderer.last_frame().cloned() {
-            client.transition = Some(if on {
-                Transition::opening(from, &client.palette)
-            } else {
-                Transition::closing(from, &client.palette)
-            });
+            client.transition = Some(Transition::new(from, on, &client.palette));
         }
     }
 
@@ -1292,7 +1256,7 @@ impl App {
     fn compose(
         &self,
         client: &Client,
-        visible: &[(usize, usize)],
+        visible: &[PaneBox],
         thumbnails: bool,
     ) -> (Frame, Option<(u16, u16)>) {
         let mut frame = Frame::new(client.width, client.height);
@@ -1307,85 +1271,92 @@ impl App {
             self.draw_offscreen_indicators(client, &mut frame);
         }
         let active_ws = self.workspaces.active_index(client.id);
-        for &(ws, idx) in visible {
+        for &PaneBox {
+            id,
+            ws,
+            column: idx,
+            x,
+            y,
+            w,
+            h,
+        } in visible
+        {
             let strip = self.workspaces.list()[ws].strip();
             let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;
-            for (id, x, y, w, h) in self.pane_boxes(client, ws, idx) {
-                let Some(pane) = self.panes.get(&id) else {
-                    continue;
-                };
-                // Its place in the stack, even when it's alone on screen
-                // because it's fullscreen.
-                let row = column.panes().iter().position(|&p| p == id).unwrap_or(0);
-                let focused =
-                    ws == active_ws && idx == strip.focus_index() && row == column.focus_index();
-                let border = if focused {
-                    Style {
-                        bold: true,
-                        ..Style::fg(FOCUSED_BORDER)
-                    }
-                } else {
-                    Style::fg(UNFOCUSED_BORDER)
-                };
-                draw_box(&mut frame, x, y, w, h, border);
-                let number = if stacked {
-                    format!("{}.{}", idx + 1, row + 1)
-                } else {
-                    format!("{}", idx + 1)
-                };
-                let number = if column.fullscreen() == Some(id) {
-                    format!("{number} [fullscreen]")
-                } else {
-                    number
-                };
-                let scrolled = client.scrolled(id, pane);
-                let title = if scrolled > 0 {
-                    let history = pane.history_size();
-                    format!(" {number}: {} [{scrolled}/{history}] ", pane.title())
-                } else {
-                    format!(" {number}: {} ", pane.title())
-                };
-                let title: String = title
-                    .chars()
-                    .take(w.saturating_sub(4).max(0) as usize)
-                    .collect();
-                frame.put_str(x + 2, y, &title, border);
+            let Some(pane) = self.panes.get(&id) else {
+                continue;
+            };
+            // Its place in the stack, even when it's alone on screen
+            // because it's fullscreen.
+            let row = column.panes().iter().position(|&p| p == id).unwrap_or(0);
+            let focused =
+                ws == active_ws && idx == strip.focus_index() && row == column.focus_index();
+            let border = if focused {
+                Style {
+                    bold: true,
+                    ..Style::fg(FOCUSED_BORDER)
+                }
+            } else {
+                Style::fg(UNFOCUSED_BORDER)
+            };
+            draw_box(&mut frame, x, y, w, h, border);
+            let number = if stacked {
+                format!("{}.{}", idx + 1, row + 1)
+            } else {
+                format!("{}", idx + 1)
+            };
+            let number = if column.fullscreen() == Some(id) {
+                format!("{number} [fullscreen]")
+            } else {
+                number
+            };
+            let scrolled = client.scrolled(id, pane);
+            let title = if scrolled > 0 {
+                let history = pane.history_size();
+                format!(" {number}: {} [{scrolled}/{history}] ", pane.title())
+            } else {
+                format!(" {number}: {} ", pane.title())
+            };
+            let title: String = title
+                .chars()
+                .take(w.saturating_sub(4).max(0) as usize)
+                .collect();
+            frame.put_str(x + 2, y, &title, border);
 
-                let top = content_top(pane, h - 2, scrolled);
-                match client.thumbnails.get(&id) {
-                    Some(thumb) if thumbnails => {
-                        let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + id.0));
-                        let (cols, rows) = thumb.size;
-                        for r in 0..rows {
-                            for c in 0..cols {
-                                let cell = kitty::placeholder(r, c);
-                                frame.put(x + 1 + i32::from(c), y + 1 + i32::from(r), &cell, style);
-                            }
+            let top = content_top(pane, h - 2, scrolled);
+            match client.thumbnails.get(&id) {
+                Some(thumb) if thumbnails => {
+                    let style = Style::fg(kitty::id_color(image_id(id)));
+                    let (cols, rows) = thumb.size;
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let cell = kitty::placeholder(r, c);
+                            frame.put(x + 1 + i32::from(c), y + 1 + i32::from(r), &cell, style);
                         }
                     }
-                    _ => draw_screen(
-                        &mut frame,
-                        pane,
-                        id,
-                        x + 1,
-                        y + 1,
-                        w - 2,
-                        h - 2,
-                        top,
-                        client.selection.as_ref(),
-                    ),
                 }
+                _ => draw_screen(
+                    &mut frame,
+                    pane,
+                    id,
+                    x + 1,
+                    y + 1,
+                    w - 2,
+                    h - 2,
+                    top,
+                    client.selection.as_ref(),
+                ),
+            }
 
-                if focused && show_cursor && scrolled == 0 && pane.cursor_visible() {
-                    let (r, c) = pane.cursor();
-                    let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
-                    if (0..i32::from(client.width)).contains(&cx)
-                        && (0..client.area_height()).contains(&cy)
-                        && cy < y + h - 1
-                    {
-                        cursor = Some((cx as u16, cy as u16));
-                    }
+            if focused && show_cursor && scrolled == 0 && pane.cursor_visible() {
+                let (r, c) = pane.cursor();
+                let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
+                if (0..i32::from(client.width)).contains(&cx)
+                    && (0..client.area_height()).contains(&cy)
+                    && cy < y + h - 1
+                {
+                    cursor = Some((cx as u16, cy as u16));
                 }
             }
         }
@@ -1416,7 +1387,7 @@ impl App {
     fn draw_workspace_label(&self, client: &Client, frame: &mut Frame, ws: usize) {
         let top = self.row_top(client, ws);
         let row_height = self.row_height(client);
-        let zoom = self.workspaces.zoom(client.id);
+        let overview = self.workspaces.in_overview(client.id);
         let active = ws == self.workspaces.active_index(client.id);
         let style = if active {
             Style {
@@ -1426,7 +1397,7 @@ impl App {
         } else {
             Style::fg(DIM_TEXT)
         };
-        if zoom < 1.0 {
+        if overview {
             frame.put_str(
                 1,
                 top - 1,
@@ -1445,8 +1416,9 @@ impl App {
         };
         let hint_width = hint.chars().count() as i32;
         let middle = top + row_height / 2;
-        if self.workspaces.in_overview(client.id) {
+        if overview {
             // A box the size of a default column, where one would open.
+            let zoom = self.workspaces.zoom(client.id);
             let w = ((f64::from(client.width) * 0.5 * zoom).round() as i32).max(hint_width + 4);
             let x = (i32::from(client.width) - w) / 2;
             draw_box(frame, x, top, w, row_height, style);
@@ -1647,13 +1619,11 @@ fn fit_hints(hints: &[&str], room: usize) -> String {
     out
 }
 
-fn prefix_binding(key: KeyEvent) -> Option<Action> {
-    let action = match key.code {
-        KeyCode::Char('n') | KeyCode::Enter => Action::NewColumn,
+/// Keys that mean the same after the prefix, in the overview and with Alt.
+fn common_binding(code: KeyCode) -> Option<Action> {
+    let action = match code {
         KeyCode::Char('h') | KeyCode::Left => Action::FocusLeft,
         KeyCode::Char('l') | KeyCode::Right => Action::FocusRight,
-        KeyCode::Char('0') | KeyCode::Home => Action::FocusFirst,
-        KeyCode::Char('$') | KeyCode::End => Action::FocusLast,
         KeyCode::Char('H') => Action::MoveLeft,
         KeyCode::Char('L') => Action::MoveRight,
         KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
@@ -1664,19 +1634,29 @@ fn prefix_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
         KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
         KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
-        KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
-        KeyCode::Char(']') => Action::ConsumeOrExpelRight,
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
         KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
         KeyCode::Char('f') => Action::ToggleMaximized,
         KeyCode::Char('F') => Action::ToggleFullscreen,
+        _ => return None,
+    };
+    Some(action)
+}
+
+fn prefix_binding(key: KeyEvent) -> Option<Action> {
+    let action = match key.code {
+        KeyCode::Char('n') | KeyCode::Enter => Action::NewColumn,
+        KeyCode::Char('0') | KeyCode::Home => Action::FocusFirst,
+        KeyCode::Char('$') | KeyCode::End => Action::FocusLast,
+        KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
+        KeyCode::Char(']') => Action::ConsumeOrExpelRight,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
         KeyCode::Char('x') => Action::Close,
         KeyCode::Char('d') => Action::Detach,
         KeyCode::Char('q') => Action::Quit,
-        _ => return None,
+        code => return common_binding(code),
     };
     Some(action)
 }
@@ -1690,32 +1670,15 @@ fn overview_binding(key: KeyEvent) -> Option<Action> {
         return None;
     }
     let action = match key.code {
-        KeyCode::Char('h') | KeyCode::Left => Action::FocusLeft,
-        KeyCode::Char('l') | KeyCode::Right => Action::FocusRight,
+        KeyCode::Char('n') => Action::NewColumn,
         KeyCode::Char('0') | KeyCode::Home => Action::FocusFirst,
         KeyCode::Char('$') | KeyCode::End => Action::FocusLast,
-        KeyCode::Char('H') => Action::MoveLeft,
-        KeyCode::Char('L') => Action::MoveRight,
-        KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
-        KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
-        KeyCode::Char('J') => Action::MoveDown,
-        KeyCode::Char('K') => Action::MoveUp,
-        KeyCode::Char('u') | KeyCode::PageDown => Action::FocusWorkspaceDown,
-        KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
-        KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
-        KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
         KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
         KeyCode::Char(']') => Action::ConsumeOrExpelRight,
-        KeyCode::Char(',') => Action::ConsumeIntoColumn,
-        KeyCode::Char('.') => Action::ExpelFromColumn,
-        KeyCode::Char('n') => Action::NewColumn,
-        KeyCode::Char('r') => Action::CycleWidth,
-        KeyCode::Char('f') => Action::ToggleMaximized,
-        KeyCode::Char('F') => Action::ToggleFullscreen,
         KeyCode::Char('x') => Action::Close,
         KeyCode::Char('t') => Action::ToggleThumbnails,
         KeyCode::Char('o') | KeyCode::Enter | KeyCode::Esc => Action::ExitOverview,
-        _ => return None,
+        code => return common_binding(code),
     };
     Some(action)
 }
@@ -1728,30 +1691,13 @@ fn alt_binding(key: KeyEvent) -> Option<Action> {
     }
     let action = match key.code {
         KeyCode::Enter => Action::NewColumn,
-        KeyCode::Char('h') | KeyCode::Left => Action::FocusLeft,
-        KeyCode::Char('l') | KeyCode::Right => Action::FocusRight,
-        KeyCode::Char('H') => Action::MoveLeft,
-        KeyCode::Char('L') => Action::MoveRight,
-        KeyCode::Char('j') | KeyCode::Down => Action::FocusDown,
-        KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
-        KeyCode::Char('J') => Action::MoveDown,
-        KeyCode::Char('K') => Action::MoveUp,
         // Alt-[ would be read as the start of an escape sequence, so
         // consume-or-expel is on Alt-{ and Alt-} instead.
         KeyCode::Char('{') => Action::ConsumeOrExpelLeft,
         KeyCode::Char('}') => Action::ConsumeOrExpelRight,
-        KeyCode::Char('u') | KeyCode::PageDown => Action::FocusWorkspaceDown,
-        KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
-        KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
-        KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
-        KeyCode::Char(',') => Action::ConsumeIntoColumn,
-        KeyCode::Char('.') => Action::ExpelFromColumn,
-        KeyCode::Char('r') => Action::CycleWidth,
-        KeyCode::Char('f') => Action::ToggleMaximized,
-        KeyCode::Char('F') => Action::ToggleFullscreen,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
-        _ => return None,
+        code => return common_binding(code),
     };
     Some(action)
 }

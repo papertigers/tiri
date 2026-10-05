@@ -28,15 +28,10 @@ const OPEN_FADE: Duration = Duration::from_millis(200);
 const OVERVIEW_OUT: Duration = Duration::from_millis(130);
 const OVERVIEW_IN: Duration = Duration::from_millis(260);
 
-/// What an effect is drawn over, looked up afresh each frame since panes
-/// move while the strip scrolls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Anchor {
-    Pane(PaneId),
-}
-
 struct Running {
-    anchor: Anchor,
+    /// What the effect is drawn over, looked up afresh each frame since
+    /// panes move while the strip scrolls.
+    pane: PaneId,
     effect: Effect,
 }
 
@@ -51,16 +46,9 @@ impl Effects {
     /// A newly opened pane fades in, its text and colors rising out of
     /// the background.
     pub fn pane_opened(&mut self, pane: PaneId, palette: &Palette) {
-        let [r, g, b] = palette.background;
-        let background = RColor::Rgb(r, g, b);
-        self.add(
-            Anchor::Pane(pane),
-            fx::fade_from(background, background, (OPEN_FADE, Interpolation::QuadOut)),
-        );
-    }
-
-    fn add(&mut self, anchor: Anchor, effect: Effect) {
-        self.running.push(Running { anchor, effect });
+        let background = background(palette);
+        let effect = fx::fade_from(background, background, (OPEN_FADE, Interpolation::QuadOut));
+        self.running.push(Running { pane, effect });
     }
 
     pub fn is_active(&self) -> bool {
@@ -72,20 +60,20 @@ impl Effects {
         self.last = None;
     }
 
-    /// What each running effect is drawn over.
-    pub fn anchors(&self) -> Vec<Anchor> {
-        self.running.iter().map(|r| r.anchor).collect()
+    /// The panes running effects are drawn over.
+    pub fn panes(&self) -> Vec<PaneId> {
+        self.running.iter().map(|r| r.pane).collect()
     }
 
     /// Advances the effects to `now` and draws them over `frame`. `areas`
-    /// gives where each anchor is on screen now, if it's visible; effects
-    /// whose anchor has gone away are dropped.
+    /// gives where each pane is on screen now, if it's visible; effects
+    /// whose pane has gone away are dropped.
     pub fn apply(
         &mut self,
         frame: &mut Frame,
         palette: &Palette,
         now: Instant,
-        areas: &[(Anchor, Option<Rect>)],
+        areas: &[(PaneId, Option<Rect>)],
     ) {
         if self.running.is_empty() {
             self.last = None;
@@ -95,26 +83,25 @@ impl Effects {
         self.last = Some(now);
 
         let screen = Rect::new(0, 0, frame.width(), frame.height());
-        let original = to_buffer(frame, palette);
-        let mut buffer = original.clone();
-        self.running.retain_mut(|running| {
-            let area = areas
-                .iter()
-                .find(|(anchor, _)| *anchor == running.anchor)
-                .and_then(|(_, area)| *area);
-            let Some(area) = area else {
-                return false;
-            };
-            running.effect.set_area(area.intersection(screen));
-            running.effect.process(elapsed, &mut buffer, screen);
-            !running.effect.done()
+        on_buffer(frame, palette, |buffer| {
+            self.running.retain_mut(|running| {
+                let area = areas
+                    .iter()
+                    .find(|(pane, _)| *pane == running.pane)
+                    .and_then(|(_, area)| *area);
+                let Some(area) = area else {
+                    return false;
+                };
+                running.effect.set_area(area.intersection(screen));
+                running.effect.process(elapsed, buffer, screen);
+                !running.effect.done()
+            });
         });
         if self.running.is_empty() {
             // Otherwise the next effect would count the idle time since
             // this one as already elapsed, and finish at once.
             self.last = None;
         }
-        copy_changes(frame, &original, &buffer);
     }
 }
 
@@ -140,17 +127,9 @@ pub struct Transition {
 }
 
 impl Transition {
-    /// Into the overview.
-    pub fn opening(from: Frame, palette: &Palette) -> Self {
-        Self::new(from, true, palette)
-    }
-
-    /// Out of the overview.
-    pub fn closing(from: Frame, palette: &Palette) -> Self {
-        Self::new(from, false, palette)
-    }
-
-    fn new(from: Frame, opening: bool, palette: &Palette) -> Self {
+    /// Into the overview if `opening`, otherwise out of it, from `from`, the
+    /// view as last drawn.
+    pub fn new(from: Frame, opening: bool, palette: &Palette) -> Self {
         let background = background(palette);
         Self {
             from,
@@ -203,12 +182,11 @@ impl Transition {
             self.out_elapsed += elapsed;
             // The old view, out of date though it is, still fills the screen.
             if self.from.width() == frame.width() && self.from.height() == frame.height() {
-                let original = to_buffer(&self.from, palette);
-                let mut buffer = original.clone();
-                self.out.process(elapsed, &mut buffer, area);
-                let status = frame.height().saturating_sub(1);
                 let mut old = self.from.clone();
-                copy_changes(&mut old, &original, &buffer);
+                on_buffer(&mut old, palette, |buffer| {
+                    self.out.process(elapsed, buffer, area);
+                });
+                let status = frame.height().saturating_sub(1);
                 for x in 0..frame.width() {
                     // Keep the new status bar.
                     let (sym, wide, style) = frame.content(x, status);
@@ -229,10 +207,9 @@ impl Transition {
             return true;
         }
         self.in_elapsed += elapsed;
-        let original = to_buffer(frame, palette);
-        let mut buffer = original.clone();
-        self.into.process(elapsed, &mut buffer, area);
-        copy_changes(frame, &original, &buffer);
+        on_buffer(frame, palette, |buffer| {
+            self.into.process(elapsed, buffer, area);
+        });
         !self.into.done()
     }
 }
@@ -240,6 +217,15 @@ impl Transition {
 fn background(palette: &Palette) -> RColor {
     let [r, g, b] = palette.background;
     RColor::Rgb(r, g, b)
+}
+
+/// Runs `f` over `frame` as a ratatui buffer, then copies back the cells
+/// it changed.
+fn on_buffer(frame: &mut Frame, palette: &Palette, f: impl FnOnce(&mut Buffer)) {
+    let original = to_buffer(frame, palette);
+    let mut buffer = original.clone();
+    f(&mut buffer);
+    copy_changes(frame, &original, &buffer);
 }
 
 /// `frame` as a ratatui buffer, colors resolved to RGB.
@@ -342,7 +328,7 @@ mod tests {
         effects.pane_opened(PaneId(0), &Palette::default());
         let start = Instant::now();
         // An effect over an area away from the text.
-        let areas = [(Anchor::Pane(PaneId(0)), Some(Rect::new(7, 0, 3, 1)))];
+        let areas = [(PaneId(0), Some(Rect::new(7, 0, 3, 1)))];
         effects.apply(&mut frame, &Palette::default(), start, &areas);
         effects.apply(
             &mut frame,
@@ -362,7 +348,7 @@ mod tests {
         let palette = Palette::default();
         let mut effects = Effects::default();
         effects.pane_opened(PaneId(0), &palette);
-        let areas = [(Anchor::Pane(PaneId(0)), Some(Rect::new(0, 0, 10, 3)))];
+        let areas = [(PaneId(0), Some(Rect::new(0, 0, 10, 3)))];
         let start = Instant::now();
 
         let mut frame = frame_with_text();
@@ -391,7 +377,7 @@ mod tests {
             &mut frame,
             &Palette::default(),
             Instant::now(),
-            &[(Anchor::Pane(PaneId(0)), None)],
+            &[(PaneId(0), None)],
         );
         assert!(!effects.is_active());
     }
@@ -399,7 +385,7 @@ mod tests {
     #[test]
     fn a_later_effect_starts_from_the_beginning() {
         let palette = Palette::default();
-        let areas = [(Anchor::Pane(PaneId(0)), Some(Rect::new(0, 0, 10, 3)))];
+        let areas = [(PaneId(0), Some(Rect::new(0, 0, 10, 3)))];
         let mut effects = Effects::default();
         let start = Instant::now();
         effects.pane_opened(PaneId(0), &palette);
@@ -444,7 +430,7 @@ mod tests {
 
     #[test]
     fn opening_fades_the_overview_in() {
-        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let mut transition = Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         assert_eq!(transition.image_opacity(), 0.0);
         // Through the fade-out, then part way into the fade-in.
@@ -462,7 +448,7 @@ mod tests {
 
     #[test]
     fn closing_fades_the_overview_out() {
-        let mut transition = Transition::closing(filled("o"), &Palette::default());
+        let mut transition = Transition::new(filled("o"), false, &Palette::default());
         let ms = Duration::from_millis;
         assert_eq!(transition.image_opacity(), 1.0);
         let frame = run(&mut transition, &filled("n"), &[ms(0), ms(80)]);
@@ -481,7 +467,7 @@ mod tests {
         let mut new = filled("n");
         let id = Style::fg(Color::Rgb(0, 0, 7));
         new.put(5, 5, &kitty::placeholder(0, 0), id);
-        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let mut transition = Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         let frame = run(
             &mut transition,
@@ -493,7 +479,7 @@ mod tests {
 
     #[test]
     fn a_transition_ends_showing_the_new_view_untouched() {
-        let mut transition = Transition::opening(filled("o"), &Palette::default());
+        let mut transition = Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         let start = Instant::now();
         let new = filled("n");
@@ -513,7 +499,7 @@ mod tests {
 
     #[test]
     fn the_status_bar_is_never_part_of_it() {
-        let mut transition = Transition::closing(filled("o"), &Palette::default());
+        let mut transition = Transition::new(filled("o"), false, &Palette::default());
         let mut new = filled("n");
         new.put_str(0, 10, "status", Style::default());
         let frame = run(

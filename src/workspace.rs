@@ -294,10 +294,7 @@ impl Workspaces {
         // Jump straight to the new layout rather than animating to it.
         let zoom = self.overview_zoom();
         for view in self.views.values_mut() {
-            let overview = view.overview.then_some(zoom);
-            for (strip_view, workspace) in view.strips.iter_mut().zip(&self.list) {
-                *strip_view = StripView::settled(&workspace.strip, overview);
-            }
+            settle(view, &self.list, zoom);
         }
     }
 
@@ -325,27 +322,23 @@ impl Workspaces {
             .fold(OVERVIEW_MAX_ZOOM, f64::min)
     }
 
-    /// The zoom `client`'s strips are heading for.
-    fn zoom_target(&self, view: &View) -> Option<f64> {
+    /// The zoom `view`'s strips are shown at, if it's zoomed out.
+    fn overview_zoom_for(&self, view: &View) -> Option<f64> {
         view.overview.then(|| self.overview_zoom())
     }
 
     /// Puts `client`'s view straight where it's heading, without animating:
-    /// the workspace it's on, the scroll positions and the zoom.
+    /// the workspace it's on and the scroll positions.
     pub fn snap(&mut self, client: ClientId) {
         let zoom = self.overview_zoom();
         let view = self.views.get_mut(&client).expect("client is attached");
         view.y = view.active as f64;
-        let target = view.overview.then_some(zoom);
-        for (strip_view, workspace) in view.strips.iter_mut().zip(&self.list) {
-            *strip_view = StripView::settled(&workspace.strip, target);
-        }
+        settle(view, &self.list, zoom);
     }
 
-    /// `client`'s current zoom, 1.0 outside the overview.
+    /// `client`'s zoom: 1.0, or less in the overview.
     pub fn zoom(&self, client: ClientId) -> f64 {
-        let view = self.view(client);
-        view.strips[view.active].zoom()
+        self.overview_zoom_for(self.view(client)).unwrap_or(1.0)
     }
 
     /// `client`'s vertical position, in workspaces from the top.
@@ -356,12 +349,13 @@ impl Workspaces {
     /// Column `idx` of workspace `ws`'s left edge and width on `client`'s
     /// screen.
     pub fn column_span(&self, client: ClientId, ws: usize, idx: usize) -> (i32, i32) {
-        self.view(client).strips[ws].column_span(&self.list[ws].strip, idx)
+        let zoom = self.zoom(client);
+        self.view(client).strips[ws].column_span(&self.list[ws].strip, idx, zoom)
     }
 
     pub fn is_animating(&self, client: ClientId) -> bool {
         let view = self.view(client);
-        let zoom = self.zoom_target(view);
+        let zoom = self.overview_zoom_for(view);
         view.y != view.active as f64
             || (view.strips.iter())
                 .zip(&self.list)
@@ -387,6 +381,14 @@ impl Workspaces {
             }
         }
         moving
+    }
+}
+
+/// Puts each of `view`'s strip views where it's heading, without animating.
+fn settle(view: &mut View, list: &[Workspace], overview_zoom: f64) {
+    let zoom = view.overview.then_some(overview_zoom);
+    for (strip_view, workspace) in view.strips.iter_mut().zip(list) {
+        *strip_view = StripView::settled(&workspace.strip, zoom);
     }
 }
 
@@ -543,13 +545,12 @@ mod tests {
         }
         ws.set_overview(A, true);
         settle(&mut ws);
-        // Six half-width columns need a third to fit; that applies to both.
-        let view = ws.view(A);
-        let zooms: Vec<f64> = view.strips.iter().map(StripView::zoom).collect();
-        assert!(
-            zooms.iter().all(|&z| (z - 1.0 / 3.0).abs() < 1e-9),
-            "{zooms:?}"
-        );
+        // Six half-width columns need a third to fit; that applies to both,
+        // so the lone column above is as narrow as those below.
+        assert!((ws.zoom(A) - 1.0 / 3.0).abs() < 1e-9);
+        // (Give or take rounding, at their different scroll positions.)
+        let (above, below) = (ws.column_span(A, 0, 0).1, ws.column_span(A, 1, 0).1);
+        assert!(above.abs_diff(below) <= 1, "{above} vs {below}");
     }
 
     #[test]

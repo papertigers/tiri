@@ -177,7 +177,7 @@ impl Pane {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Feeds output from the child into the emulator.
+    /// The emulated terminal, for drawing thumbnails from.
     pub fn term(&self) -> &Term<impl EventListener> {
         &self.term
     }

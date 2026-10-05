@@ -499,69 +499,61 @@ impl Strip {
     }
 
     /// Where a viewer's viewport is heading: its left edge in strip
-    /// coordinates, and its zoom. `overview_zoom` is the zoom to use if that
-    /// viewer has the overview open.
-    pub fn view_target(&self, overview_zoom: Option<f64>) -> (f64, f64) {
+    /// coordinates. `overview_zoom` is the zoom if that viewer has the
+    /// overview open.
+    pub fn view_target(&self, overview_zoom: Option<f64>) -> f64 {
         let Some(zoom) = overview_zoom else {
-            return (f64::from(self.target_offset), 1.0);
+            return f64::from(self.target_offset);
         };
         let total = f64::from(self.total_width());
         let view = f64::from(self.view_width);
         // How much of the strip fits on screen at this zoom.
         let visible = view / zoom;
-        let offset = if total <= visible || self.columns.is_empty() {
+        if total <= visible || self.columns.is_empty() {
             (total - visible) / 2.0
         } else {
             let x = f64::from(self.column_x(self.focus));
             let center = x + f64::from(self.column_width(self.focus)) / 2.0;
             (center - visible / 2.0).clamp(0.0, total - visible)
-        };
-        (offset, zoom)
+        }
     }
 }
 
-/// One viewer's animated view of a strip: how far it's scrolled and zoomed
-/// out right now, easing toward [`Strip::view_target`]. Every client has its
-/// own, so one opening the overview doesn't zoom out the others.
+/// One viewer's animated view of a strip: how far it's scrolled right now,
+/// easing toward [`Strip::view_target`]. Every client has its own, so one
+/// scrolling doesn't scroll the others.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StripView {
     offset: f64,
-    zoom: f64,
 }
 
 impl StripView {
     /// A view already at its target, without animating there.
     pub fn settled(strip: &Strip, overview_zoom: Option<f64>) -> Self {
-        let (offset, zoom) = strip.view_target(overview_zoom);
-        Self { offset, zoom }
-    }
-
-    /// The current scale, 1.0 outside the overview.
-    pub fn zoom(&self) -> f64 {
-        self.zoom
+        Self {
+            offset: strip.view_target(overview_zoom),
+        }
     }
 
     pub fn is_animating(&self, strip: &Strip, overview_zoom: Option<f64>) -> bool {
-        strip.view_target(overview_zoom) != (self.offset, self.zoom)
+        strip.view_target(overview_zoom) != self.offset
     }
 
-    /// Advances the scroll and zoom animations. Returns true while still moving.
+    /// Advances the scroll animation. Returns true while still moving.
     pub fn tick(&mut self, strip: &Strip, overview_zoom: Option<f64>, dt: Duration) -> bool {
-        let (offset, zoom) = strip.view_target(overview_zoom);
-        if (offset - self.offset).abs() < 0.5 && (zoom - self.zoom).abs() < 0.005 {
-            (self.offset, self.zoom) = (offset, zoom);
+        let offset = strip.view_target(overview_zoom);
+        if (offset - self.offset).abs() < 0.5 {
+            self.offset = offset;
             return false;
         }
-        let k = 1.0 - (-dt.as_secs_f64() / SCROLL_TAU).exp();
-        self.offset += (offset - self.offset) * k;
-        self.zoom += (zoom - self.zoom) * k;
+        self.offset += (offset - self.offset) * (1.0 - (-dt.as_secs_f64() / SCROLL_TAU).exp());
         true
     }
 
     /// Column `idx`'s left edge and width on screen, at this view's scroll
-    /// position and zoom.
-    pub fn column_span(&self, strip: &Strip, idx: usize) -> (i32, i32) {
-        let to_screen = |x: i32| ((f64::from(x) - self.offset) * self.zoom).round() as i32;
+    /// position and `zoom`.
+    pub fn column_span(&self, strip: &Strip, idx: usize, zoom: f64) -> (i32, i32) {
+        let to_screen = |x: i32| ((f64::from(x) - self.offset) * zoom).round() as i32;
         let x = strip.column_x(idx);
         let left = to_screen(x);
         (
@@ -691,50 +683,52 @@ mod tests {
         let mut view = StripView::settled(&Strip::new(100), None);
         assert!(view.tick(&strip, None, Duration::from_millis(16)));
         settle(&mut view, &strip, None);
-        assert_eq!(view.column_span(&strip, 1), (0, 50));
+        assert_eq!(view.column_span(&strip, 1, 1.0), (0, 50));
     }
 
     #[test]
     fn overview_fits_and_centers_a_short_strip() {
         let strip = strip_with(3, 100);
-        let view = view_of(&strip, Some(strip.fit_zoom()));
+        let zoom = strip.fit_zoom();
+        let view = view_of(&strip, Some(zoom));
         // 150 cells of strip at half zoom is 75 wide, centered in 100.
-        assert_eq!(view.zoom(), 0.5);
-        assert_eq!(view.column_span(&strip, 0), (13, 25));
-        assert_eq!(view.column_span(&strip, 2), (63, 25));
+        assert_eq!(zoom, 0.5);
+        assert_eq!(view.column_span(&strip, 0, zoom), (13, 25));
+        assert_eq!(view.column_span(&strip, 2, zoom), (63, 25));
     }
 
     #[test]
     fn overview_zooms_further_to_fit_more_columns() {
         let strip = strip_with(6, 100);
-        let view = view_of(&strip, Some(strip.fit_zoom()));
-        assert!((view.zoom() - 1.0 / 3.0).abs() < 1e-9);
-        assert_eq!(view.column_span(&strip, 0).0, 0);
-        assert_eq!(view.column_span(&strip, 5), (83, 17));
+        let zoom = strip.fit_zoom();
+        let view = view_of(&strip, Some(zoom));
+        assert!((zoom - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(view.column_span(&strip, 0, zoom).0, 0);
+        assert_eq!(view.column_span(&strip, 5, zoom), (83, 17));
     }
 
     #[test]
     fn overview_scrolls_to_selection_when_strip_is_too_long() {
         let mut strip = strip_with(12, 100);
-        let zoom = Some(strip.fit_zoom());
-        let mut view = view_of(&strip, zoom);
-        assert_eq!(view.zoom(), OVERVIEW_MIN_ZOOM);
+        let zoom = strip.fit_zoom();
+        let mut view = view_of(&strip, Some(zoom));
+        assert_eq!(zoom, OVERVIEW_MIN_ZOOM);
         // Selection is the last column, so the strip's right end is on screen.
-        assert_eq!(view.column_span(&strip, 11), (88, 12));
+        assert_eq!(view.column_span(&strip, 11, zoom), (88, 12));
         strip.focus_first();
-        settle(&mut view, &strip, zoom);
-        assert_eq!(view.column_span(&strip, 0), (0, 13));
+        settle(&mut view, &strip, Some(zoom));
+        assert_eq!(view.column_span(&strip, 0, zoom), (0, 13));
     }
 
     #[test]
     fn leaving_overview_lands_on_the_selection() {
         let mut strip = strip_with(4, 100);
-        let mut view = view_of(&strip, Some(strip.fit_zoom()));
+        let zoom = strip.fit_zoom();
+        let mut view = view_of(&strip, Some(zoom));
         strip.focus_first();
-        settle(&mut view, &strip, Some(strip.fit_zoom()));
+        settle(&mut view, &strip, Some(zoom));
         settle(&mut view, &strip, None);
-        assert_eq!(view.zoom(), 1.0);
-        assert_eq!(view.column_span(&strip, 0), (0, 50));
+        assert_eq!(view.column_span(&strip, 0, 1.0), (0, 50));
     }
 
     #[test]
