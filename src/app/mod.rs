@@ -29,7 +29,6 @@ use crate::layout::{PaneId, split_heights};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
 use crate::render::Renderer;
-use crate::theme::Theme;
 use crate::thumbnail;
 use crate::workspace::{ClientId, Workspaces};
 
@@ -37,8 +36,6 @@ pub use client_state::Client;
 use client_state::Drag;
 use thumbnails::THUMBNAIL_INTERVAL;
 
-/// The prefix key, tmux-style: Ctrl-a, then a command key.
-const PREFIX: char = 'a';
 const STATUS_HEIGHT: u16 = 1;
 /// The largest terminal a client may claim to have, in cells.
 const MAX_WIDTH: u16 = 1000;
@@ -73,9 +70,8 @@ pub struct App {
     /// The config file, re-read as each client attaches; None to use only
     /// what's built in.
     config_path: Option<PathBuf>,
-    /// The colors of tiri's own borders, status bar and hints, from the
-    /// config.
-    theme: Theme,
+    /// The config: the theme and key bindings.
+    config: Config,
     pub quit: bool,
 }
 
@@ -94,7 +90,7 @@ impl App {
             size_owner: None,
             exited: Vec::new(),
             config_path,
-            theme: Theme::default(),
+            config: Config::default(),
             quit: false,
         }
     }
@@ -114,7 +110,7 @@ impl App {
         let (width, height) = clamp_size(width, height);
         // Edits to the config apply from the next attach, for everyone.
         if let Some(path) = &self.config_path {
-            self.theme = Config::load(path)?.theme;
+            self.config = Config::load(path)?;
         }
         let workspace = match &target {
             Target::Default => None,

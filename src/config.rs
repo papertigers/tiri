@@ -6,16 +6,19 @@
 //! [`DEFAULT`] is a commented config with everything at its default, which
 //! `tiri config default` prints for a starting point.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use knus::ast::{Literal, TypeName};
+use crossterm::event::{KeyCode, KeyEvent};
+use knus::ast::{Literal, SpannedNode, TypeName};
 use knus::decode::{Context, Kind};
 use knus::errors::{DecodeError, ExpectedType};
 use knus::span::Spanned;
 use knus::traits::{DecodeScalar, ErrorSpan};
 use miette::{GraphicalReportHandler, GraphicalTheme};
 
+use crate::keys::{Action, Bindings, Key, Table};
 use crate::render::Color;
 use crate::theme::Theme;
 
@@ -23,9 +26,26 @@ use crate::theme::Theme;
 pub const DEFAULT: &str = include_str!("default-config.kdl");
 
 /// What the config file sets, resolved.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub theme: Theme,
+    pub bindings: Bindings,
+}
+
+impl Default for Config {
+    /// What tiri does without a config: [`DEFAULT`], which is also where the
+    /// built-in key bindings are written down.
+    fn default() -> Self {
+        let raw = decode("default-config.kdl", DEFAULT).expect("the default config parses");
+        let empty = Bindings {
+            prefix: "Ctrl+a".parse().expect("a key"),
+            prefix_binds: Table::default(),
+            binds: Table::default(),
+            overview_binds: Table::default(),
+        };
+        raw.resolve("default-config.kdl", empty)
+            .expect("the default config is valid")
+    }
 }
 
 impl Config {
@@ -39,20 +59,25 @@ impl Config {
         Config::parse(&path.display().to_string(), &text)
     }
 
-    /// Parses config `text`, naming it `file` in errors.
+    /// Parses config `text`, naming it `file` in errors. Its key bindings
+    /// add to and override the built-in ones.
     pub fn parse(file: &str, text: &str) -> Result<Config> {
-        let raw: RawConfig = knus::parse(file, text).map_err(|e| {
-            // An error report showing the offending lines, as plain text: it
-            // reaches the user through the attaching client.
-            let mut report = String::new();
-            let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
-            match handler.render_report(&mut report, &e) {
-                Ok(()) => anyhow::anyhow!("{report}"),
-                Err(_) => anyhow::anyhow!("{file}: {e}"),
-            }
-        })?;
-        raw.resolve(file)
+        decode(file, text)?.resolve(file, Config::default().bindings)
     }
+}
+
+/// Decodes config `text` without looking names up.
+fn decode(file: &str, text: &str) -> Result<RawConfig> {
+    knus::parse(file, text).map_err(|e| {
+        // An error report showing the offending lines, as plain text: it
+        // reaches the user through the attaching client.
+        let mut report = String::new();
+        let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+        match handler.render_report(&mut report, &e) {
+            Ok(()) => anyhow::anyhow!("{report}"),
+            Err(_) => anyhow::anyhow!("{file}: {e}"),
+        }
+    })
 }
 
 /// Where the config file is: under `$XDG_CONFIG_HOME`, or `~/.config`.
@@ -71,6 +96,73 @@ struct RawConfig {
     theme: Option<String>,
     #[knus(children(name = "define-theme"))]
     themes: Vec<RawTheme>,
+    #[knus(child, unwrap(argument), default)]
+    prefix: Option<ConfigKey>,
+    #[knus(child, default)]
+    prefix_binds: RawBinds,
+    #[knus(child, default)]
+    binds: RawBinds,
+    #[knus(child, default)]
+    overview_binds: RawBinds,
+}
+
+/// A section of key bindings, as in `binds { Alt+h { focus-column-left; } }`.
+#[derive(knus::Decode, Debug, Default)]
+struct RawBinds {
+    #[knus(children)]
+    binds: Vec<RawBind>,
+}
+
+/// One binding: a key, and its action, or None for `unbind`.
+#[derive(Debug)]
+struct RawBind {
+    key: Key,
+    action: Option<Action>,
+}
+
+impl<S: ErrorSpan> knus::Decode<S> for RawBind {
+    fn decode_node(node: &SpannedNode<S>, ctx: &mut Context<S>) -> Result<Self, DecodeError<S>> {
+        let key = node
+            .node_name
+            .parse::<Key>()
+            .map_err(|e| DecodeError::conversion(&node.node_name, e))?;
+        for arg in &node.arguments {
+            ctx.emit_error(DecodeError::unexpected(
+                &arg.literal,
+                "argument",
+                "a binding takes no arguments; its action goes in braces",
+            ));
+        }
+        let children = node.children.as_ref().map_or(&[][..], |c| &c[..]);
+        let [child] = children else {
+            return Err(DecodeError::missing(
+                node,
+                "a binding needs one action, as in `h { focus-column-left; }`",
+            ));
+        };
+        if &**child.node_name == "unbind" {
+            return Ok(RawBind { key, action: None });
+        }
+        let action = Action::decode_node(child, ctx)?;
+        Ok(RawBind {
+            key,
+            action: Some(action),
+        })
+    }
+}
+
+impl RawBinds {
+    /// Applies these bindings on top of `table`.
+    fn apply_to(self, table: &mut Table, file: &str, section: &str) -> Result<()> {
+        let mut seen = HashSet::new();
+        for bind in self.binds {
+            if !seen.insert(bind.key) {
+                bail!("{file}: {section} has {} more than once", bind.key);
+            }
+            table.set(bind.key, bind.action);
+        }
+        Ok(())
+    }
 }
 
 #[derive(knus::Decode, Debug)]
@@ -98,7 +190,17 @@ struct RawTheme {
 }
 
 impl RawConfig {
-    fn resolve(self, file: &str) -> Result<Config> {
+    /// Looks names up, and lays this config's bindings over `bindings`.
+    fn resolve(self, file: &str, mut bindings: Bindings) -> Result<Config> {
+        if let Some(ConfigKey(prefix)) = self.prefix {
+            bindings.prefix = prefix;
+        }
+        self.prefix_binds
+            .apply_to(&mut bindings.prefix_binds, file, "prefix-binds")?;
+        self.binds.apply_to(&mut bindings.binds, file, "binds")?;
+        self.overview_binds
+            .apply_to(&mut bindings.overview_binds, file, "overview-binds")?;
+
         let mut defined: Vec<(String, Theme)> = Vec::new();
         for raw in self.themes {
             let taken =
@@ -120,7 +222,7 @@ impl RawConfig {
             Some(name) => lookup(name, &defined)
                 .ok_or_else(|| unknown_theme(file, "theme", name, &defined))?,
         };
-        Ok(Config { theme })
+        Ok(Config { theme, bindings })
     }
 }
 
@@ -166,6 +268,33 @@ fn unknown_theme(
         "{file}: {setting} {name:?} isn't a theme; there's {}",
         names.join(", ")
     )
+}
+
+/// A key as written in the config's `prefix`, as in "Ctrl+a".
+#[derive(Debug, Clone, Copy)]
+struct ConfigKey(Key);
+
+impl<S: ErrorSpan> DecodeScalar<S> for ConfigKey {
+    fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
+        no_type_name(type_name, ctx, "key");
+    }
+
+    fn raw_decode(
+        value: &Spanned<Literal, S>,
+        ctx: &mut Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let Literal::String(s) = &**value else {
+            ctx.emit_error(DecodeError::scalar_kind(Kind::String, value));
+            return Ok(ConfigKey(Key::from_event(KeyEvent::from(KeyCode::Null))));
+        };
+        match s.parse() {
+            Ok(key) => Ok(ConfigKey(key)),
+            Err(e) => {
+                ctx.emit_error(DecodeError::unexpected(value, "key", e));
+                Ok(ConfigKey(Key::from_event(KeyEvent::from(KeyCode::Null))))
+            }
+        }
+    }
 }
 
 /// A color as written in the config: "#rrggbb", or a palette index.
@@ -260,6 +389,77 @@ mod tests {
             .replace("theme \"default\"", "theme \"mine\"");
         assert_eq!(parse(&example).unwrap(), Config::default());
         assert_ne!(example, DEFAULT);
+    }
+
+    fn key(s: &str) -> Key {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_default_bindings() {
+        let b = Config::default().bindings;
+        assert_eq!(b.prefix, key("Ctrl+a"));
+        assert_eq!(
+            b.prefix_binds.get(key("Shift+h")),
+            Some(Action::MoveColumnLeft)
+        );
+        assert_eq!(b.prefix_binds.get(key("$")), Some(Action::FocusColumnLast));
+        assert_eq!(
+            b.binds.get(key("Alt+{")),
+            Some(Action::ConsumeOrExpelPaneLeft)
+        );
+        assert_eq!(
+            b.binds.get(key("Alt+Shift+u")),
+            Some(Action::MoveColumnToWorkspaceDown)
+        );
+        assert_eq!(
+            b.overview_binds.get(key("Escape")),
+            Some(Action::CloseOverview)
+        );
+        assert_eq!(b.binds.get(key("Alt+n")), None);
+    }
+
+    #[test]
+    fn bindings_add_to_the_defaults() {
+        let b = parse(
+            r#"
+            prefix "Ctrl+b"
+            prefix-binds {
+                v { new-column; }
+                n { unbind; }
+                x { detach; }
+            }
+            binds { Alt+n { new-column; }; }
+            "#,
+        )
+        .unwrap()
+        .bindings;
+        assert_eq!(b.prefix, key("Ctrl+b"));
+        assert_eq!(b.prefix_binds.get(key("v")), Some(Action::NewColumn));
+        assert_eq!(b.prefix_binds.get(key("n")), None);
+        assert_eq!(b.prefix_binds.get(key("x")), Some(Action::Detach));
+        // Untouched ones stay.
+        assert_eq!(b.prefix_binds.get(key("h")), Some(Action::FocusColumnLeft));
+        assert_eq!(b.binds.get(key("Alt+n")), Some(Action::NewColumn));
+        assert_eq!(b.binds.get(key("Alt+Enter")), Some(Action::NewColumn));
+    }
+
+    #[test]
+    fn explains_binding_mistakes() {
+        let err = |text| format!("{:#}", parse(text).unwrap_err());
+        let twice = err("binds { Alt+h { detach; }; Alt+H { detach; }; Alt+h { detach; }; }");
+        assert!(twice.contains("binds has Alt+h more than once"), "{twice}");
+        let bad_key = err("binds { Super+h { detach; }; }");
+        assert!(
+            bad_key.contains("isn't a modifier") && bad_key.contains("Super+h"),
+            "{bad_key}"
+        );
+        let bad_action = err("binds { Alt+h { focus-left; }; }");
+        assert!(bad_action.contains("focus-left"), "{bad_action}");
+        let no_action = err("binds { Alt+h; }");
+        assert!(no_action.contains("needs one action"), "{no_action}");
+        let bad_prefix = err(r#"prefix "Ctrl+""#);
+        assert!(bad_prefix.contains("no key given"), "{bad_prefix}");
     }
 
     #[test]

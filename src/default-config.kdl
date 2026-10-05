@@ -34,3 +34,169 @@ theme "default"
     // Behind selected text; "reverse" swaps the text's own colors instead.
     selection-bg "reverse"
 }
+
+// Key bindings. Keys are written like niri's: a key, after any of Ctrl+,
+// Alt+ and Shift+, as in Alt+Enter or Shift+h. Shift+h, Shift+H and H are
+// the same key. Characters KDL keeps for itself, like [ , and {, go in
+// quotes: "[" or "Alt+,".
+//
+// Your config's bindings add to these: a key you bind replaces the one
+// here, and `key { unbind; }` removes it. Every action:
+//
+//   new-column                       a new column with a shell, right of this one
+//   focus-column-left/right          focus-column-first/last
+//   move-column-left/right
+//   focus-pane-up/down               within the column
+//   move-pane-up/down
+//   consume-or-expel-pane-left/right into the column to that side, or out of it
+//   consume-pane-into-column         pull the next column's pane into this one
+//   expel-pane-from-column           push the focused pane out to its own column
+//   switch-preset-column-width       cycle through the widths
+//   maximize-column                  full width, or back
+//   fullscreen-pane                  the whole column's height, or back
+//   center-column
+//   close-pane
+//   focus-workspace-down/up
+//   move-column-to-workspace-down/up
+//   toggle-overview                  close-overview
+//   toggle-thumbnails                images or text in the overview, where the terminal can show images
+//   detach                           leave everything running, and come back with `tiri`
+//   kill-server                      end every pane
+
+// The prefix, tmux-style: press it, then a key from prefix-binds. Press it
+// twice to send it to the pane. After the prefix, a key that isn't bound
+// itself also works with Ctrl held, so Ctrl+a Ctrl+n is Ctrl+a n.
+prefix "Ctrl+a"
+
+prefix-binds {
+    n { new-column; }
+    Enter { new-column; }
+
+    h { focus-column-left; }
+    Left { focus-column-left; }
+    l { focus-column-right; }
+    Right { focus-column-right; }
+    j { focus-pane-down; }
+    Down { focus-pane-down; }
+    k { focus-pane-up; }
+    Up { focus-pane-up; }
+    "0" { focus-column-first; }
+    Home { focus-column-first; }
+    $ { focus-column-last; }
+    End { focus-column-last; }
+
+    Shift+h { move-column-left; }
+    Shift+l { move-column-right; }
+    Shift+j { move-pane-down; }
+    Shift+k { move-pane-up; }
+
+    "[" { consume-or-expel-pane-left; }
+    "]" { consume-or-expel-pane-right; }
+    "," { consume-pane-into-column; }
+    "." { expel-pane-from-column; }
+
+    u { focus-workspace-down; }
+    PageDown { focus-workspace-down; }
+    i { focus-workspace-up; }
+    PageUp { focus-workspace-up; }
+    Shift+u { move-column-to-workspace-down; }
+    Shift+i { move-column-to-workspace-up; }
+
+    r { switch-preset-column-width; }
+    f { maximize-column; }
+    Shift+f { fullscreen-pane; }
+    c { center-column; }
+
+    o { toggle-overview; }
+    x { close-pane; }
+    d { detach; }
+    q { kill-server; }
+}
+
+// Keys that act straight away, without the prefix, like niri's Mod keys.
+// They work in the overview too. On macOS, Alt needs your terminal's
+// "Option as Meta" setting.
+binds {
+    Alt+Enter { new-column; }
+
+    Alt+h { focus-column-left; }
+    Alt+Left { focus-column-left; }
+    Alt+l { focus-column-right; }
+    Alt+Right { focus-column-right; }
+    Alt+j { focus-pane-down; }
+    Alt+Down { focus-pane-down; }
+    Alt+k { focus-pane-up; }
+    Alt+Up { focus-pane-up; }
+
+    Alt+Shift+h { move-column-left; }
+    Alt+Shift+l { move-column-right; }
+    Alt+Shift+j { move-pane-down; }
+    Alt+Shift+k { move-pane-up; }
+
+    // Alt+[ starts an escape sequence, so these are on { and } instead.
+    "Alt+{" { consume-or-expel-pane-left; }
+    "Alt+}" { consume-or-expel-pane-right; }
+    "Alt+," { consume-pane-into-column; }
+    "Alt+." { expel-pane-from-column; }
+
+    Alt+u { focus-workspace-down; }
+    Alt+PageDown { focus-workspace-down; }
+    Alt+i { focus-workspace-up; }
+    Alt+PageUp { focus-workspace-up; }
+    Alt+Shift+u { move-column-to-workspace-down; }
+    Alt+Shift+i { move-column-to-workspace-up; }
+
+    Alt+r { switch-preset-column-width; }
+    Alt+f { maximize-column; }
+    Alt+Shift+f { fullscreen-pane; }
+    Alt+c { center-column; }
+
+    Alt+o { toggle-overview; }
+}
+
+// Keys while the overview is open, which takes the keyboard: nothing typed
+// reaches the panes. Keys not bound here fall through to binds.
+overview-binds {
+    Enter { close-overview; }
+    o { close-overview; }
+    Escape { close-overview; }
+
+    n { new-column; }
+
+    h { focus-column-left; }
+    Left { focus-column-left; }
+    l { focus-column-right; }
+    Right { focus-column-right; }
+    j { focus-pane-down; }
+    Down { focus-pane-down; }
+    k { focus-pane-up; }
+    Up { focus-pane-up; }
+    "0" { focus-column-first; }
+    Home { focus-column-first; }
+    $ { focus-column-last; }
+    End { focus-column-last; }
+
+    Shift+h { move-column-left; }
+    Shift+l { move-column-right; }
+    Shift+j { move-pane-down; }
+    Shift+k { move-pane-up; }
+
+    "[" { consume-or-expel-pane-left; }
+    "]" { consume-or-expel-pane-right; }
+    "," { consume-pane-into-column; }
+    "." { expel-pane-from-column; }
+
+    u { focus-workspace-down; }
+    PageDown { focus-workspace-down; }
+    i { focus-workspace-up; }
+    PageUp { focus-workspace-up; }
+    Shift+u { move-column-to-workspace-down; }
+    Shift+i { move-column-to-workspace-up; }
+
+    r { switch-preset-column-width; }
+    f { maximize-column; }
+    Shift+f { fullscreen-pane; }
+
+    x { close-pane; }
+    t { toggle-thumbnails; }
+}

@@ -4,6 +4,7 @@ mod colors;
 mod config;
 mod effects;
 mod input;
+mod keys;
 mod kitty;
 mod layout;
 mod pane;

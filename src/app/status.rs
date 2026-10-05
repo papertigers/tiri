@@ -4,6 +4,9 @@
 use crate::layout::Visibility;
 use crate::render::{Frame, Style};
 
+use crate::keys::Action::{self, *};
+use crate::keys::{Bindings, Key, Table, hint_keys};
+
 use super::{App, Client};
 
 /// A piece of the status bar.
@@ -25,7 +28,7 @@ impl App {
     /// markers for the active workspace's columns. Shared by drawing and
     /// by working out what a click on the bar hit.
     pub(super) fn status_segments(&self, client: &Client) -> Vec<Segment> {
-        let theme = &self.theme;
+        let theme = &self.config.theme;
         let base = Style {
             bg: theme.status_bg,
             ..Style::fg(theme.status_fg)
@@ -98,7 +101,7 @@ impl App {
 
     pub(super) fn draw_status(&self, client: &Client, frame: &mut Frame) {
         let y = i32::from(client.height) - 1;
-        let theme = &self.theme;
+        let theme = &self.config.theme;
         let base = Style {
             bg: theme.status_bg,
             ..Style::fg(theme.status_fg)
@@ -111,51 +114,15 @@ impl App {
         }
 
         let overview = self.workspaces.in_overview(client.id);
-        let hints: &[&str] = if client.prefix_pending {
-            &[
-                "C-a:",
-                "n new",
-                "hjkl focus",
-                "HJKL move",
-                "u/i workspace",
-                "o overview",
-                "x close",
-                "d detach",
-                "r width",
-                "f max",
-                "F full",
-                "c center",
-                "U/I to workspace",
-                "[/] consume/expel",
-                ",/. into/out of column",
-                "0/$ first/last",
-                "q kill server",
-            ]
+        let hints = if client.prefix_pending {
+            prefix_hints(&self.config.bindings)
         } else if overview {
-            &[
-                "OVERVIEW",
-                "⏎/o/Esc open",
-                "hjkl select",
-                "u/i workspace",
-                "HJKL/U/I move",
-                "x close",
-                if client.kitty_overview {
-                    "t text"
-                } else {
-                    "t thumbnails"
-                },
-            ]
+            overview_hints(&self.config.bindings, client.kitty_overview)
         } else {
-            &[
-                "C-a n or Alt-⏎ new",
-                "Alt-h/l focus",
-                "Alt-o overview",
-                "C-a d detach",
-                "C-a for more",
-            ]
+            normal_hints(&self.config.bindings)
         };
         let room = (i32::from(client.width) - x - 2).max(0) as usize;
-        let hint = fit_hints(hints, room);
+        let hint = fit_hints(&hints, room);
         let hint_x = i32::from(client.width) - hint.chars().count() as i32;
         if !hint.is_empty() {
             frame.put_str(hint_x, y, &hint, base);
@@ -165,7 +132,7 @@ impl App {
 
 /// As many of `hints` as fit in `room` columns, from the first, two spaces
 /// apart and with one after. Empty if not even the first fits.
-fn fit_hints(hints: &[&str], room: usize) -> String {
+fn fit_hints(hints: &[String], room: usize) -> String {
     let mut out = String::new();
     for hint in hints {
         let sep = if out.is_empty() { "" } else { "  " };
@@ -181,13 +148,165 @@ fn fit_hints(hints: &[&str], room: usize) -> String {
     out
 }
 
+/// Hints after the prefix, most useful first, from what's bound.
+fn prefix_hints(bindings: &Bindings) -> Vec<String> {
+    let table = &bindings.prefix_binds;
+    let mut hints = vec![format!("{}:", bindings.prefix.short())];
+    hints.extend(labelled(
+        table,
+        &[
+            ("new", &[NewColumn]),
+            ("focus", FOCUS),
+            ("move", MOVE),
+            ("workspace", &[FocusWorkspaceDown, FocusWorkspaceUp]),
+            ("overview", &[ToggleOverview]),
+            ("close", &[ClosePane]),
+            ("detach", &[Detach]),
+            ("width", &[SwitchPresetColumnWidth]),
+            ("max", &[MaximizeColumn]),
+            ("full", &[FullscreenPane]),
+            ("center", &[CenterColumn]),
+            ("to workspace", MOVE_TO_WORKSPACE),
+            (
+                "consume/expel",
+                &[ConsumeOrExpelPaneLeft, ConsumeOrExpelPaneRight],
+            ),
+            (
+                "into/out of column",
+                &[ConsumePaneIntoColumn, ExpelPaneFromColumn],
+            ),
+            ("first/last", &[FocusColumnFirst, FocusColumnLast]),
+            ("kill server", &[KillServer]),
+        ],
+    ));
+    hints
+}
+
+/// Hints in the overview.
+fn overview_hints(bindings: &Bindings, kitty_overview: bool) -> Vec<String> {
+    let table = &bindings.overview_binds;
+    let mut hints = vec!["OVERVIEW".to_owned()];
+    let open: Vec<Key> = table.keys_for(CloseOverview).collect();
+    if !open.is_empty() {
+        hints.push(format!("{} open", hint_keys(&open)));
+    }
+    hints.extend(labelled(
+        table,
+        &[
+            ("select", FOCUS),
+            ("workspace", &[FocusWorkspaceDown, FocusWorkspaceUp]),
+        ],
+    ));
+    // Moving within the strip and between workspaces, as one hint.
+    let moves: Vec<String> = [MOVE, MOVE_TO_WORKSPACE]
+        .iter()
+        .filter_map(|actions| table.hint_keys(actions))
+        .collect();
+    if !moves.is_empty() {
+        hints.push(format!("{} move", moves.join("/")));
+    }
+    let thumbnails = if kitty_overview { "text" } else { "thumbnails" };
+    hints.extend(labelled(
+        table,
+        &[("close", &[ClosePane]), (thumbnails, &[ToggleThumbnails])],
+    ));
+    hints
+}
+
+/// Hints with neither the prefix pressed nor the overview open: keys that
+/// act straight away where there are any, the prefix's otherwise.
+fn normal_hints(bindings: &Bindings) -> Vec<String> {
+    let prefixed = |actions: &[Action]| {
+        (bindings.prefix_binds.hint_keys(actions))
+            .map(|keys| format!("{} {keys}", bindings.prefix.short()))
+    };
+    let direct = |actions: &[Action]| bindings.binds.hint_keys(actions);
+    let mut hints = Vec::new();
+    // Both ways to open a column, since it's the first thing to do.
+    let new: Vec<String> = [prefixed(&[NewColumn]), direct(&[NewColumn])]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !new.is_empty() {
+        hints.push(format!("{} new", new.join(" or ")));
+    }
+    for (label, actions) in [
+        ("focus", &[FocusColumnLeft, FocusColumnRight][..]),
+        ("overview", &[ToggleOverview]),
+        ("detach", &[Detach]),
+    ] {
+        if let Some(keys) = direct(actions).or_else(|| prefixed(actions)) {
+            hints.push(format!("{keys} {label}"));
+        }
+    }
+    hints.push(format!("{} for more", bindings.prefix.short()));
+    hints
+}
+
+/// "keys label" for each of `items` whose actions all have keys in `table`.
+fn labelled(table: &Table, items: &[(&str, &[Action])]) -> Vec<String> {
+    (items.iter())
+        .filter_map(|(label, actions)| Some(format!("{} {label}", table.hint_keys(actions)?)))
+        .collect()
+}
+
+/// Left, down, up, right: hjkl.
+const FOCUS: &[Action] = &[
+    FocusColumnLeft,
+    FocusPaneDown,
+    FocusPaneUp,
+    FocusColumnRight,
+];
+const MOVE: &[Action] = &[MoveColumnLeft, MovePaneDown, MovePaneUp, MoveColumnRight];
+const MOVE_TO_WORKSPACE: &[Action] = &[MoveColumnToWorkspaceDown, MoveColumnToWorkspaceUp];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn default_hints() {
+        let bindings = Config::default().bindings;
+        assert_eq!(
+            normal_hints(&bindings).join("  "),
+            "C-a n or Alt-⏎ new  Alt-h/l focus  Alt-o overview  C-a d detach  C-a for more"
+        );
+        assert_eq!(
+            prefix_hints(&bindings).join("  "),
+            "C-a:  n new  hjkl focus  HJKL move  u/i workspace  o overview  x close  \
+             d detach  r width  f max  F full  c center  U/I to workspace  \
+             [/] consume/expel  ,/. into/out of column  0/$ first/last  q kill server"
+        );
+        assert_eq!(
+            overview_hints(&bindings, false).join("  "),
+            "OVERVIEW  ⏎/o/Esc open  hjkl select  u/i workspace  HJKL/U/I move  \
+             x close  t thumbnails"
+        );
+    }
+
+    #[test]
+    fn hints_follow_the_bindings() {
+        let bindings = Config::parse(
+            "config.kdl",
+            r#"
+            prefix "Ctrl+b"
+            prefix-binds { d { unbind; }; Shift+d { detach; }; }
+            binds { Alt+o { unbind; }; }
+            "#,
+        )
+        .unwrap()
+        .bindings;
+        let hints = normal_hints(&bindings).join("  ");
+        assert!(hints.contains("C-b D detach"), "{hints}");
+        // No Alt key for the overview any more, so the prefix's.
+        assert!(hints.contains("C-b o overview"), "{hints}");
+        assert!(hints.ends_with("C-b for more"), "{hints}");
+    }
 
     #[test]
     fn hints_drop_from_the_end_to_fit() {
-        let hints = ["C-a:", "n new", "x close"];
+        let hints = ["C-a:", "n new", "x close"].map(String::from);
         assert_eq!(fit_hints(&hints, 100), "C-a:  n new  x close ");
         assert_eq!(fit_hints(&hints, 13), "C-a:  n new ");
         assert_eq!(fit_hints(&hints, 4), "");
