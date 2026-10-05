@@ -7,7 +7,7 @@
 //! `tiri config default` prints for a starting point.
 
 use std::collections::HashSet;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -82,7 +82,7 @@ pub struct ConfigError {
 
 impl ConfigError {
     /// A problem that isn't at any one place in the file.
-    fn plain(file: &str, problem: String) -> Self {
+    fn plain(file: &str, problem: impl fmt::Display) -> Self {
         Self {
             summary: format!("{}: {problem}", file_name(file)),
             report: format!("{file}: {problem}"),
@@ -160,7 +160,8 @@ fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
             None => format!("{}: {first}", file_name(file)),
         };
         if problems.len() > 1 {
-            summary += &format!(" (and {} more)", problems.len() - 1);
+            write!(summary, " (and {} more)", problems.len() - 1)
+                .expect("writing to memory can't fail");
         }
 
         // Each problem with the lines at fault, as plain text: it goes to
@@ -173,7 +174,7 @@ fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
                 text: e.source_code().unwrap_or(&text),
             };
             if handler.render_report(&mut report, &shown).is_err() {
-                report += &format!("  {problem}\n");
+                writeln!(report, "  {problem}").expect("writing to memory can't fail");
             }
         }
         ConfigError {
@@ -423,7 +424,7 @@ struct ConfigKey(Key);
 
 impl<S: ErrorSpan> DecodeScalar<S> for ConfigKey {
     fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
-        no_type_name(type_name, ctx, "key");
+        no_type_name(type_name.as_ref(), ctx, "key");
     }
 
     fn raw_decode(
@@ -450,7 +451,7 @@ struct ConfigColor(Color);
 
 impl<S: ErrorSpan> DecodeScalar<S> for ConfigColor {
     fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
-        no_type_name(type_name, ctx, "color");
+        no_type_name(type_name.as_ref(), ctx, "color");
     }
 
     fn raw_decode(
@@ -480,7 +481,7 @@ struct SelectionBg(Option<Color>);
 
 impl<S: ErrorSpan> DecodeScalar<S> for SelectionBg {
     fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
-        no_type_name(type_name, ctx, "color");
+        no_type_name(type_name.as_ref(), ctx, "color");
     }
 
     fn raw_decode(
@@ -495,7 +496,7 @@ impl<S: ErrorSpan> DecodeScalar<S> for SelectionBg {
 }
 
 fn no_type_name<S: ErrorSpan>(
-    type_name: &Option<Spanned<TypeName, S>>,
+    type_name: Option<&Spanned<TypeName, S>>,
     ctx: &mut Context<S>,
     rust_type: &'static str,
 ) {

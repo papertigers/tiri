@@ -1,4 +1,4 @@
-//! A pane: a child process on a PTY plus the alacritty_terminal emulator it
+//! A pane: a child process on a PTY plus the `alacritty_terminal` emulator it
 //! draws into.
 
 use std::cell::RefCell;
@@ -464,7 +464,7 @@ mod tests {
         assert!(pane.history_size() > 20);
 
         // Fill history, in pieces as output arrives.
-        for _ in 0..(pane.history_limit / 100 + 1) {
+        for _ in 0..=(pane.history_limit / 100) {
             pane.process("line\r\n".repeat(100).as_bytes());
         }
         assert_eq!(pane.history_size(), pane.history_limit);

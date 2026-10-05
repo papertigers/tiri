@@ -324,16 +324,13 @@ impl Table {
 
     /// Binds `key`, or with None unbinds it.
     pub fn set(&mut self, key: Key, action: Option<Action>) {
-        match action {
-            Some(action) => {
-                if self.map.insert(key, action).is_none() {
-                    self.order.push(key);
-                }
+        if let Some(action) = action {
+            if self.map.insert(key, action).is_none() {
+                self.order.push(key);
             }
-            None => {
-                self.map.remove(&key);
-                self.order.retain(|k| *k != key);
-            }
+        } else {
+            self.map.remove(&key);
+            self.order.retain(|k| *k != key);
         }
     }
 

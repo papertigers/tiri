@@ -31,7 +31,7 @@ use protocol::Target;
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// The server's socket. Defaults to $TIRI_SOCKET, then a private
+    /// The server's socket. Defaults to `$TIRI_SOCKET`, then a private
     /// per-user directory.
     #[arg(short = 'S', long, global = true)]
     socket: Option<PathBuf>,
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// The server's socket: `--socket`, then $TIRI_SOCKET, then the default,
+/// The server's socket: `--socket`, then `$TIRI_SOCKET`, then the default,
 /// with its directory made ready.
 fn socket_path(arg: Option<PathBuf>) -> Result<PathBuf> {
     let (socket, default) = match arg.or_else(|| std::env::var_os("TIRI_SOCKET").map(PathBuf::from))

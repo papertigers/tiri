@@ -62,17 +62,17 @@ const UNKNOWN_GLYPH_ALPHA: u8 = 0x90;
 
 #[derive(Clone)]
 pub struct Image {
-    pub width: u32,
-    pub height: u32,
+    pub width: usize,
+    pub height: usize,
     pub rgba: Vec<u8>,
 }
 
 impl Image {
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
-            rgba: vec![0; width as usize * height as usize * 4],
+            rgba: vec![0; width * height * 4],
         }
     }
 
@@ -89,9 +89,9 @@ impl Image {
     }
 
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: [u8; 3], alpha: u8) {
-        for py in y..(y + h).min(self.height as usize) {
-            for px in x..(x + w).min(self.width as usize) {
-                let i = (py * self.width as usize + px) * 4;
+        for py in y..(y + h).min(self.height) {
+            for px in x..(x + w).min(self.width) {
+                let i = (py * self.width + px) * 4;
                 self.rgba[i..i + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
             }
         }
@@ -123,8 +123,7 @@ pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> O
     let (rows, cols) = (term.screen_lines(), term.columns());
     let cell_size = fit_cell(cell_size, cols, rows)?;
     let (cell_width, cell_height) = cell_size;
-    // Within MAX_PIXELS, so each side fits a u32.
-    let mut image = Image::new((cols * cell_width) as u32, (rows * cell_height) as u32);
+    let mut image = Image::new(cols * cell_width, rows * cell_height);
     let colors = term.colors();
     for row in 0..rows {
         for col in 0..cols {
@@ -352,7 +351,7 @@ mod tests {
     }
 
     fn pixel(image: &Image, x: usize, y: usize) -> [u8; 4] {
-        let i = (y * image.width as usize + x) * 4;
+        let i = (y * image.width + x) * 4;
         image.rgba[i..i + 4].try_into().unwrap()
     }
 

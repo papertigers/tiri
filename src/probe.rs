@@ -56,10 +56,8 @@ pub fn probe() -> io::Result<TerminalInfo> {
         if left.is_zero() {
             break;
         }
-        let timeout = Timespec {
-            tv_sec: left.as_secs() as _,
-            tv_nsec: left.subsec_nanos() as _,
-        };
+        // Under the one-second timeout, so it always fits.
+        let timeout = Timespec::try_from(left).expect("a short timeout");
         let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
         match poll(&mut fds, Some(&timeout)) {
             Ok(0) => break,

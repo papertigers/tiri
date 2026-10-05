@@ -531,7 +531,7 @@ impl StripView {
         }
     }
 
-    pub fn is_animating(&self, strip: &Strip, overview_zoom: Option<f64>) -> bool {
+    pub fn is_animating(self, strip: &Strip, overview_zoom: Option<f64>) -> bool {
         strip.view_target(overview_zoom) != self.offset
     }
 
@@ -548,7 +548,7 @@ impl StripView {
 
     /// Column `idx`'s left edge and width on screen, at this view's scroll
     /// position and `zoom`.
-    pub fn column_span(&self, strip: &Strip, idx: usize, zoom: f64) -> (i32, i32) {
+    pub fn column_span(self, strip: &Strip, idx: usize, zoom: f64) -> (i32, i32) {
         let to_screen = |x: i32| ((f64::from(x) - self.offset) * zoom).round() as i32;
         let x = strip.column_x(idx);
         let left = to_screen(x);

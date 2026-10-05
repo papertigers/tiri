@@ -230,33 +230,77 @@ fn event_loop(
     app: &mut App,
     connections: &mut HashMap<usize, Connection>,
 ) -> Result<()> {
-    let mut next_connection = CONNECTION_KEY_BASE;
-    let mut events = Events::new();
-    let started = Instant::now();
-    let mut had_panes = false;
-    let mut kill = false;
-    let mut animating = false;
-    let mut last_tick = Instant::now();
-    let mut last_draw = Instant::now();
-    let mut accept_paused_until: Option<Instant> = None;
-
+    let now = Instant::now();
+    let mut server = Server {
+        listener,
+        poller,
+        app,
+        connections,
+        events: Events::new(),
+        next_connection: CONNECTION_KEY_BASE,
+        started: now,
+        had_panes: false,
+        kill: false,
+        animating: false,
+        last_tick: now,
+        last_draw: now,
+        accept_paused_until: None,
+    };
     loop {
-        if accept_paused_until.is_some_and(|until| Instant::now() >= until) {
-            accept_paused_until = None;
+        server.wait()?;
+        server.take_events();
+        server.handle_messages();
+        if server.should_stop() {
+            return Ok(());
+        }
+        server.tick();
+        server.draw();
+        server.drop_finished();
+    }
+}
+
+/// The event loop's state between turns.
+struct Server<'a> {
+    listener: &'a UnixListener,
+    poller: &'a Poller,
+    app: &'a mut App,
+    connections: &'a mut HashMap<usize, Connection>,
+    /// What woke the loop this turn.
+    events: Events,
+    next_connection: usize,
+    started: Instant,
+    /// Whether any pane has opened yet: until one has, an empty server is
+    /// waiting for its first client rather than finished.
+    had_panes: bool,
+    /// A client asked the server to stop.
+    kill: bool,
+    /// Something is moving, so frames are due every [`FRAME`].
+    animating: bool,
+    last_tick: Instant,
+    last_draw: Instant,
+    /// When to accept connections again, after accepting failed.
+    accept_paused_until: Option<Instant>,
+}
+
+impl Server<'_> {
+    /// Waits for I/O, or until the next thing that's due without any.
+    fn wait(&mut self) -> Result<()> {
+        if (self.accept_paused_until).is_some_and(|until| Instant::now() >= until) {
+            self.accept_paused_until = None;
         }
 
         // Wake for the next animation frame, a pane or thumbnail deadline,
         // accepting again, reaping closed panes, or giving up on a first
         // client that never came; otherwise only for I/O.
-        let client_deadlines = (connections.values())
+        let client_deadlines = (self.connections.values())
             .filter(|c| c.wants_frames())
             .filter_map(|c| c.client.as_ref())
-            .filter_map(|client| app.next_deadline(client));
+            .filter_map(|client| self.app.next_deadline(client));
         let deadline = [
-            animating.then(|| last_draw + FRAME),
-            (!had_panes).then_some(started + STARTUP_GRACE),
-            accept_paused_until,
-            app.reap_deadline(),
+            self.animating.then(|| self.last_draw + FRAME),
+            (!self.had_panes).then_some(self.started + STARTUP_GRACE),
+            self.accept_paused_until,
+            self.app.reap_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -264,40 +308,47 @@ fn event_loop(
         .min();
 
         // `polling` reports each source once per arming, so re-arm them all.
-        app.arm_panes();
-        if accept_paused_until.is_none() {
-            poller
-                .modify(listener, PollEvent::readable(LISTENER_KEY))
+        self.app.arm_panes();
+        if self.accept_paused_until.is_none() {
+            (self.poller)
+                .modify(self.listener, PollEvent::readable(LISTENER_KEY))
                 .context("couldn't watch the socket")?;
         }
-        for (&key, connection) in connections.iter_mut() {
+        for (&key, connection) in self.connections.iter_mut() {
             // After end of input a socket stays readable, to no purpose.
             let interest = PollEvent::new(key, !connection.eof, !connection.outgoing.is_empty());
-            if let Err(e) = poller.modify(&connection.stream, interest) {
+            if let Err(e) = self.poller.modify(&connection.stream, interest) {
                 log::warn!("{}: couldn't watch it: {e}", connection.name());
                 connection.dead = true;
             }
         }
-        events.clear();
-        match poller.wait(
-            &mut events,
-            deadline.map(|d| d.saturating_duration_since(Instant::now())),
-        ) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e).context("couldn't wait for events"),
+        self.events.clear();
+        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        match self.poller.wait(&mut self.events, timeout) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Err(e) => Err(e).context("couldn't wait for events"),
         }
+    }
 
-        for event in events.iter() {
+    /// Accepts connections, and reads and writes what's ready to be.
+    fn take_events(&mut self) {
+        for event in self.events.iter() {
             match event.key {
                 LISTENER_KEY => {
-                    if let Err(e) = accept(listener, poller, connections, &mut next_connection) {
+                    let accepted = accept(
+                        self.listener,
+                        self.poller,
+                        self.connections,
+                        &mut self.next_connection,
+                    );
+                    if let Err(e) = accepted {
                         log::warn!("couldn't accept a connection: {e}");
-                        accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                        self.accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     }
                 }
                 key if key >= CONNECTION_KEY_BASE => {
-                    if let Some(connection) = connections.get_mut(&key) {
+                    if let Some(connection) = self.connections.get_mut(&key) {
                         if event.writable {
                             connection.flush();
                         }
@@ -306,16 +357,19 @@ fn event_loop(
                         }
                     }
                 }
-                _ => app.pane_ready(event),
+                _ => self.app.pane_ready(event),
             }
         }
+    }
 
-        for connection in connections.values_mut() {
+    /// Acts on what clients have sent, then on what panes have copied.
+    fn handle_messages(&mut self) {
+        for connection in self.connections.values_mut() {
             // A connection that's been answered and is closing has had its
             // say; anything more is dropped with it.
             while !connection.dead && !connection.closing {
                 match connection.decoder.next::<ClientMsg>() {
-                    Ok(Some(msg)) => handle(app, connection, msg, &mut kill),
+                    Ok(Some(msg)) => handle(self.app, connection, msg, &mut self.kill),
                     Ok(None) => break,
                     Err(e) => {
                         log::warn!("{}: dropping it: {e:#}", connection.name());
@@ -325,13 +379,10 @@ fn event_loop(
             }
             // Nothing more is coming. One still owed a reply gets it first.
             connection.dead |= connection.eof && !connection.closing;
-            if connection
-                .client
-                .as_ref()
-                .is_some_and(Client::detach_requested)
+            if let Some(mut client) =
+                (connection.client).take_if(|client| client.detach_requested())
             {
-                let mut client = connection.client.take().expect("checked above");
-                app.detach(&mut client);
+                self.app.detach(&mut client);
                 // Thumbnail cleanup, before the client leaves the screen.
                 connection.send_output(&client.take_escapes());
                 connection.send(&ServerMsg::Exit(ExitReason::Detached));
@@ -340,71 +391,77 @@ fn event_loop(
         }
 
         // Programs copying with OSC 52 reach every attached clipboard.
-        for text in app.take_copied() {
-            for client in connections.values_mut().filter_map(|c| c.client.as_mut()) {
+        for text in self.app.take_copied() {
+            for client in (self.connections.values_mut()).filter_map(|c| c.client.as_mut()) {
                 client.copy(&text);
             }
         }
-        app.reap_exited();
+        self.app.reap_exited();
+    }
 
-        had_panes |= !app.is_empty();
-        // Nobody attached in time. Connections that never said hello don't
-        // keep the server alive; shutting down tells them it's gone.
-        let abandoned = !had_panes && started.elapsed() >= STARTUP_GRACE;
-        if kill || app.quit || (had_panes && app.is_empty()) || abandoned {
-            return Ok(());
-        }
+    /// Whether the server is done: asked to stop, out of panes, or never
+    /// attached to in time.
+    fn should_stop(&mut self) -> bool {
+        self.had_panes |= !self.app.is_empty();
+        // Connections that never said hello don't keep the server alive;
+        // shutting down tells them it's gone.
+        let abandoned = !self.had_panes && self.started.elapsed() >= STARTUP_GRACE;
+        self.kill || self.app.quit || (self.had_panes && self.app.is_empty()) || abandoned
+    }
 
+    /// Moves animations on to now.
+    fn tick(&mut self) {
         let now = Instant::now();
-        app.expire_syncs(now);
+        self.app.expire_syncs(now);
         // Don't let a long idle wait turn into one giant animation step.
-        let dt = if animating {
-            now - last_tick
+        let dt = if self.animating {
+            now - self.last_tick
         } else {
             Duration::ZERO
         };
-        last_tick = now;
-        animating = app.tick(dt.max(Duration::from_millis(1)));
+        self.last_tick = now;
+        self.animating = self.app.tick(dt.max(Duration::from_millis(1)));
+    }
 
+    /// Draws for each client that's due a frame and ready for one.
+    fn draw(&mut self) {
         // Draw when something may have changed: a pane or a client said
         // something, a deadline passed, an animation's next frame is due,
         // or a client that was behind has caught up. Waking only because a
         // socket can take more output isn't a reason: drawing then would
         // answer a slow client with more frames.
-        let changed = events.is_empty()
-            || events.iter().any(|event| match event.key {
+        let now = Instant::now();
+        let changed = self.events.is_empty()
+            || self.events.iter().any(|event| match event.key {
                 LISTENER_KEY => false,
                 key if key >= CONNECTION_KEY_BASE => event.readable,
                 _ => true,
             });
-        let frame_due = animating && now.duration_since(last_draw) >= FRAME;
-        let caught_up = (connections.values()).any(|c| c.owed_frame && c.wants_frames());
+        let frame_due = self.animating && now.duration_since(self.last_draw) >= FRAME;
+        let caught_up = (self.connections.values()).any(|c| c.owed_frame && c.wants_frames());
         let drawing = changed || frame_due || caught_up;
         if drawing {
-            last_draw = now;
+            self.last_draw = now;
         }
 
-        for connection in connections.values_mut() {
+        for connection in self.connections.values_mut() {
             if connection.dead || connection.client.is_none() {
                 continue;
             }
             if !drawing || !connection.wants_frames() {
                 connection.owed_frame |= drawing;
                 // Effects still running need their next frame in time.
-                animating |= connection.wants_frames()
-                    && connection
-                        .client
-                        .as_ref()
-                        .is_some_and(Client::effects_running);
+                self.animating |= connection.wants_frames()
+                    && (connection.client.as_ref()).is_some_and(Client::effects_running);
                 continue;
             }
             connection.owed_frame = false;
             let Some(client) = connection.client.as_mut() else {
                 continue;
             };
-            let (frame, cursor) = app.draw(client);
+            let (frame, cursor) = self.app.draw(client);
             // Running effects need further frames, as animations do.
-            animating |= client.effects_running();
+            self.animating |= client.effects_running();
             let mut bytes = Vec::new();
             if let Err(e) = client.render(&mut bytes, frame, cursor) {
                 log::error!("{}: couldn't render: {e}", connection.name());
@@ -414,15 +471,18 @@ fn event_loop(
             connection.send_output(&bytes);
             connection.flush();
         }
+    }
 
-        connections.retain(|_, connection| {
+    /// Lets go of connections that are done with.
+    fn drop_finished(&mut self) {
+        self.connections.retain(|_, connection| {
             if !connection.finished() {
                 return true;
             }
             if let Some(mut client) = connection.client.take() {
-                app.detach(&mut client);
+                self.app.detach(&mut client);
             }
-            let _ = poller.delete(&connection.stream);
+            let _ = self.poller.delete(&connection.stream);
             false
         });
     }

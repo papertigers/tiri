@@ -296,7 +296,10 @@ impl App {
 
     /// Handles a pane's PTY becoming readable or writable.
     pub fn pane_ready(&mut self, event: PollEvent) {
-        let id = PaneId(event.key as u32);
+        // Keys above a u32 are the server's own, never a pane's.
+        let Ok(id) = u32::try_from(event.key).map(PaneId) else {
+            return;
+        };
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };

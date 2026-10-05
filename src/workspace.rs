@@ -411,6 +411,7 @@ fn settle(view: &mut View, list: &[Workspace], overview_zoom: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Column;
 
     const A: ClientId = ClientId(0);
     const B: ClientId = ClientId(1);
@@ -428,7 +429,7 @@ mod tests {
             .iter()
             .map(|w| {
                 let panes = (w.strip().columns().iter())
-                    .flat_map(|c| c.panes())
+                    .flat_map(Column::panes)
                     .map(|p| p.0);
                 (w.name(), panes.collect())
             })

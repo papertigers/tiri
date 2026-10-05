@@ -74,10 +74,10 @@ impl App {
             Action::MovePaneUp => self.workspaces.active_mut(id).move_up(),
             Action::MovePaneDown => self.workspaces.active_mut(id).move_down(),
             Action::ConsumeOrExpelPaneLeft => {
-                self.workspaces.active_mut(id).consume_or_expel_left()
+                self.workspaces.active_mut(id).consume_or_expel_left();
             }
             Action::ConsumeOrExpelPaneRight => {
-                self.workspaces.active_mut(id).consume_or_expel_right()
+                self.workspaces.active_mut(id).consume_or_expel_right();
             }
             Action::ConsumePaneIntoColumn => self.workspaces.active_mut(id).consume_into_column(),
             Action::ExpelPaneFromColumn => self.workspaces.active_mut(id).expel_from_column(),

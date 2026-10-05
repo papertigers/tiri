@@ -137,8 +137,7 @@ impl Client {
     pub fn copy(&mut self, text: &str) {
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-        self.escapes
-            .extend_from_slice(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+        write!(self.escapes, "\x1b]52;c;{encoded}\x07").expect("writing to memory can't fail");
     }
 
     /// How many lines back this client is scrolled in `pane`. Output since

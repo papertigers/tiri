@@ -4,6 +4,8 @@
 //!
 //! Spec: <https://sw.kovidgoyal.net/kitty/graphics-protocol/>
 
+use std::io::Write as _;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -346,19 +348,20 @@ pub fn id_color(id: u32) -> Color {
 pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 1);
     let payload = BASE64.encode(compressed);
-    let control = format!("a=t,f=32,o=z,s={},v={},i={id},", image.width, image.height);
     let chunks = payload.as_bytes().chunks(CHUNK);
     let last = chunks.len().saturating_sub(1);
     for (n, chunk) in chunks.enumerate() {
         out.extend_from_slice(b"\x1b_G");
         if n == 0 {
-            out.extend_from_slice(control.as_bytes());
+            let (width, height) = (image.width, image.height);
+            write!(out, "a=t,f=32,o=z,s={width},v={height},i={id},")
+                .expect("writing to memory can't fail");
         }
         // q=2 keeps the terminal from replying; replies would arrive as
         // input. It's on every chunk, since terminals differ on which
         // chunk's they go by.
         let more = u8::from(n < last);
-        out.extend_from_slice(format!("q=2,m={more};").as_bytes());
+        write!(out, "q=2,m={more};").expect("writing to memory can't fail");
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
@@ -373,14 +376,16 @@ pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
 /// is added alongside them; placeholders then use whichever the terminal
 /// finds first, which after a resize is often one with the old size.
 pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
-    out.extend_from_slice(
-        format!("\x1b_Ga=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows},q=2\x1b\\").as_bytes(),
-    );
+    write!(
+        out,
+        "\x1b_Ga=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows},q=2\x1b\\"
+    )
+    .expect("writing to memory can't fail");
 }
 
 /// Frees image `id` and its placements.
 pub fn delete(out: &mut Vec<u8>, id: u32) {
-    out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\").expect("writing to memory can't fail");
 }
 
 #[cfg(test)]

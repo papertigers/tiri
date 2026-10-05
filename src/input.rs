@@ -1,6 +1,8 @@
 //! Translating crossterm key events back into the bytes a program running in
 //! a pane expects to read.
 
+use std::io::Write as _;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
 pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
@@ -90,16 +92,17 @@ fn cursor_key(out: &mut Vec<u8>, final_byte: u8, mods: KeyModifiers, application
     match modifier_param(mods) {
         1 if application => out.extend_from_slice(b"\x1bO"),
         1 => out.extend_from_slice(b"\x1b["),
-        m => out.extend_from_slice(format!("\x1b[1;{m}").as_bytes()),
+        m => write!(out, "\x1b[1;{m}").expect("writing to memory can't fail"),
     }
     out.push(final_byte);
 }
 
 fn tilde_key(out: &mut Vec<u8>, code: u8, mods: KeyModifiers) {
     match modifier_param(mods) {
-        1 => out.extend_from_slice(format!("\x1b[{code}~").as_bytes()),
-        m => out.extend_from_slice(format!("\x1b[{code};{m}~").as_bytes()),
+        1 => write!(out, "\x1b[{code}~"),
+        m => write!(out, "\x1b[{code};{m}~"),
     }
+    .expect("writing to memory can't fail");
 }
 
 /// Which mouse events a pane's program asked to be told about, and how.
@@ -118,7 +121,7 @@ pub struct MouseModes {
 }
 
 impl MouseModes {
-    pub fn any(&self) -> bool {
+    pub fn any(self) -> bool {
         self.click || self.drag || self.motion
     }
 }
