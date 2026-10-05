@@ -32,7 +32,7 @@ use crate::thumbnail;
 use crate::workspace::{ClientId, Workspaces};
 
 pub use client_state::Client;
-use client_state::Drag;
+use client_state::{Drag, Paste};
 use thumbnails::THUMBNAIL_INTERVAL;
 
 const STATUS_HEIGHT: u16 = 1;
@@ -160,6 +160,7 @@ impl App {
             effects: Effects::default(),
             transition: None,
             notice: None,
+            paste: None,
         };
         if let Some(error) = config_error {
             client.notify(format!("{error}; config not applied"));
@@ -384,15 +385,38 @@ impl App {
         }
     }
 
-    pub fn paste(&mut self, client: &Client, text: &str) {
+    /// Pastes `text`, which is part of a paste that `last` ends. All its
+    /// parts go to the pane focused when it began, as one paste: bracketed
+    /// as a whole if the program asked for that.
+    pub fn paste(&mut self, client: &mut Client, text: &str, last: bool) {
         self.lay_out_for(client);
-        let Some(pane) = self.focused_pane_mut(client) else {
+        let paste = match client.paste {
+            Some(paste) => paste,
+            None => {
+                let Some(id) = self.workspaces.focused(client.id) else {
+                    return;
+                };
+                let Some(pane) = self.panes.get_mut(&id) else {
+                    return;
+                };
+                let bracketed = pane.bracketed_paste();
+                if bracketed {
+                    pane.write(b"\x1b[200~");
+                }
+                Paste {
+                    pane: id,
+                    bracketed,
+                }
+            }
+        };
+        client.paste = (!last).then_some(paste);
+        // A pane that closed partway through just misses the rest.
+        let Some(pane) = self.panes.get_mut(&paste.pane) else {
             return;
         };
-        if pane.bracketed_paste() {
-            pane.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
-        } else {
-            pane.write(text.as_bytes());
+        pane.write(text.as_bytes());
+        if last && paste.bracketed {
+            pane.write(b"\x1b[201~");
         }
     }
 

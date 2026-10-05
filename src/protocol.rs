@@ -11,8 +11,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::colors::ReportedColors;
 
-/// Refuse messages bigger than this, rather than trying to buffer them.
-const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+/// The biggest message a server may send: its output comes in pieces far
+/// smaller, so this is only a backstop.
+pub const MAX_SERVER_MESSAGE: usize = 64 * 1024 * 1024;
+/// The biggest message a client may send. Clients send small things (keys,
+/// mouse, resizes) and pastes in [`PASTE_CHUNK`]s, so the server never
+/// buffers much for any one of them.
+pub const MAX_CLIENT_MESSAGE: usize = 1024 * 1024;
+/// How much of a paste goes in one message.
+pub const PASTE_CHUNK: usize = 64 * 1024;
 
 /// Which workspace a client wants to land on when it attaches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +52,14 @@ pub struct Hello {
 pub enum ClientMsg {
     /// The first message from an attaching client.
     Hello(Hello),
-    /// Input from the client's terminal.
+    /// Input from the client's terminal. Pastes come as [`ClientMsg::Paste`].
     Event(crossterm::event::Event),
+    /// Part of a paste, in order; `last` on its last part. The parts make
+    /// one paste, as far as the program receiving it can tell.
+    Paste {
+        text: String,
+        last: bool,
+    },
     /// The terminal's cell size in pixels changed, as after a font change.
     CellPixels(Option<(u16, u16)>),
     /// Asks for the workspace list instead of attaching.
@@ -94,15 +107,34 @@ pub fn encode(msg: &impl Serialize) -> Vec<u8> {
 }
 
 /// Collects bytes from a socket and yields whole messages from them.
-#[derive(Default)]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the next message starts in `buf`; what's before it has been
     /// decoded, and is dropped on the next push rather than per message.
     start: usize,
+    /// Messages bigger than this are refused rather than buffered.
+    limit: usize,
 }
 
 impl Decoder {
+    /// A decoder for messages from a server.
+    pub fn from_server() -> Self {
+        Self::with_limit(MAX_SERVER_MESSAGE)
+    }
+
+    /// A decoder for messages from a client.
+    pub fn from_client() -> Self {
+        Self::with_limit(MAX_CLIENT_MESSAGE)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            start: 0,
+            limit,
+        }
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.drain(..self.start);
         self.start = 0;
@@ -116,7 +148,7 @@ impl Decoder {
             return Ok(None);
         };
         let len = u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
-        if len > MAX_MESSAGE {
+        if len > self.limit {
             bail!("message of {len} bytes is too big");
         }
         let Some(body) = buf.get(4..4 + len) else {
@@ -168,7 +200,7 @@ mod tests {
         let mut bytes = encode(&ClientMsg::Event(key.clone()));
         bytes.extend(encode(&ClientMsg::KillServer));
 
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::from_server();
         let mut got = Vec::new();
         for byte in bytes {
             decoder.push(&[byte]);
@@ -180,8 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn clients_may_only_send_small_messages() {
+        let paste = ClientMsg::Paste {
+            text: "x".repeat(MAX_CLIENT_MESSAGE),
+            last: true,
+        };
+        let mut decoder = Decoder::from_client();
+        decoder.push(&encode(&paste));
+        assert!(decoder.next::<ClientMsg>().is_err());
+
+        let paste = ClientMsg::Paste {
+            text: "x".repeat(PASTE_CHUNK),
+            last: true,
+        };
+        let mut decoder = Decoder::from_client();
+        decoder.push(&encode(&paste));
+        assert!(matches!(
+            decoder.next::<ClientMsg>(),
+            Ok(Some(ClientMsg::Paste { .. }))
+        ));
+    }
+
+    #[test]
     fn rejects_absurd_lengths() {
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::from_server();
         decoder.push(&u32::MAX.to_le_bytes());
         assert!(decoder.next::<ServerMsg>().is_err());
     }
@@ -192,7 +246,7 @@ mod tests {
         send(&mut wire, &ServerMsg::Output(b"hello".to_vec())).unwrap();
         send(&mut wire, &ServerMsg::Exit(ExitReason::Detached)).unwrap();
         let mut reader = &wire[..];
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::from_server();
         let first: ServerMsg = recv(&mut reader, &mut decoder).unwrap().unwrap();
         assert!(matches!(first, ServerMsg::Output(b) if b == b"hello"));
         let second: ServerMsg = recv(&mut reader, &mut decoder).unwrap().unwrap();

@@ -19,7 +19,9 @@ use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::probe::{self, TerminalInfo};
-use crate::protocol::{ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send};
+use crate::protocol::{
+    ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target, recv, send,
+};
 use crate::socket;
 
 /// How long to wait for a freshly started server to start listening.
@@ -53,7 +55,7 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         }),
     )
     .with_context(talking)?;
-    let mut decoder = Decoder::default();
+    let mut decoder = Decoder::from_server();
     match recv(&mut stream, &mut decoder).with_context(talking)? {
         Some(ServerMsg::Attached) => {}
         Some(ServerMsg::Error(e)) => bail!(e),
@@ -86,7 +88,13 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
                 // size probed at attach still stands.
                 let resized = matches!(event, event::Event::Resize(..));
                 let pixels = if resized { size_cell_pixels() } else { None };
-                if send(&mut writer, &ClientMsg::Event(event)).is_err()
+                let sent = match event {
+                    event::Event::Paste(text) => {
+                        paste_messages(&text).try_for_each(|msg| send(&mut writer, &msg))
+                    }
+                    event => send(&mut writer, &ClientMsg::Event(event)),
+                };
+                if sent.is_err()
                     || pixels.is_some_and(|p| {
                         send(&mut writer, &ClientMsg::CellPixels(Some(p))).is_err()
                     })
@@ -105,6 +113,30 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         ExitReason::ServerExited => println!("[tiri server exited]"),
     }
     Ok(())
+}
+
+/// A paste as messages of at most [`PASTE_CHUNK`] bytes each, split
+/// between characters.
+///
+/// The end-of-paste marker is taken out first, as xterm does: in a paste it
+/// would end the program's bracketed paste early, and what followed would
+/// arrive as if typed.
+fn paste_messages(text: &str) -> impl Iterator<Item = ClientMsg> {
+    let mut rest = text.replace("\x1b[201~", "");
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let mut end = rest.len().min(PASTE_CHUNK);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let tail = rest.split_off(end);
+        let text = std::mem::replace(&mut rest, tail);
+        done = rest.is_empty();
+        Some(ClientMsg::Paste { text, last: done })
+    })
 }
 
 /// The cell size in pixels from the probe: the terminal's own cell size
@@ -172,7 +204,7 @@ pub fn list(socket: &Path) -> Result<()> {
         return Ok(());
     };
     send(&mut stream, &ClientMsg::List)?;
-    match recv(&mut stream, &mut Decoder::default())? {
+    match recv(&mut stream, &mut Decoder::from_server())? {
         Some(ServerMsg::Workspaces(workspaces)) => {
             for ws in workspaces {
                 if ws.panes == 0 && ws.name.is_none() {
@@ -204,7 +236,7 @@ pub fn kill_server(socket: &Path) -> Result<()> {
     };
     send(&mut stream, &ClientMsg::KillServer)?;
     // Wait for the server to hang up, so it's gone when we return.
-    let _ = recv::<ServerMsg>(&mut stream, &mut Decoder::default());
+    let _ = recv::<ServerMsg>(&mut stream, &mut Decoder::from_server());
     Ok(())
 }
 
@@ -366,4 +398,48 @@ fn restore() {
     let _ = out.execute(cursor::Show);
     let _ = terminal::disable_raw_mode();
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(text: &str) -> Vec<(String, bool)> {
+        paste_messages(text)
+            .map(|msg| match msg {
+                ClientMsg::Paste { text, last } => (text, last),
+                other => panic!("not a paste: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pastes_go_in_chunks_split_between_characters() {
+        let text = "é".repeat(PASTE_CHUNK); // two bytes each
+        let parts = parts(&text);
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|(t, _)| t.len() <= PASTE_CHUNK));
+        assert_eq!(
+            parts.iter().map(|(t, _)| t.as_str()).collect::<String>(),
+            text
+        );
+        assert_eq!(
+            parts.iter().map(|(_, last)| *last).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn small_and_empty_pastes_are_one_part() {
+        assert_eq!(parts("hi"), [("hi".to_owned(), true)]);
+        assert_eq!(parts(""), [(String::new(), true)]);
+    }
+
+    #[test]
+    fn pastes_cant_end_a_bracketed_paste_early() {
+        assert_eq!(
+            parts("a\x1b[201~rm -rf ~\r"),
+            [("arm -rf ~\r".to_owned(), true)]
+        );
+    }
 }

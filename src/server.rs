@@ -73,7 +73,7 @@ impl Connection {
         Self {
             key,
             stream,
-            decoder: Decoder::default(),
+            decoder: Decoder::from_client(),
             outgoing: Vec::new(),
             client: None,
             closing: false,
@@ -587,8 +587,10 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
             };
             let result = match event {
                 Event::Key(key) => app.key(client, key),
+                // Clients send pastes as ClientMsg::Paste; one sent whole
+                // is still one paste.
                 Event::Paste(text) => {
-                    app.paste(client, &text);
+                    app.paste(client, &text, true);
                     Ok(())
                 }
                 Event::Resize(width, height) => {
@@ -605,6 +607,11 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 // Otherwise the key just seems to do nothing.
                 client.notify(format!("{e:#}"));
                 log::error!("{}: {e:#}", connection.name());
+            }
+        }
+        ClientMsg::Paste { text, last } => {
+            if let Some(client) = connection.client.as_mut() {
+                app.paste(client, &text, last);
             }
         }
         ClientMsg::CellPixels(cell_pixels) => {

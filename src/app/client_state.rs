@@ -57,6 +57,16 @@ pub struct Client {
     pub(super) transition: Option<Transition>,
     /// Something to tell the user, shown in the status bar for a while.
     pub(super) notice: Option<Notice>,
+    /// A paste partway through arriving.
+    pub(super) paste: Option<Paste>,
+}
+
+/// Where a paste is going, while it arrives in parts.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Paste {
+    pub(super) pane: PaneId,
+    /// Whether it began with the start-of-paste marker, so needs the end.
+    pub(super) bracketed: bool,
 }
 
 /// A left press in a pane.
