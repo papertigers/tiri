@@ -19,6 +19,7 @@ use crossterm::event::{
 use polling::{Event as PollEvent, Poller};
 
 use crate::colors::Palette;
+use crate::effects::{Anchor, Effects};
 use crate::input::{encode_key, encode_mouse};
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
@@ -158,6 +159,8 @@ pub struct Client {
     /// When and where the last left press in a pane was, and how many
     /// presses in a row it made, to spot double and triple clicks.
     last_click: Option<(Instant, PaneId, Point, u8)>,
+    /// Visual effects running on this client's screen.
+    effects: Effects,
 }
 
 /// How far back a client has scrolled a pane, and how much history the pane
@@ -185,6 +188,11 @@ enum Drag {
 impl Client {
     pub fn detach_requested(&self) -> bool {
         self.detach_requested
+    }
+
+    /// Whether effects are running, so frames must keep coming.
+    pub fn effects_running(&self) -> bool {
+        self.effects.is_active()
     }
 
     /// Its terminal's cells changed shape: redraw its thumbnails to match.
@@ -384,7 +392,7 @@ impl App {
         if let Some(idx) = workspace {
             self.workspaces.set_active(id, idx);
         }
-        let client = Client {
+        let mut client = Client {
             id,
             width,
             height,
@@ -401,10 +409,11 @@ impl App {
             selection: None,
             drag: Drag::None,
             last_click: None,
+            effects: Effects::default(),
         };
         self.lay_out_for(&client);
         if matches!(target, Target::New(_)) || self.panes.is_empty() {
-            self.open_column(&client)?;
+            self.open_column(&mut client)?;
         }
         Ok(client)
     }
@@ -450,7 +459,7 @@ impl App {
         self.layout_size.1.saturating_sub(STATUS_HEIGHT + 2).max(1)
     }
 
-    fn open_column(&mut self, client: &Client) -> Result<()> {
+    fn open_column(&mut self, client: &mut Client) -> Result<()> {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         // Width isn't known until it's in the strip, so start narrow and fix it below.
@@ -466,7 +475,33 @@ impl App {
         self.panes.insert(id, pane);
         self.workspaces.insert(client.id, id);
         self.resize_panes();
+        client.effects.pane_opened(id, &client.palette);
         Ok(())
+    }
+
+    /// Where pane `id` is on `client`'s screen, clipped to the pane area.
+    fn pane_area(&self, client: &Client, id: PaneId) -> Option<ratatui_core::layout::Rect> {
+        let screen = (i32::from(client.width), client.area_height());
+        for ws in self.visible_workspaces(client) {
+            for idx in self.visible_columns(client, ws) {
+                for (pane, x, y, w, h) in self.pane_boxes(client, ws, idx) {
+                    if pane != id {
+                        continue;
+                    }
+                    let (left, top) = (x.max(0), y.max(0));
+                    let (right, bottom) = ((x + w).min(screen.0), (y + h).min(screen.1));
+                    return (right > left && bottom > top).then(|| {
+                        ratatui_core::layout::Rect::new(
+                            left as u16,
+                            top as u16,
+                            (right - left) as u16,
+                            (bottom - top) as u16,
+                        )
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Lays panes out for `client`'s terminal size, making it the client
@@ -1113,8 +1148,33 @@ impl App {
         } else {
             client.clear_thumbnails();
         }
-        let client: &Client = client;
 
+        // Effects stay off while thumbnails show: they'd change the colors
+        // that tell the terminal which image a cell shows.
+        if thumbnails {
+            client.effects.clear();
+        }
+
+        let (mut frame, cursor) = self.compose(client, &visible, thumbnails);
+        let areas: Vec<_> = (client.effects.anchors().into_iter())
+            .map(|anchor| match anchor {
+                Anchor::Pane(id) => (anchor, self.pane_area(client, id)),
+            })
+            .collect();
+        let palette = client.palette;
+        client
+            .effects
+            .apply(&mut frame, &palette, Instant::now(), &areas);
+        (frame, cursor)
+    }
+
+    /// Composes the frame itself: every visible pane, labels and status bar.
+    fn compose(
+        &self,
+        client: &Client,
+        visible: &[(usize, usize)],
+        thumbnails: bool,
+    ) -> (Frame, Option<(u16, u16)>) {
         let mut frame = Frame::new(client.width, client.height);
         let overview = self.workspaces.in_overview(client.id);
         let show_cursor = !overview && !self.workspaces.is_animating(client.id);
@@ -1127,7 +1187,7 @@ impl App {
             self.draw_offscreen_indicators(client, &mut frame);
         }
         let active_ws = self.workspaces.active_index(client.id);
-        for (ws, idx) in visible {
+        for &(ws, idx) in visible {
             let strip = self.workspaces.list()[ws].strip();
             let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;

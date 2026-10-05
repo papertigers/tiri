@@ -246,6 +246,8 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
                 continue;
             };
             let (frame, cursor) = app.draw(client);
+            // Running effects need further frames, as animations do.
+            animating |= client.effects_running();
             let mut bytes = Vec::new();
             client.render(&mut bytes, frame, cursor)?;
             connection.send(&ServerMsg::Output(bytes));

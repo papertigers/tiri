@@ -17,3 +17,5 @@ portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 rustix = { version = "1", features = ["event", "fs", "process", "termios"] }
 serde = { version = "1.0.229", features = ["derive"] }
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
+ratatui-core = "0.1.2"

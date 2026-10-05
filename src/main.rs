@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod colors;
+mod effects;
 mod input;
 mod kitty;
 mod layout;

@@ -135,6 +135,13 @@ impl Frame {
         }
     }
 
+    /// The text at (`x`, `y`), whether it's a wide character, and its style.
+    /// Text is empty for the cell a wide character covers.
+    pub fn content(&self, x: u16, y: u16) -> (&str, bool, Style) {
+        let cell = &self.cells[usize::from(y) * usize::from(self.width) + usize::from(x)];
+        (&cell.sym, cell.wide, cell.style)
+    }
+
     /// Writes a string of narrow characters left to right.
     pub fn put_str(&mut self, x: i32, y: i32, s: &str, style: Style) {
         for (i, ch) in s.chars().enumerate() {
