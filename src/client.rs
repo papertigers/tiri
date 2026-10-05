@@ -217,6 +217,7 @@ impl TerminalGuard {
         let mut out = io::stdout();
         out.execute(terminal::EnterAlternateScreen)?;
         out.execute(event::EnableBracketedPaste)?;
+        out.execute(event::EnableMouseCapture)?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore();
@@ -234,6 +235,7 @@ impl Drop for TerminalGuard {
 
 fn restore() {
     let mut out = io::stdout();
+    let _ = out.execute(event::DisableMouseCapture);
     let _ = out.execute(event::DisableBracketedPaste);
     let _ = out.execute(terminal::LeaveAlternateScreen);
     let _ = out.execute(cursor::Show);

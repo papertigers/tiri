@@ -139,6 +139,23 @@ impl Workspaces {
         idx
     }
 
+    /// Moves `client` to workspace `idx`, sliding there.
+    pub fn focus_workspace(&mut self, client: ClientId, idx: usize) {
+        if idx < self.list.len() {
+            self.view_mut(client).active = idx;
+            self.normalize();
+        }
+    }
+
+    /// Focuses `pane` for `client`, moving to its workspace if need be.
+    pub fn focus_pane(&mut self, client: ClientId, pane: PaneId) -> bool {
+        let Some(idx) = self.list.iter_mut().position(|w| w.strip.focus_pane(pane)) else {
+            return false;
+        };
+        self.focus_workspace(client, idx);
+        true
+    }
+
     /// Puts `client` on workspace `idx` straight away, without sliding there.
     pub fn set_active(&mut self, client: ClientId, idx: usize) {
         let view = self.view_mut(client);
@@ -623,5 +640,16 @@ mod tests {
         assert_eq!(ws.find("play"), Some(1));
         ws.set_active(A, 1);
         assert_eq!((ws.active_index(A), ws.y(A), ws.clients_on(1)), (1, 1.0, 1));
+    }
+
+    #[test]
+    fn focusing_a_pane_moves_to_its_workspace() {
+        let mut ws = with_client(&[]);
+        ws.insert(A, PaneId(0));
+        ws.insert(A, PaneId(1));
+        ws.move_column_down(A); // [0] [1]
+        assert!(ws.focus_pane(A, PaneId(0)));
+        assert_eq!((ws.active_index(A), ws.focused(A)), (0, Some(PaneId(0))));
+        assert!(!ws.focus_pane(A, PaneId(7)));
     }
 }

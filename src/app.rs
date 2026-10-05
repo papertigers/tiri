@@ -13,15 +13,18 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use anyhow::{Context, Result, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use polling::{Event as PollEvent, Poller};
 
-use crate::input::encode_key;
+use crate::input::{encode_key, encode_mouse};
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
 use crate::pane::Pane;
 use crate::protocol::{Target, WorkspaceInfo};
 use crate::render::{Color, Frame, Renderer, Style};
+use crate::selection::{self, Point, Selection};
 use crate::thumbnail;
 use crate::workspace::{ClientId, Workspaces};
 
@@ -74,6 +77,41 @@ enum Action {
     Quit,
 }
 
+/// A piece of the status bar.
+struct Segment {
+    text: String,
+    style: Style,
+    /// What clicking it does.
+    target: Option<StatusTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTarget {
+    Workspace(usize),
+    Column(usize),
+}
+
+/// What's under the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    /// A pane, and if not on its border, the cell within its box (relative
+    /// to the box's inside) and the content point there.
+    Pane {
+        id: PaneId,
+        inner: Option<(u16, u16, Point)>,
+    },
+    /// An empty workspace's row.
+    EmptyWorkspace(usize),
+    Status(StatusTarget),
+    Nothing,
+}
+
+/// Lines per wheel notch, in scrollback or as arrow keys.
+const WHEEL_LINES: i32 = 3;
+/// Presses on the same cell this close together make a double or
+/// triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+
 /// An overview thumbnail uploaded to a client's terminal.
 struct Thumbnail {
     /// Placement size in cells.
@@ -99,9 +137,41 @@ pub struct Client {
     /// instead of text.
     kitty_overview: bool,
     thumbnails: HashMap<PaneId, Thumbnail>,
-    /// Graphics protocol commands to send before the next frame.
-    graphics: Vec<u8>,
+    /// Escape sequences to send before the next frame: kitty graphics
+    /// commands and clipboard writes.
+    escapes: Vec<u8>,
     renderer: Renderer,
+    /// How far back this client has scrolled each pane it's scrolled.
+    scrollback: HashMap<PaneId, Scrollback>,
+    /// Text selected with the mouse, highlighted until the next click or key.
+    selection: Option<Selection>,
+    /// What the left button is doing while held.
+    drag: Drag,
+    /// When and where the last left press in a pane was, and how many
+    /// presses in a row it made, to spot double and triple clicks.
+    last_click: Option<(Instant, PaneId, Point, u8)>,
+}
+
+/// How far back a client has scrolled a pane, and how much history the pane
+/// had then, so output arriving meanwhile doesn't drag the view along.
+#[derive(Debug, Clone, Copy)]
+struct Scrollback {
+    lines: usize,
+    history: usize,
+}
+
+/// What a held left button is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Drag {
+    #[default]
+    None,
+    /// The press only focused a pane; ignore the rest of it.
+    Ignored,
+    /// Passing the drag to the program in this pane.
+    Forwarded(PaneId),
+    /// Selecting text in this pane; `snapped` if a double or triple click
+    /// picked a word or line, which copies even a single character.
+    Selecting { pane: PaneId, snapped: bool },
 }
 
 impl Client {
@@ -109,9 +179,47 @@ impl Client {
         self.detach_requested
     }
 
-    /// Graphics commands to write before drawing the next frame.
-    pub fn take_graphics(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.graphics)
+    /// Escape sequences to write before drawing the next frame.
+    pub fn take_escapes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.escapes)
+    }
+
+    /// Puts `text` on this client's terminal's clipboard, with OSC 52.
+    pub fn copy(&mut self, text: &str) {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        self.escapes
+            .extend_from_slice(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+    }
+
+    /// How many lines back this client is scrolled in `pane`. Output since
+    /// it scrolled pushes the view further back, so what it was reading
+    /// stays put.
+    fn scrolled(&self, id: PaneId, pane: &Pane) -> usize {
+        let Some(scroll) = self.scrollback.get(&id) else {
+            return 0;
+        };
+        let history = pane.history_size();
+        (scroll.lines + history.saturating_sub(scroll.history)).min(history)
+    }
+
+    /// Scrolls `pane` back by `lines` (forward if negative), returning to
+    /// the live screen at the bottom.
+    fn scroll(&mut self, id: PaneId, pane: &Pane, lines: i32) {
+        let history = pane.history_size();
+        let current = self.scrolled(id, pane) as i32;
+        let target = (current + lines).clamp(0, history as i32) as usize;
+        if target == 0 {
+            self.scrollback.remove(&id);
+        } else {
+            self.scrollback.insert(
+                id,
+                Scrollback {
+                    lines: target,
+                    history,
+                },
+            );
+        }
     }
 
     /// Sends `frame` to this client's terminal, as a diff against the last.
@@ -126,17 +234,17 @@ impl Client {
 
     fn clear_thumbnails(&mut self) {
         for (id, _) in self.thumbnails.drain() {
-            kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
+            kitty::delete(&mut self.escapes, THUMBNAIL_ID_BASE + id.0);
         }
     }
 
     /// Frees the thumbnails of panes that have since closed.
     fn forget_closed_thumbnails(&mut self, panes: &HashMap<PaneId, Pane>) {
-        let graphics = &mut self.graphics;
+        let escapes = &mut self.escapes;
         self.thumbnails.retain(|id, _| {
             let open = panes.contains_key(id);
             if !open {
-                kitty::delete(graphics, THUMBNAIL_ID_BASE + id.0);
+                kitty::delete(escapes, THUMBNAIL_ID_BASE + id.0);
             }
             open
         });
@@ -163,7 +271,7 @@ impl Client {
         }
         let image = thumbnail::rasterize(pane.term());
         kitty::upload(
-            &mut self.graphics,
+            &mut self.escapes,
             THUMBNAIL_ID_BASE + id.0,
             &image,
             size.0,
@@ -261,8 +369,12 @@ impl App {
             prefix_pending: false,
             kitty_overview,
             thumbnails: HashMap::new(),
-            graphics: Vec::new(),
+            escapes: Vec::new(),
             renderer: Renderer::default(),
+            scrollback: HashMap::new(),
+            selection: None,
+            drag: Drag::None,
+            last_click: None,
         };
         self.lay_out_for(&client);
         if matches!(target, Target::New(_)) || self.panes.is_empty() {
@@ -564,11 +676,307 @@ impl App {
         if let Some(action) = alt_binding(key) {
             return self.run(client, action);
         }
+        client.selection = None;
+        if let Some(id) = self.workspaces.focused(client.id) {
+            // Typing returns to the live screen, as in any terminal.
+            client.scrollback.remove(&id);
+        }
         if let Some(pane) = self.focused_pane_mut(client) {
             let bytes = encode_key(key, pane.application_cursor());
             pane.write(&bytes);
         }
         Ok(())
+    }
+
+    /// What's at (`x`, `y`) on `client`'s screen.
+    fn hit(&self, client: &Client, x: i32, y: i32) -> Hit {
+        if y == i32::from(client.height) - 1 {
+            let mut left = 0;
+            for segment in self.status_segments(client) {
+                let right = left + segment.text.chars().count() as i32;
+                if (left..right).contains(&x) {
+                    return segment.target.map_or(Hit::Nothing, Hit::Status);
+                }
+                left = right;
+            }
+            return Hit::Nothing;
+        }
+        for ws in self.visible_workspaces(client) {
+            for idx in self.visible_columns(client, ws) {
+                for (id, bx, by, w, h) in self.pane_boxes(client, ws, idx) {
+                    if !(bx..bx + w).contains(&x) || !(by..by + h).contains(&y) {
+                        continue;
+                    }
+                    let (cx, cy) = (x - bx - 1, y - by - 1);
+                    let inside = (0..w - 2).contains(&cx) && (0..h - 2).contains(&cy);
+                    let inner = self.panes.get(&id).filter(|_| inside).map(|pane| {
+                        let top = content_top(pane, h - 2, client.scrolled(id, pane));
+                        let point = Point {
+                            line: top + cy,
+                            col: cx as u16,
+                        };
+                        (cx as u16, cy as u16, point)
+                    });
+                    return Hit::Pane { id, inner };
+                }
+            }
+            let top = self.row_top(client, ws);
+            let in_row = (top..top + self.row_height(client)).contains(&y);
+            if in_row && self.workspaces.list()[ws].is_empty() {
+                return Hit::EmptyWorkspace(ws);
+            }
+        }
+        Hit::Nothing
+    }
+
+    /// Where (`x`, `y`) falls within pane `id`'s box on `client`'s screen,
+    /// clamped to its inside, for drags that wander off the pane: the
+    /// (column, row) inside the box, the content point there, and -1, 0 or
+    /// 1 for whether `y` was above, within or below the box.
+    fn clamped_point(
+        &self,
+        client: &Client,
+        id: PaneId,
+        x: i32,
+        y: i32,
+    ) -> Option<(u16, u16, Point, i32)> {
+        let pane = self.panes.get(&id)?;
+        for ws in self.visible_workspaces(client) {
+            for idx in self.visible_columns(client, ws) {
+                for (pane_id, bx, by, w, h) in self.pane_boxes(client, ws, idx) {
+                    if pane_id != id || w < 3 || h < 3 {
+                        continue;
+                    }
+                    let cx = (x - bx - 1).clamp(0, w - 3);
+                    let raw_y = y - by - 1;
+                    let cy = raw_y.clamp(0, h - 3);
+                    let top = content_top(pane, h - 2, client.scrolled(id, pane));
+                    let point = Point {
+                        line: top + cy,
+                        col: cx as u16,
+                    };
+                    return Some((cx as u16, cy as u16, point, (raw_y - cy).signum()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Passes a mouse event to pane `id`'s program at (`col`, `row`) within
+    /// it, if it asked for that kind of event.
+    fn forward_mouse(
+        &mut self,
+        id: PaneId,
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+        mods: KeyModifiers,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&id)
+            && let Some(bytes) = encode_mouse(kind, col, row, mods, pane.mouse_modes())
+        {
+            pane.write(&bytes);
+        }
+    }
+
+    /// Handles a mouse event from `client`.
+    pub fn mouse(&mut self, client: &mut Client, event: MouseEvent) {
+        self.lay_out_for(client);
+        let (x, y) = (i32::from(event.column), i32::from(event.row));
+        let overview = self.workspaces.in_overview(client.id);
+        let shift = event.modifiers.contains(KeyModifiers::SHIFT);
+        match event.kind {
+            // Shift+wheel steps one column per tick, which lands squarely on
+            // a column. macOS sends Shift+wheel as horizontal ticks, so take
+            // either axis. Horizontal ticks without Shift are ignored: they
+            // leak from trackpads during ordinary scrolling and selecting,
+            // and terminals don't report gestures well enough to snap a
+            // free scroll the way niri does.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft if shift => {
+                self.workspaces.active_mut(client.id).focus_left();
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight if shift => {
+                self.workspaces.active_mut(client.id).focus_right();
+            }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {}
+            MouseEventKind::ScrollUp if overview => self.workspaces.focus_up(client.id),
+            MouseEventKind::ScrollDown if overview => self.workspaces.focus_down(client.id),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.wheel(client, event, x, y);
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.press(client, event, x, y),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag(client, event, x, y),
+            MouseEventKind::Up(MouseButton::Left) => self.release(client, event, x, y),
+            // Other buttons, and movement, only matter to programs that
+            // asked for them, in the focused pane.
+            kind => {
+                if let Hit::Pane {
+                    id,
+                    inner: Some((col, row, _)),
+                } = self.hit(client, x, y)
+                    && Some(id) == self.workspaces.focused(client.id)
+                    && !overview
+                {
+                    self.forward_mouse(id, kind, col, row, event.modifiers);
+                }
+            }
+        }
+    }
+
+    /// The vertical wheel over a pane: to its program if it takes the
+    /// mouse, as arrow keys in a full-screen program that doesn't, and
+    /// otherwise through the client's view of its scrollback.
+    fn wheel(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+        let Hit::Pane { id, inner } = self.hit(client, x, y) else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let up = event.kind == MouseEventKind::ScrollUp;
+        if pane.mouse_modes().any() {
+            if let Some((col, row, _)) = inner {
+                self.forward_mouse(id, event.kind, col, row, event.modifiers);
+            }
+        } else if pane.alternate_scroll() {
+            let arrow: &[u8] = match (up, pane.application_cursor()) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            for _ in 0..WHEEL_LINES {
+                pane.write(arrow);
+            }
+        } else {
+            client.scroll(id, pane, if up { WHEEL_LINES } else { -WHEEL_LINES });
+        }
+    }
+
+    fn press(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+        client.selection = None;
+        client.drag = Drag::Ignored;
+        let overview = self.workspaces.in_overview(client.id);
+        match self.hit(client, x, y) {
+            Hit::Status(StatusTarget::Workspace(ws)) => {
+                self.workspaces.focus_workspace(client.id, ws);
+            }
+            Hit::Status(StatusTarget::Column(idx)) => {
+                self.workspaces.active_mut(client.id).focus_column(idx);
+            }
+            Hit::EmptyWorkspace(ws) => {
+                self.workspaces.focus_workspace(client.id, ws);
+                self.workspaces.set_overview(client.id, false);
+            }
+            Hit::Pane { id, inner } => {
+                let focused = self.workspaces.focused(client.id) == Some(id);
+                self.workspaces.focus_pane(client.id, id);
+                if overview {
+                    self.workspaces.set_overview(client.id, false);
+                    return;
+                }
+                // Counted before the focus check, so double-clicking a pane
+                // that wasn't focused still selects a word. A fourth click
+                // in a row starts over.
+                let now = Instant::now();
+                let clicks = inner.map_or(1, |(_, _, point)| match client.last_click {
+                    Some((at, pane, last, n))
+                        if pane == id && last == point && now - at < MULTI_CLICK =>
+                    {
+                        n % 3 + 1
+                    }
+                    _ => 1,
+                });
+                client.last_click = inner.map(|(_, _, point)| (now, id, point, clicks));
+
+                // A click that focuses a pane isn't passed to its program.
+                let Some((col, row, point)) = inner.filter(|_| focused || clicks > 1) else {
+                    return;
+                };
+                let Some(pane) = self.panes.get(&id) else {
+                    return;
+                };
+                if pane.mouse_modes().any() {
+                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                    client.drag = Drag::Forwarded(id);
+                } else {
+                    let (anchor, head) = match clicks {
+                        2 => selection::word_at(pane.term(), point),
+                        3 => selection::line_at(pane.term(), point),
+                        _ => (point, point),
+                    };
+                    client.drag = Drag::Selecting {
+                        pane: id,
+                        snapped: clicks > 1,
+                    };
+                    client.selection = Some(Selection {
+                        pane: id,
+                        anchor,
+                        head,
+                    });
+                }
+            }
+            Hit::Nothing => {}
+        }
+    }
+
+    fn drag(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+        match client.drag {
+            Drag::Forwarded(id) => {
+                if let Some((col, row, _, _)) = self.clamped_point(client, id, x, y) {
+                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                }
+            }
+            Drag::Selecting { pane: id, .. } => {
+                // Dragging above or below the pane scrolls it along.
+                if let Some((_, _, _, past)) = self.clamped_point(client, id, x, y)
+                    && past != 0
+                    && let Some(pane) = self.panes.get(&id)
+                {
+                    client.scroll(id, pane, -past);
+                }
+                if let Some((_, _, point, _)) = self.clamped_point(client, id, x, y)
+                    && let Some(selection) = client.selection.as_mut()
+                {
+                    selection.head = point;
+                }
+            }
+            Drag::None | Drag::Ignored => {}
+        }
+    }
+
+    fn release(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+        match std::mem::take(&mut client.drag) {
+            Drag::Forwarded(id) => {
+                if let Some((col, row, _, _)) = self.clamped_point(client, id, x, y) {
+                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                }
+            }
+            Drag::Selecting { pane: id, snapped } => {
+                let Some(selection) = client.selection.filter(|s| snapped || !s.is_empty()) else {
+                    // A plain click selects nothing.
+                    client.selection = None;
+                    return;
+                };
+                if let Some(pane) = self.panes.get(&id) {
+                    let (start, end) = selection.bounds();
+                    let text = selection::text(pane.term(), start, end);
+                    if !text.is_empty() {
+                        client.copy(&text);
+                    }
+                }
+            }
+            Drag::None | Drag::Ignored => {}
+        }
+    }
+
+    /// Text programs in panes have copied (OSC 52), for passing on to the
+    /// clients' clipboards.
+    pub fn take_copied(&mut self) -> Vec<String> {
+        self.panes
+            .values_mut()
+            .flat_map(Pane::take_copied)
+            .collect()
     }
 
     fn run(&mut self, client: &mut Client, action: Action) -> Result<()> {
@@ -693,14 +1101,21 @@ impl App {
                 } else {
                     format!("{}", idx + 1)
                 };
-                let title = format!(" {number}: {} ", pane.title());
+                let scrolled = client.scrolled(id, pane);
+                let title = if scrolled > 0 {
+                    let history = pane.history_size();
+                    format!(" {number}: {} [{scrolled}/{history}] ", pane.title())
+                } else {
+                    format!(" {number}: {} ", pane.title())
+                };
                 let title: String = title
                     .chars()
                     .take(w.saturating_sub(4).max(0) as usize)
                     .collect();
                 frame.put_str(x + 2, y, &title, border);
 
-                let first_row = match client.thumbnails.get(&id) {
+                let top = content_top(pane, h - 2, scrolled);
+                match client.thumbnails.get(&id) {
                     Some(thumb) if thumbnails => {
                         let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + id.0));
                         let (cols, rows) = thumb.size;
@@ -710,14 +1125,23 @@ impl App {
                                 frame.put(x + 1 + i32::from(c), y + 1 + i32::from(r), &cell, style);
                             }
                         }
-                        0
                     }
-                    _ => draw_screen(&mut frame, pane, x + 1, y + 1, w - 2, h - 2),
-                };
+                    _ => draw_screen(
+                        &mut frame,
+                        pane,
+                        id,
+                        x + 1,
+                        y + 1,
+                        w - 2,
+                        h - 2,
+                        top,
+                        client.selection.as_ref(),
+                    ),
+                }
 
-                if focused && show_cursor && pane.cursor_visible() {
+                if focused && show_cursor && scrolled == 0 && pane.cursor_visible() {
                     let (r, c) = pane.cursor();
-                    let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r - first_row));
+                    let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
                     if (0..i32::from(client.width)).contains(&cx) && cy < y + h - 1 {
                         cursor = Some((cx as u16, cy as u16));
                     }
@@ -824,20 +1248,19 @@ impl App {
         }
     }
 
-    fn draw_status(&self, client: &Client, frame: &mut Frame) {
-        let y = i32::from(client.height) - 1;
+    /// The status bar's left side, piece by piece: the workspaces, then
+    /// markers for the active workspace's columns. Shared by drawing and
+    /// by working out what a click on the bar hit.
+    fn status_segments(&self, client: &Client) -> Vec<Segment> {
         let base = Style {
             bg: STATUS_BG,
             ..Style::fg(STATUS_FG)
         };
-        frame.put_str(0, y, &" ".repeat(usize::from(client.width)), base);
-
-        let mut x = 0;
-        let mut put = |frame: &mut Frame, s: &str, style: Style| {
-            frame.put_str(x, y, s, style);
-            x += s.chars().count() as i32;
-        };
-        put(frame, " tiri ", Style { bold: true, ..base });
+        let mut segments = vec![Segment {
+            text: " tiri ".to_owned(),
+            style: Style { bold: true, ..base },
+            target: None,
+        }];
 
         // The workspaces, top to bottom, ending with "+" for the empty one.
         let active_ws = self.workspaces.active_index(client.id);
@@ -857,20 +1280,24 @@ impl App {
             } else {
                 base
             };
-            put(frame, &format!(" {} ", self.workspace_label(ws)), style);
+            segments.push(Segment {
+                text: format!(" {} ", self.workspace_label(ws)),
+                style,
+                target: Some(StatusTarget::Workspace(ws)),
+            });
         }
-        put(frame, " │ ", base);
+        segments.push(Segment {
+            text: " │ ".to_owned(),
+            style: base,
+            target: None,
+        });
 
         // A minimap of the active workspace's columns: the focused one
         // filled, the rest hollow, dimmed when scrolled out of view.
         let strip = self.workspaces.active(client.id);
         for idx in 0..strip.columns().len() {
-            let label = if idx == strip.focus_index() {
-                "■ "
-            } else {
-                "□ "
-            };
-            let style = if idx == strip.focus_index() {
+            let focused = idx == strip.focus_index();
+            let style = if focused {
                 Style {
                     fg: FOCUSED_BORDER,
                     bold: true,
@@ -886,7 +1313,26 @@ impl App {
                     },
                 }
             };
-            put(frame, label, style);
+            segments.push(Segment {
+                text: if focused { "■ " } else { "□ " }.to_owned(),
+                style,
+                target: Some(StatusTarget::Column(idx)),
+            });
+        }
+        segments
+    }
+
+    fn draw_status(&self, client: &Client, frame: &mut Frame) {
+        let y = i32::from(client.height) - 1;
+        let base = Style {
+            bg: STATUS_BG,
+            ..Style::fg(STATUS_FG)
+        };
+        frame.put_str(0, y, &" ".repeat(usize::from(client.width)), base);
+        let mut x = 0;
+        for segment in self.status_segments(client) {
+            frame.put_str(x, y, &segment.text, segment.style);
+            x += segment.text.chars().count() as i32;
         }
 
         let overview = self.workspaces.in_overview(client.id);
@@ -1028,26 +1474,51 @@ fn draw_box(frame: &mut Frame, x: i32, y: i32, w: i32, h: i32, style: Style) {
     frame.put(right, bottom, "┘", style);
 }
 
-/// Copies a pane's screen into a `w` x `h` box at (x, y), clipping at the
-/// frame's edges. A box smaller than the screen (in the overview) shows the
-/// left edge of the rows around the cursor. Returns the first row shown.
-fn draw_screen(frame: &mut Frame, pane: &Pane, x: i32, y: i32, w: i32, h: i32) -> u16 {
-    let (rows, cols) = pane.size();
-    let w = w.clamp(0, i32::from(cols)) as u16;
+/// The first line of `pane` to show in a box `h` rows high: the screen's
+/// top, or the rows around the cursor if the box is shorter (as in the
+/// overview), moved up by however far the client has scrolled back.
+fn content_top(pane: &Pane, h: i32, scrolled: usize) -> i32 {
+    let (rows, _) = pane.size();
     let h = h.clamp(0, i32::from(rows)) as u16;
     let (cursor_row, _) = pane.cursor();
-    let first_row = (cursor_row + 1).saturating_sub(h).min(rows - h);
+    let crop = (cursor_row + 1).saturating_sub(h).min(rows - h);
+    i32::from(crop) - scrolled as i32
+}
+
+/// Copies part of a pane into a `w` x `h` box at (x, y), starting from
+/// content line `top`, clipping at the frame's edges. Selected text is
+/// drawn inverted.
+#[allow(clippy::too_many_arguments)]
+fn draw_screen(
+    frame: &mut Frame,
+    pane: &Pane,
+    id: PaneId,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    top: i32,
+    selection: Option<&Selection>,
+) {
+    let (rows, cols) = pane.size();
+    let w = w.clamp(0, i32::from(cols)) as u16;
+    let h = h.clamp(0, i32::from(rows));
 
     let mut sym = String::new();
-    for row in first_row..first_row + h {
-        let fy = y + i32::from(row - first_row);
+    for row in 0..h {
+        let line = top + row;
+        let fy = y + row;
         for col in 0..w {
             let fx = x + i32::from(col);
-            if fx < 0 || fx >= i32::from(frame.width()) || fy >= i32::from(frame.height()) {
+            if fx < 0 || fx >= i32::from(frame.width()) || fy < 0 || fy >= i32::from(frame.height())
+            {
                 continue;
             }
-            let cell = pane.cell(row, col);
-            let style = cell_style(pane, cell);
+            let cell = pane.cell(line, col);
+            let mut style = cell_style(pane, cell);
+            if selection.is_some_and(|s| s.contains(id, Point { line, col })) {
+                style.inverse = !style.inverse;
+            }
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 // Its first half is drawn by the cell to the left, unless that
                 // half was scrolled off the left edge.
@@ -1076,7 +1547,6 @@ fn draw_screen(frame: &mut Frame, pane: &Pane, x: i32, y: i32, w: i32, h: i32) -
             }
         }
     }
-    first_row
 }
 
 fn cell_style(pane: &Pane, cell: &alacritty_terminal::term::cell::Cell) -> Style {

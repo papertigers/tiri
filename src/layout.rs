@@ -363,6 +363,21 @@ impl Strip {
         self.set_focus(self.columns.len().saturating_sub(1));
     }
 
+    pub fn focus_column(&mut self, idx: usize) {
+        self.set_focus(idx);
+    }
+
+    /// Focuses `pane`, wherever it is in the strip. Returns false if it
+    /// isn't here.
+    pub fn focus_pane(&mut self, pane: PaneId) -> bool {
+        let Some((col, row)) = self.locate(pane) else {
+            return false;
+        };
+        self.columns[col].focus = row;
+        self.set_focus(col);
+        true
+    }
+
     fn set_focus(&mut self, idx: usize) {
         if idx < self.columns.len() {
             self.focus = idx;
@@ -789,5 +804,16 @@ mod tests {
         assert_eq!(split_heights(10, 3), [4, 3, 3]);
         assert_eq!(split_heights(9, 3), [3, 3, 3]);
         assert_eq!(split_heights(5, 1), [5]);
+    }
+
+    #[test]
+    fn focus_pane_finds_stacked_panes() {
+        let mut strip = strip_with(3, 100);
+        strip.consume_or_expel_left(); // [0] [1 2]
+        assert!(strip.focus_pane(PaneId(1)));
+        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(1))));
+        assert!(strip.focus_pane(PaneId(0)));
+        assert_eq!(strip.focus_index(), 0);
+        assert!(!strip.focus_pane(PaneId(9)));
     }
 }

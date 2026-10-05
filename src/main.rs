@@ -6,6 +6,7 @@ mod layout;
 mod pane;
 mod protocol;
 mod render;
+mod selection;
 mod server;
 mod socket;
 mod thumbnail;

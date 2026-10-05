@@ -18,6 +18,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
 
+use crate::input::MouseModes;
+
 /// Answers for apps that ask what colors the terminal uses (OSC 10/11).
 /// Assumes a dark theme until we ask the outer terminal.
 const DEFAULT_FG: Rgb = Rgb {
@@ -52,6 +54,8 @@ pub struct Pane {
     fallback_title: String,
     /// Bumped whenever the screen may have changed.
     generation: u64,
+    /// Text the program copied with OSC 52, for the clients' clipboards.
+    copied: Vec<String>,
 }
 
 impl Pane {
@@ -105,6 +109,7 @@ impl Pane {
             title: None,
             fallback_title,
             generation: 0,
+            copied: Vec::new(),
         })
     }
 
@@ -116,8 +121,40 @@ impl Pane {
         (self.term.screen_lines() as u16, self.term.columns() as u16)
     }
 
-    pub fn cell(&self, row: u16, col: u16) -> &Cell {
-        &self.term.grid()[Point::new(Line(i32::from(row)), Column(usize::from(col)))]
+    /// The cell at `line`, `col`. Line 0 is the top of the live screen;
+    /// negative lines reach back into the scrollback.
+    pub fn cell(&self, line: i32, col: u16) -> &Cell {
+        &self.term.grid()[Point::new(Line(line), Column(usize::from(col)))]
+    }
+
+    /// How many lines of scrollback there are above the screen.
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// What the program asked to hear about the mouse.
+    pub fn mouse_modes(&self) -> MouseModes {
+        let mode = self.term.mode();
+        MouseModes {
+            click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            utf8: mode.contains(TermMode::UTF8_MOUSE),
+        }
+    }
+
+    /// Whether the wheel should become arrow keys: a full-screen program
+    /// that doesn't take the mouse itself, like `less`.
+    pub fn alternate_scroll(&self) -> bool {
+        let mode = self.term.mode();
+        mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+            && !mode.intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Text the program has copied since the last call.
+    pub fn take_copied(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.copied)
     }
 
     /// The color an app has set for palette entry `idx` with OSC 4, if any.
@@ -210,6 +247,7 @@ impl Pane {
                 TermEvent::PtyWrite(text) => self.write(text.as_bytes()),
                 TermEvent::Title(title) => self.title = Some(title),
                 TermEvent::ResetTitle => self.title = None,
+                TermEvent::ClipboardStore(_, text) => self.copied.push(text),
                 TermEvent::ColorRequest(idx, reply) => {
                     let rgb = self.term.colors()[idx].unwrap_or(match idx {
                         256 => DEFAULT_FG,

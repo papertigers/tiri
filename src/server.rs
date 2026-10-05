@@ -207,9 +207,16 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
                 let mut client = connection.client.take().expect("checked above");
                 app.detach(&mut client);
                 // Thumbnail cleanup, before the client leaves the screen.
-                connection.send(&ServerMsg::Output(client.take_graphics()));
+                connection.send(&ServerMsg::Output(client.take_escapes()));
                 connection.send(&ServerMsg::Exit(ExitReason::Detached));
                 connection.closing = true;
+            }
+        }
+
+        // Programs copying with OSC 52 reach every attached clipboard.
+        for text in app.take_copied() {
+            for client in connections.values_mut().filter_map(|c| c.client.as_mut()) {
+                client.copy(&text);
             }
         }
 
@@ -239,7 +246,7 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
                 continue;
             };
             let (frame, cursor) = app.draw(client);
-            let mut bytes = client.take_graphics();
+            let mut bytes = client.take_escapes();
             client.render(&mut bytes, frame, cursor)?;
             connection.send(&ServerMsg::Output(bytes));
             connection.flush();
@@ -327,6 +334,10 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                     app.resize(client, width, height);
                     Ok(())
                 }
+                Event::Mouse(mouse) => {
+                    app.mouse(client, mouse);
+                    Ok(())
+                }
                 _ => Ok(()),
             };
             if let Err(e) = result {
@@ -351,7 +362,7 @@ fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connect
     for (_, mut connection) in connections {
         if let Some(mut client) = connection.client.take() {
             app.detach(&mut client);
-            connection.send(&ServerMsg::Output(client.take_graphics()));
+            connection.send(&ServerMsg::Output(client.take_escapes()));
         }
         connection.send(&ServerMsg::Exit(ExitReason::ServerExited));
         let _ = poller.delete(&connection.stream);
