@@ -21,7 +21,7 @@ pub(super) fn content_top(pane: &Pane, h: i32, scrolled: usize) -> i32 {
 
 /// Copies part of a pane into a `w` x `h` box at (x, y), starting from
 /// content line `top`, clipping at the frame's edges. Selected text is
-/// drawn inverted.
+/// drawn on `selection_bg`, or inverted if there's none.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_screen(
     frame: &mut Frame,
@@ -33,6 +33,7 @@ pub(super) fn draw_screen(
     h: i32,
     top: i32,
     selection: Option<&Selection>,
+    selection_bg: Option<Color>,
 ) {
     let (rows, cols) = pane.size();
     let w = w.clamp(0, i32::from(cols)) as u16;
@@ -51,7 +52,10 @@ pub(super) fn draw_screen(
             let cell = pane.cell(line, col);
             let mut style = cell_style(pane, cell);
             if selection.is_some_and(|s| s.contains(id, Point { line, col })) {
-                style.inverse = !style.inverse;
+                match selection_bg {
+                    Some(bg) => style.bg = bg,
+                    None => style.inverse = !style.inverse,
+                }
             }
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 // Its first half is drawn by the cell to the left, unless that

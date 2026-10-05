@@ -12,6 +12,7 @@ use crate::layout::PaneId;
 use crate::pane::Pane;
 use crate::render::{Frame, Renderer};
 use crate::selection::{Point, Selection};
+use crate::theme::Theme;
 use crate::thumbnail;
 use crate::workspace::ClientId;
 
@@ -30,6 +31,8 @@ pub struct Client {
     /// Its terminal's colors, for its thumbnails and for answering
     /// programs that ask.
     pub(super) palette: Palette,
+    /// The colors of tiri's own borders, status bar and hints.
+    pub(super) theme: Theme,
     /// Its thumbnails' cell size, the same shape as its terminal's cells.
     pub(super) thumbnail_cell: thumbnail::CellSize,
     /// Set when the client asks to detach; the server then lets it go.

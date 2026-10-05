@@ -27,6 +27,7 @@ use crate::layout::{PaneId, split_heights};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
 use crate::render::Renderer;
+use crate::theme::Theme;
 use crate::thumbnail;
 use crate::workspace::{ClientId, Workspaces};
 
@@ -98,8 +99,16 @@ impl App {
             kitty_overview,
             colors,
             cell_pixels,
+            theme,
         } = hello;
         let (width, height) = clamp_size(width, height);
+        let theme = match theme.as_deref() {
+            None | Some("") => Theme::default(),
+            Some(name) => Theme::named(name).with_context(|| {
+                let names: Vec<_> = Theme::ALL.iter().map(|(n, _)| *n).collect();
+                format!("no theme named {name:?}; there's {}", names.join(", "))
+            })?,
+        };
         let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
@@ -126,6 +135,7 @@ impl App {
             height,
             cwd,
             palette: Palette::from_reported(&colors),
+            theme,
             thumbnail_cell: thumbnail::cell_size_for(cell_pixels),
             detach_requested: false,
             prefix_pending: false,

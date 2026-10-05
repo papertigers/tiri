@@ -5,17 +5,12 @@ use std::time::Instant;
 
 use crate::effects::Transition;
 use crate::kitty;
-use crate::render::{Color, Frame, Style};
+use crate::render::{Frame, Style};
 
 use super::geometry::PaneBox;
 use super::screen::{content_top, draw_screen};
-use super::status::{STATUS_BG, STATUS_FG};
 use super::thumbnails::image_id;
 use super::{App, Client};
-
-pub(super) const FOCUSED_BORDER: Color = Color::Idx(12);
-const UNFOCUSED_BORDER: Color = Color::Idx(8);
-pub(super) const DIM_TEXT: Color = Color::Idx(242);
 
 impl App {
     /// Composes `client`'s view of the workspaces plus its status bar.
@@ -113,10 +108,10 @@ impl App {
             let border = if focused {
                 Style {
                     bold: true,
-                    ..Style::fg(FOCUSED_BORDER)
+                    ..Style::fg(client.theme.focused_border)
                 }
             } else {
-                Style::fg(UNFOCUSED_BORDER)
+                Style::fg(client.theme.unfocused_border)
             };
             draw_box(&mut frame, x, y, w, h, border);
             let number = if stacked {
@@ -164,6 +159,7 @@ impl App {
                     h - 2,
                     top,
                     client.selection.as_ref(),
+                    client.theme.selection_bg,
                 ),
             }
 
@@ -210,10 +206,10 @@ impl App {
         let style = if active {
             Style {
                 bold: true,
-                ..Style::fg(FOCUSED_BORDER)
+                ..Style::fg(client.theme.focused_border)
             }
         } else {
-            Style::fg(DIM_TEXT)
+            Style::fg(client.theme.dim)
         };
         if overview {
             frame.put_str(
@@ -243,7 +239,7 @@ impl App {
             frame.put_str(x + (w - hint_width) / 2, middle, hint, style);
         } else {
             let x = (i32::from(client.width) - hint_width) / 2;
-            frame.put_str(x, middle, hint, Style::fg(DIM_TEXT));
+            frame.put_str(x, middle, hint, Style::fg(client.theme.dim));
         }
     }
 
@@ -259,8 +255,8 @@ impl App {
             .filter(|&ws| self.row_top(client, ws) >= area)
             .collect();
         let style = Style {
-            bg: STATUS_BG,
-            ..Style::fg(STATUS_FG)
+            bg: client.theme.status_bg,
+            ..Style::fg(client.theme.status_fg)
         };
         let mut note = |y: i32, text: String| {
             let x = i32::from(client.width) - text.chars().count() as i32 - 1;

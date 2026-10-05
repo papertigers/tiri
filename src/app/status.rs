@@ -2,13 +2,9 @@
 //! right.
 
 use crate::layout::Visibility;
-use crate::render::{Color, Frame, Style};
+use crate::render::{Frame, Style};
 
-use super::draw::{DIM_TEXT, FOCUSED_BORDER};
 use super::{App, Client};
-
-pub(super) const STATUS_BG: Color = Color::Idx(236);
-pub(super) const STATUS_FG: Color = Color::Idx(250);
 
 /// A piece of the status bar.
 pub(super) struct Segment {
@@ -29,9 +25,10 @@ impl App {
     /// markers for the active workspace's columns. Shared by drawing and
     /// by working out what a click on the bar hit.
     pub(super) fn status_segments(&self, client: &Client) -> Vec<Segment> {
+        let theme = &client.theme;
         let base = Style {
-            bg: STATUS_BG,
-            ..Style::fg(STATUS_FG)
+            bg: theme.status_bg,
+            ..Style::fg(theme.status_fg)
         };
         let mut segments = vec![Segment {
             text: " tiri ".to_owned(),
@@ -44,14 +41,14 @@ impl App {
         for ws in 0..self.workspaces.list().len() {
             let style = if ws == active_ws {
                 Style {
-                    bg: STATUS_FG,
-                    fg: STATUS_BG,
+                    bg: theme.status_active_bg,
+                    fg: theme.status_active_fg,
                     bold: true,
                     ..base
                 }
             } else if self.is_new_workspace(ws) {
                 Style {
-                    fg: DIM_TEXT,
+                    fg: theme.dim,
                     ..base
                 }
             } else {
@@ -76,7 +73,7 @@ impl App {
             let focused = idx == strip.focus_index();
             let style = if focused {
                 Style {
-                    fg: FOCUSED_BORDER,
+                    fg: theme.focused_border,
                     bold: true,
                     ..base
                 }
@@ -85,7 +82,7 @@ impl App {
                     Visibility::Full => Style { bold: true, ..base },
                     Visibility::Partial => base,
                     Visibility::Hidden => Style {
-                        fg: DIM_TEXT,
+                        fg: theme.dim,
                         ..base
                     },
                 }
@@ -101,9 +98,10 @@ impl App {
 
     pub(super) fn draw_status(&self, client: &Client, frame: &mut Frame) {
         let y = i32::from(client.height) - 1;
+        let theme = &client.theme;
         let base = Style {
-            bg: STATUS_BG,
-            ..Style::fg(STATUS_FG)
+            bg: theme.status_bg,
+            ..Style::fg(theme.status_fg)
         };
         frame.put_str(0, y, &" ".repeat(usize::from(client.width)), base);
         let mut x = 0;

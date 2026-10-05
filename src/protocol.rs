@@ -39,6 +39,8 @@ pub struct Hello {
     pub colors: ReportedColors,
     /// Its terminal's cell size in pixels, if it says.
     pub cell_pixels: Option<(u16, u16)>,
+    /// The built-in theme it asked for, if any.
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

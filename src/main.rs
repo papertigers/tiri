@@ -12,6 +12,7 @@ mod render;
 mod selection;
 mod server;
 mod socket;
+mod theme;
 mod thumbnail;
 mod workspace;
 

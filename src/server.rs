@@ -387,7 +387,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
         ClientMsg::Hello(hello) if connection.client.is_none() => {
             log::info!(
                 "{}: attaching: {}x{} cells, cell pixels {:?}, \
-                 kitty overview {}, foreground {:?}, background {:?}",
+                 kitty overview {}, foreground {:?}, background {:?}, theme {:?}",
                 connection.name(),
                 hello.width,
                 hello.height,
@@ -395,6 +395,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 hello.kitty_overview,
                 hello.colors.foreground,
                 hello.colors.background,
+                hello.theme,
             );
             match app.attach(hello) {
                 Ok(client) => {
