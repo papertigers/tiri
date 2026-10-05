@@ -1,9 +1,11 @@
 mod app;
 mod client;
+mod colors;
 mod input;
 mod kitty;
 mod layout;
 mod pane;
+mod probe;
 mod protocol;
 mod render;
 mod selection;

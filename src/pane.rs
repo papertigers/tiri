@@ -18,20 +18,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
 
+use crate::colors::Palette;
 use crate::input::MouseModes;
 
-/// Answers for apps that ask what colors the terminal uses (OSC 10/11).
-/// Assumes a dark theme until we ask the outer terminal.
-const DEFAULT_FG: Rgb = Rgb {
-    r: 0xd8,
-    g: 0xd8,
-    b: 0xd8,
-};
-const DEFAULT_BG: Rgb = Rgb {
-    r: 0x00,
-    g: 0x00,
-    b: 0x00,
-};
 /// The most output to take from one pane per wakeup, so a pane streaming
 /// output can't starve input or the others. The rest is read next time.
 const READ_BUDGET: usize = 256 * 1024;
@@ -56,6 +45,9 @@ pub struct Pane {
     generation: u64,
     /// Text the program copied with OSC 52, for the clients' clipboards.
     copied: Vec<String>,
+    /// The colors to answer the program's color queries with: those of
+    /// the client most recently used.
+    palette: Palette,
 }
 
 impl Pane {
@@ -110,6 +102,7 @@ impl Pane {
             fallback_title,
             generation: 0,
             copied: Vec::new(),
+            palette: Palette::default(),
         })
     }
 
@@ -150,6 +143,10 @@ impl Pane {
         let mode = self.term.mode();
         mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
             && !mode.intersects(TermMode::MOUSE_MODE)
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     /// Text the program has copied since the last call.
@@ -249,9 +246,11 @@ impl Pane {
                 TermEvent::ResetTitle => self.title = None,
                 TermEvent::ClipboardStore(_, text) => self.copied.push(text),
                 TermEvent::ColorRequest(idx, reply) => {
-                    let rgb = self.term.colors()[idx].unwrap_or(match idx {
-                        256 => DEFAULT_FG,
-                        _ => DEFAULT_BG,
+                    // Colors the program set itself win; otherwise the
+                    // real terminal's.
+                    let rgb = self.term.colors()[idx].unwrap_or_else(|| {
+                        let [r, g, b] = self.palette.by_index(idx);
+                        Rgb { r, g, b }
                     });
                     self.write(reply(rgb).as_bytes());
                 }

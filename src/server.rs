@@ -246,7 +246,7 @@ fn serve_with(listener: &UnixListener, poller: &Arc<Poller>) -> Result<()> {
                 continue;
             };
             let (frame, cursor) = app.draw(client);
-            let mut bytes = client.take_escapes();
+            let mut bytes = Vec::new();
             client.render(&mut bytes, frame, cursor)?;
             connection.send(&ServerMsg::Output(bytes));
             connection.flush();
@@ -301,14 +301,18 @@ fn accept(
 
 fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut bool) {
     match msg {
-        ClientMsg::Hello {
-            width,
-            height,
-            target,
-            cwd,
-            kitty_overview,
-        } if connection.client.is_none() => {
-            match app.attach(width, height, &target, cwd, kitty_overview) {
+        ClientMsg::Hello(hello) if connection.client.is_none() => {
+            eprintln!(
+                "tiri server: client attaching: {}x{} cells, cell pixels {:?}, \
+                 kitty overview {}, foreground {:?}, background {:?}",
+                hello.width,
+                hello.height,
+                hello.cell_pixels,
+                hello.kitty_overview,
+                hello.colors.foreground,
+                hello.colors.background,
+            );
+            match app.attach(hello) {
                 Ok(client) => {
                     connection.send(&ServerMsg::Attached);
                     connection.client = Some(client);
@@ -319,7 +323,7 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
                 }
             }
         }
-        ClientMsg::Hello { .. } => {}
+        ClientMsg::Hello(_) => {}
         ClientMsg::Event(event) => {
             let Some(client) = connection.client.as_mut() else {
                 return;
@@ -342,6 +346,11 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
             };
             if let Err(e) = result {
                 eprintln!("tiri server: {e:#}");
+            }
+        }
+        ClientMsg::CellPixels(cell_pixels) => {
+            if let Some(client) = connection.client.as_mut() {
+                client.set_cell_pixels(cell_pixels);
             }
         }
         ClientMsg::List => {

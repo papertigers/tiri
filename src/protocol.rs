@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::colors::ReportedColors;
+
 /// Refuse messages bigger than this, rather than trying to buffer them.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -23,20 +25,30 @@ pub enum Target {
     New(String),
 }
 
+/// What an attaching client says about itself and where it wants to go.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Hello {
+    pub width: u16,
+    pub height: u16,
+    pub target: Target,
+    /// Where panes this client opens should start.
+    pub cwd: PathBuf,
+    /// Whether its overview should use kitty graphics thumbnails.
+    pub kitty_overview: bool,
+    /// The colors its terminal reported.
+    pub colors: ReportedColors,
+    /// Its terminal's cell size in pixels, if it says.
+    pub cell_pixels: Option<(u16, u16)>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// The first message from an attaching client.
-    Hello {
-        width: u16,
-        height: u16,
-        target: Target,
-        /// Where panes this client opens should start.
-        cwd: PathBuf,
-        /// Whether its overview should use kitty graphics thumbnails.
-        kitty_overview: bool,
-    },
+    Hello(Hello),
     /// Input from the client's terminal.
     Event(crossterm::event::Event),
+    /// The terminal's cell size in pixels changed, as after a font change.
+    CellPixels(Option<(u16, u16)>),
     /// Asks for the workspace list instead of attaching.
     List,
     KillServer,

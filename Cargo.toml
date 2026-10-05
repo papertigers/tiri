@@ -15,5 +15,5 @@ miniz_oxide = "0.9.1"
 polling = "3"
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
-rustix = { version = "1", features = ["fs", "process", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "process", "termios"] }
 serde = { version = "1.0.229", features = ["derive"] }

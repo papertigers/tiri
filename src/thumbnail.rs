@@ -10,15 +10,35 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use font8x8::UnicodeFonts as _;
 
-/// Pixels per terminal cell. 1:2 is close to most terminals' cell shape, so
-/// the terminal scales the image about evenly in both directions.
-pub const CELL_WIDTH: usize = 8;
-pub const CELL_HEIGHT: usize = 16;
+use crate::colors::{Palette, Rgb};
 
-/// Used for text in the default color. The default background is left
-/// transparent so the outer terminal's own background shows through.
-const DEFAULT_FG: [u8; 3] = [0xd8, 0xd8, 0xd8];
-const DEFAULT_BG: [u8; 3] = [0x00, 0x00, 0x00];
+/// A thumbnail cell's size in pixels, (width, height).
+pub type CellSize = (usize, usize);
+
+/// Cell size for terminals that don't say how big their cells are.
+pub const DEFAULT_CELL: CellSize = (8, 16);
+
+/// The thumbnail cell size for a terminal whose cells are `cell_pixels`
+/// (width, height) pixels: exactly the same shape, as small as allows at
+/// least 8 pixels across for the font. The terminal fits an image into its
+/// placement without stretching it, so any difference in shape leaves a gap
+/// that visibly closes when the overview hands back to live text.
+pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
+    let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) else {
+        return DEFAULT_CELL;
+    };
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let (w, h) = (usize::from(w), usize::from(h));
+    let g = gcd(w, h);
+    let (w, h) = (w / g, h / g);
+    let scale = 8usize.div_ceil(w);
+    (w * scale, h * scale)
+}
 
 /// Opacity of the smudge drawn for characters the font doesn't have.
 const UNKNOWN_GLYPH_ALPHA: u8 = 0x90;
@@ -48,9 +68,14 @@ impl Image {
     }
 }
 
-pub fn rasterize<T>(term: &Term<T>) -> Image {
+/// Draws `term`'s screen in `palette`, the colors of the terminal the
+/// thumbnail is for, with cells `cell_height` pixels tall. The default
+/// background is left transparent so that terminal's own background shows
+/// through.
+pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> Image {
     let (rows, cols) = (term.screen_lines(), term.columns());
-    let mut image = Image::new((cols * CELL_WIDTH) as u32, (rows * CELL_HEIGHT) as u32);
+    let (cell_width, cell_height) = cell_size;
+    let mut image = Image::new((cols * cell_width) as u32, (rows * cell_height) as u32);
     let colors = term.colors();
     for row in 0..rows {
         for col in 0..cols {
@@ -59,34 +84,44 @@ pub fn rasterize<T>(term: &Term<T>) -> Image {
                 &mut image,
                 cell,
                 colors,
-                col * CELL_WIDTH,
-                row * CELL_HEIGHT,
+                palette,
+                col * cell_width,
+                row * cell_height,
+                cell_size,
             );
         }
     }
     image
 }
 
-fn draw_cell(image: &mut Image, cell: &Cell, colors: &Colors, x: usize, y: usize) {
+fn draw_cell(
+    image: &mut Image,
+    cell: &Cell,
+    colors: &Colors,
+    palette: &Palette,
+    x: usize,
+    y: usize,
+    (cell_width, cell_height): CellSize,
+) {
     if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
         return;
     }
     let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-        2 * CELL_WIDTH
+        2 * cell_width
     } else {
-        CELL_WIDTH
+        cell_width
     };
 
-    let mut fg = resolve(cell.fg, colors).unwrap_or(DEFAULT_FG);
-    let mut bg = resolve(cell.bg, colors);
+    let mut fg = resolve(cell.fg, colors, palette).unwrap_or(palette.foreground);
+    let mut bg = resolve(cell.bg, colors, palette);
     if cell.flags.contains(Flags::INVERSE) {
-        (fg, bg) = (bg.unwrap_or(DEFAULT_BG), Some(fg));
+        (fg, bg) = (bg.unwrap_or(palette.background), Some(fg));
     }
     if cell.flags.contains(Flags::DIM) {
         fg = fg.map(|c| c / 2);
     }
     if let Some(bg) = bg {
-        image.fill(x, y, width, CELL_HEIGHT, bg, 0xff);
+        image.fill(x, y, width, cell_height, bg, 0xff);
     }
     if cell.flags.contains(Flags::HIDDEN) || cell.c.is_whitespace() || cell.c.is_control() {
         return;
@@ -94,31 +129,44 @@ fn draw_cell(image: &mut Image, cell: &Cell, colors: &Colors, x: usize, y: usize
 
     if let Some(dots) = braille(cell.c) {
         // Braille is a 2x4 grid of dots; btop draws its graphs with it.
+        let (dot_w, dot_h) = ((cell_width / 4).max(1), (cell_height / 8).max(1));
         for (bit, (dx, dy)) in BRAILLE_DOTS.iter().enumerate() {
             if dots & (1 << bit) != 0 {
-                image.fill(x + 1 + dx * 4, y + 1 + dy * 4, 2, 2, fg, 0xff);
+                let dot_x = x + cell_width / 8 + dx * cell_width / 2;
+                let dot_y = y + cell_height / 16 + dy * cell_height / 4;
+                image.fill(dot_x, dot_y, dot_w, dot_h, fg, 0xff);
             }
         }
     } else if let Some(glyph) = glyph(cell.c) {
-        // Stretch the 8x8 bitmap to fill the cell. Bit 0 is the leftmost pixel.
-        // Strokes are drawn a pixel wider than the font has them: one-pixel
-        // vertical lines vanish when the terminal shrinks the image.
-        let sx = width / 8;
-        let sy = CELL_HEIGHT / 8;
-        for (gy, bits) in glyph.iter().enumerate() {
-            for gx in 0..8 {
-                if bits & (1 << gx) != 0 {
-                    let w = (sx + 1).min(width - gx * sx);
-                    image.fill(x + gx * sx, y + gy * sy, w, sy, fg, 0xff);
+        // Stretch the 8x8 bitmap across the cell (bit 0 is the leftmost
+        // pixel), so lines run on unbroken into the next cell whatever its
+        // width. Text keeps whole-pixel rows, centred, so letters keep
+        // their shape; box drawing and blocks fill the full height so
+        // vertical lines join up. Strokes stay as thin as the font has
+        // them: the terminal draws its own text thin and anti-aliased, and
+        // anything heavier reads as a brighter color when the overview
+        // hands back to live text.
+        let full_height = matches!(cell.c, '\u{2500}'..='\u{259f}');
+        let (top, height) = if full_height {
+            (y, cell_height)
+        } else {
+            let rows = 8 * (cell_height / 8).max(1);
+            (y + (cell_height - rows) / 2, rows)
+        };
+        for py in 0..height {
+            let bits = glyph[py * 8 / height];
+            for px in 0..width {
+                if bits & (1 << (px * 8 / width)) != 0 {
+                    image.fill(x + px, top + py, 1, 1, fg, 0xff);
                 }
             }
         }
     } else {
         image.fill(
             x + 1,
-            y + 5,
+            y + cell_height * 5 / 16,
             width - 2,
-            CELL_HEIGHT - 8,
+            cell_height / 2,
             fg,
             UNKNOWN_GLYPH_ALPHA,
         );
@@ -153,8 +201,9 @@ fn glyph(c: char) -> Option<[u8; 8]> {
         .or_else(|| font8x8::HIRAGANA_FONTS.get(c))
 }
 
-/// The RGB for a cell color, or None for the default background.
-fn resolve(color: TermColor, colors: &Colors) -> Option<[u8; 3]> {
+/// The RGB for a cell color, or None for the default background. Colors
+/// the program set itself (OSC 4/10/11) win over the palette.
+fn resolve(color: TermColor, colors: &Colors, palette: &Palette) -> Option<Rgb> {
     let idx = match color {
         TermColor::Spec(c) => return Some([c.r, c.g, c.b]),
         TermColor::Indexed(i) => usize::from(i),
@@ -165,47 +214,14 @@ fn resolve(color: TermColor, colors: &Colors) -> Option<[u8; 3]> {
     }
     match color {
         TermColor::Named(NamedColor::Background) => None,
-        TermColor::Named(n) if (n as usize) < 16 => Some(xterm_color(n as u8)),
+        TermColor::Named(n) if (n as usize) < 16 => Some(palette.indexed(n as u8)),
         TermColor::Named(n) if (NamedColor::DimBlack..=NamedColor::DimWhite).contains(&n) => {
-            Some(xterm_color((n as usize - NamedColor::DimBlack as usize) as u8).map(|c| c / 2))
+            let base = (n as usize - NamedColor::DimBlack as usize) as u8;
+            Some(palette.indexed(base).map(|c| c / 2))
         }
-        TermColor::Named(_) => Some(DEFAULT_FG),
-        TermColor::Indexed(i) => Some(xterm_color(i)),
+        TermColor::Named(_) => Some(palette.foreground),
+        TermColor::Indexed(i) => Some(palette.indexed(i)),
         TermColor::Spec(_) => unreachable!(),
-    }
-}
-
-/// xterm's default 256-color palette.
-fn xterm_color(i: u8) -> [u8; 3] {
-    const ANSI: [[u8; 3]; 16] = [
-        [0x00, 0x00, 0x00],
-        [0xcd, 0x00, 0x00],
-        [0x00, 0xcd, 0x00],
-        [0xcd, 0xcd, 0x00],
-        [0x00, 0x00, 0xee],
-        [0xcd, 0x00, 0xcd],
-        [0x00, 0xcd, 0xcd],
-        [0xe5, 0xe5, 0xe5],
-        [0x7f, 0x7f, 0x7f],
-        [0xff, 0x00, 0x00],
-        [0x00, 0xff, 0x00],
-        [0xff, 0xff, 0x00],
-        [0x5c, 0x5c, 0xff],
-        [0xff, 0x00, 0xff],
-        [0x00, 0xff, 0xff],
-        [0xff, 0xff, 0xff],
-    ];
-    match i {
-        0..16 => ANSI[usize::from(i)],
-        16..232 => {
-            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-            let i = i - 16;
-            [level(i / 36), level(i / 6 % 6), level(i % 6)]
-        }
-        232.. => {
-            let v = 8 + (i - 232) * 10;
-            [v, v, v]
-        }
     }
 }
 
@@ -224,6 +240,51 @@ mod tests {
         term
     }
 
+    fn rasterize_default<T>(term: &Term<T>) -> Image {
+        rasterize(term, &Palette::default(), DEFAULT_CELL)
+    }
+
+    #[test]
+    fn cells_take_the_terminals_exact_shape() {
+        assert_eq!(cell_size_for(None), (8, 16));
+        assert_eq!(cell_size_for(Some((18, 40))), (9, 20));
+        assert_eq!(cell_size_for(Some((16, 34))), (8, 17));
+        assert_eq!(cell_size_for(Some((10, 10))), (8, 8));
+        assert_eq!(cell_size_for(Some((17, 41))), (17, 41));
+        assert_eq!(cell_size_for(Some((6, 13))), (12, 26));
+        assert_eq!(cell_size_for(Some((0, 20))), (8, 16));
+        let image = rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20));
+        assert_eq!((image.width, image.height), (27, 40));
+    }
+
+    #[test]
+    fn lines_run_unbroken_across_wider_cells() {
+        // A horizontal line in a 9-pixel cell covers all 9 columns.
+        let image = rasterize(
+            &term_with(2, 1, "\u{2500}\u{2500}".as_bytes()),
+            &Palette::default(),
+            (9, 20),
+        );
+        let lit = (0..18)
+            .filter(|&x| (0..20).any(|y| pixel(&image, x, y)[3] == 0xff))
+            .count();
+        assert_eq!(lit, 18);
+    }
+
+    #[test]
+    fn draws_in_the_terminals_own_colors() {
+        let reported = crate::colors::ReportedColors {
+            foreground: Some([1, 2, 3]),
+            ..Default::default()
+        };
+        let image = rasterize(
+            &term_with(1, 1, b"L"),
+            &Palette::from_reported(&reported),
+            DEFAULT_CELL,
+        );
+        assert_eq!(pixel(&image, 0, 0), [1, 2, 3, 0xff]);
+    }
+
     fn pixel(image: &Image, x: usize, y: usize) -> [u8; 4] {
         let i = (y * image.width as usize + x) * 4;
         image.rgba[i..i + 4].try_into().unwrap()
@@ -231,7 +292,7 @@ mod tests {
 
     #[test]
     fn image_is_eight_by_sixteen_pixels_per_cell() {
-        let image = rasterize(&term_with(10, 3, b""));
+        let image = rasterize_default(&term_with(10, 3, b""));
         assert_eq!((image.width, image.height), (80, 48));
         assert!(
             image.rgba.iter().all(|&b| b == 0),
@@ -242,7 +303,7 @@ mod tests {
     #[test]
     fn draws_glyphs_left_to_right_in_their_color() {
         // 'L' has its stem on the left and its foot along the bottom.
-        let image = rasterize(&term_with(2, 1, b"\x1b[31mL"));
+        let image = rasterize_default(&term_with(2, 1, b"\x1b[31mL"));
         let red = [0xcd, 0x00, 0x00, 0xff];
         assert_eq!(pixel(&image, 0, 0), red);
         assert_eq!(pixel(&image, 6, 12), red);
@@ -250,15 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn vertical_lines_are_thick_enough_to_survive_scaling() {
-        let image = rasterize(&term_with(1, 1, "\u{2502}".as_bytes()));
+    fn strokes_are_as_thin_as_the_font() {
+        // The font's vertical line is a single pixel column.
+        let image = rasterize_default(&term_with(1, 1, "\u{2502}".as_bytes()));
         let row: Vec<u8> = (0..8).map(|x| pixel(&image, x, 8)[3]).collect();
-        assert!(row.iter().filter(|&&a| a == 0xff).count() >= 2, "{row:?}");
+        assert_eq!(row.iter().filter(|&&a| a == 0xff).count(), 1, "{row:?}");
     }
 
     #[test]
     fn backgrounds_fill_the_cell_and_default_stays_clear() {
-        let image = rasterize(&term_with(2, 1, b"\x1b[48;2;1;2;3m \x1b[0m "));
+        let image = rasterize_default(&term_with(2, 1, b"\x1b[48;2;1;2;3m \x1b[0m "));
         assert_eq!(pixel(&image, 3, 8), [1, 2, 3, 0xff]);
         assert_eq!(pixel(&image, 11, 8)[3], 0);
     }
@@ -266,17 +328,9 @@ mod tests {
     #[test]
     fn braille_dots_land_in_the_right_corners() {
         // U+2801 is dot 1 (top left); U+2880 is dot 8 (bottom right).
-        let image = rasterize(&term_with(2, 1, "\u{2801}\u{2880}".as_bytes()));
+        let image = rasterize_default(&term_with(2, 1, "\u{2801}\u{2880}".as_bytes()));
         assert_eq!(pixel(&image, 1, 1)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 5, 13)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 1, 1)[3], 0);
-    }
-
-    #[test]
-    fn xterm_palette_spot_checks() {
-        assert_eq!(xterm_color(16), [0, 0, 0]);
-        assert_eq!(xterm_color(196), [0xff, 0, 0]);
-        assert_eq!(xterm_color(231), [0xff, 0xff, 0xff]);
-        assert_eq!(xterm_color(255), [0xee, 0xee, 0xee]);
     }
 }

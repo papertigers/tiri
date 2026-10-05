@@ -166,13 +166,18 @@ impl Renderer {
         self.prev = None;
     }
 
+    /// Draws `frame` as a diff against the last one. `escapes` (graphics
+    /// commands and the like) go out inside the same synchronized update,
+    /// so the terminal shows them and the frame's cells together.
     pub fn draw(
         &mut self,
         out: &mut impl Write,
+        escapes: &[u8],
         frame: Frame,
         cursor_at: Option<(u16, u16)>,
     ) -> io::Result<()> {
         out.queue(terminal::BeginSynchronizedUpdate)?;
+        out.write_all(escapes)?;
         out.queue(cursor::Hide)?;
 
         let prev = self
@@ -348,7 +353,7 @@ mod tests {
 
             let expected: Vec<String> = frame.cells.iter().map(|c| c.sym.clone()).collect();
             let mut out = Vec::new();
-            renderer.draw(&mut out, frame, None).unwrap();
+            renderer.draw(&mut out, &[], frame, None).unwrap();
             parser.advance(&mut term, &out);
 
             for y in 0..H {

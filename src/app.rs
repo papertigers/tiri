@@ -18,11 +18,12 @@ use crossterm::event::{
 };
 use polling::{Event as PollEvent, Poller};
 
+use crate::colors::Palette;
 use crate::input::{encode_key, encode_mouse};
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
 use crate::pane::Pane;
-use crate::protocol::{Target, WorkspaceInfo};
+use crate::protocol::{Hello, Target, WorkspaceInfo};
 use crate::render::{Color, Frame, Renderer, Style};
 use crate::selection::{self, Point, Selection};
 use crate::thumbnail;
@@ -132,6 +133,11 @@ pub struct Client {
     height: u16,
     /// Where panes this client opens start.
     cwd: PathBuf,
+    /// Its terminal's colors, for its thumbnails and for answering
+    /// programs that ask.
+    palette: Palette,
+    /// Its thumbnails' cell size, the same shape as its terminal's cells.
+    thumbnail_cell: thumbnail::CellSize,
     /// Set when the client asks to detach; the server then lets it go.
     detach_requested: bool,
     prefix_pending: bool,
@@ -181,6 +187,15 @@ impl Client {
         self.detach_requested
     }
 
+    /// Its terminal's cells changed shape: redraw its thumbnails to match.
+    pub fn set_cell_pixels(&mut self, cell_pixels: Option<(u16, u16)>) {
+        let cell = thumbnail::cell_size_for(cell_pixels);
+        if cell != self.thumbnail_cell {
+            self.thumbnail_cell = cell;
+            self.clear_thumbnails();
+        }
+    }
+
     /// Escape sequences to write before drawing the next frame.
     pub fn take_escapes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.escapes)
@@ -224,14 +239,16 @@ impl Client {
         }
     }
 
-    /// Sends `frame` to this client's terminal, as a diff against the last.
+    /// Sends `frame` to this client's terminal, as a diff against the last,
+    /// along with any pending escape sequences.
     pub fn render(
         &mut self,
         out: &mut impl Write,
         frame: Frame,
         cursor: Option<(u16, u16)>,
     ) -> io::Result<()> {
-        self.renderer.draw(out, frame, cursor)
+        let escapes = std::mem::take(&mut self.escapes);
+        self.renderer.draw(out, &escapes, frame, cursor)
     }
 
     fn clear_thumbnails(&mut self) {
@@ -252,8 +269,10 @@ impl Client {
         });
     }
 
-    /// Uploads a thumbnail of `id` sized `size` cells if there's none yet, it
-    /// changed size, or the pane changed and the last upload isn't too recent.
+    /// Keeps `id`'s thumbnail current: uploads the image if there's none yet
+    /// or the pane changed (at most every [`THUMBNAIL_INTERVAL`]), and sizes
+    /// its placement to `size` cells. Placing is cheap, so it follows the
+    /// zoom animation frame by frame.
     fn refresh_thumbnail(
         &mut self,
         panes: &HashMap<PaneId, Pane>,
@@ -264,27 +283,28 @@ impl Client {
         let Some(pane) = panes.get(&id) else {
             return;
         };
+        let image_id = THUMBNAIL_ID_BASE + id.0;
         let generation = pane.generation();
-        let fresh = self.thumbnails.get(&id).is_some_and(|t| {
-            t.size == size && (t.generation == generation || now < t.uploaded + THUMBNAIL_INTERVAL)
-        });
-        if fresh {
-            return;
+        let current = self.thumbnails.get(&id);
+        let stale = current
+            .is_none_or(|t| t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL);
+        let (generation, uploaded) = if stale {
+            let image = thumbnail::rasterize(pane.term(), &self.palette, self.thumbnail_cell);
+            kitty::transmit(&mut self.escapes, image_id, &image);
+            (generation, now)
+        } else {
+            let t = current.expect("not stale, so present");
+            (t.generation, t.uploaded)
+        };
+        if stale || current.is_some_and(|t| t.size != size) {
+            kitty::place(&mut self.escapes, image_id, size.0, size.1);
         }
-        let image = thumbnail::rasterize(pane.term());
-        kitty::upload(
-            &mut self.escapes,
-            THUMBNAIL_ID_BASE + id.0,
-            &image,
-            size.0,
-            size.1,
-        );
         self.thumbnails.insert(
             id,
             Thumbnail {
                 size,
                 generation,
-                uploaded: now,
+                uploaded,
             },
         );
     }
@@ -334,15 +354,17 @@ impl App {
 
     /// Attaches a terminal of the given size to `target`. A new workspace,
     /// or a server with no panes yet, starts with a shell in `cwd`.
-    pub fn attach(
-        &mut self,
-        width: u16,
-        height: u16,
-        target: &Target,
-        cwd: PathBuf,
-        kitty_overview: bool,
-    ) -> Result<Client> {
-        let workspace = match target {
+    pub fn attach(&mut self, hello: Hello) -> Result<Client> {
+        let Hello {
+            width,
+            height,
+            target,
+            cwd,
+            kitty_overview,
+            colors,
+            cell_pixels,
+        } = hello;
+        let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
                 Some(idx) => Some(idx),
@@ -367,6 +389,8 @@ impl App {
             width,
             height,
             cwd,
+            palette: Palette::from_reported(&colors),
+            thumbnail_cell: thumbnail::cell_size_for(cell_pixels),
             detach_requested: false,
             prefix_pending: false,
             kitty_overview,
@@ -430,7 +454,8 @@ impl App {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         // Width isn't known until it's in the strip, so start narrow and fix it below.
-        let pane = Pane::spawn(self.pane_rows(), 1, &client.cwd)?;
+        let mut pane = Pane::spawn(self.pane_rows(), 1, &client.cwd)?;
+        pane.set_palette(client.palette);
         // SAFETY: the pane is deleted from the poller in `pane_exited` or
         // `shutdown`, before it's dropped and its PTY closed.
         unsafe {
@@ -451,6 +476,12 @@ impl App {
         let size = (client.width, client.height);
         if self.size_owner == Some(client.id) && self.layout_size == size {
             return;
+        }
+        if self.size_owner != Some(client.id) {
+            // Programs asking about colors get this terminal's now.
+            for pane in self.panes.values_mut() {
+                pane.set_palette(client.palette);
+            }
         }
         self.size_owner = Some(client.id);
         self.layout_size = size;
@@ -555,12 +586,11 @@ impl App {
         }
     }
 
-    /// Thumbnails show once the overview has settled, since a placement's
-    /// size is fixed and the boxes change size while zooming.
+    /// Thumbnails show whenever the view is zoomed out: while the overview
+    /// zooms out, while it's open, and while it zooms back in. Live text
+    /// only returns at full size, so nothing pops in or out mid-zoom.
     fn showing_thumbnails(&self, client: &Client) -> bool {
-        client.kitty_overview
-            && self.workspaces.in_overview(client.id)
-            && !self.workspaces.is_animating(client.id)
+        client.kitty_overview && self.workspaces.zoom(client.id) < 1.0
     }
 
     /// The height of a workspace row on `client`'s screen: its whole pane
@@ -1080,7 +1110,7 @@ impl App {
                     client.refresh_thumbnail(&self.panes, id, size, now);
                 }
             }
-        } else if !(client.kitty_overview && self.workspaces.in_overview(client.id)) {
+        } else {
             client.clear_thumbnails();
         }
         let client: &Client = client;

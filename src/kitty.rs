@@ -342,15 +342,8 @@ pub fn id_color(id: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// Uploads `image` as image `id` (replacing any earlier one) and creates a
-/// virtual placement `cols` x `rows` cells big for placeholders to show.
-///
-/// The placement always gets the same id, so it replaces the previous one.
-/// Re-uploading an image keeps its placements, and an unnumbered placement
-/// is added alongside them; placeholders then use whichever the terminal
-/// finds first, which after a resize is often one with the old size.
-/// The terminal scales the image to fit.
-pub fn upload(out: &mut Vec<u8>, id: u32, image: &Image, cols: u16, rows: u16) {
+/// Uploads `image` as image `id`, replacing any earlier one.
+pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 1);
     let payload = BASE64.encode(compressed);
     // q=2 keeps the terminal from replying; replies would arrive as input.
@@ -370,6 +363,17 @@ pub fn upload(out: &mut Vec<u8>, id: u32, image: &Image, cols: u16, rows: u16) {
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
+}
+
+/// Shows image `id` through placeholders `cols` x `rows` cells big, by
+/// creating or resizing its virtual placement. The terminal scales the
+/// image to fit, so resizing every frame zooms it smoothly.
+///
+/// The placement always gets the same id, so it replaces the previous one.
+/// Re-uploading an image keeps its placements, and an unnumbered placement
+/// is added alongside them; placeholders then use whichever the terminal
+/// finds first, which after a resize is often one with the old size.
+pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
     out.extend_from_slice(
         format!("\x1b_Ga=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows},q=2\x1b\\").as_bytes(),
     );
@@ -396,10 +400,11 @@ mod tests {
     }
 
     #[test]
-    fn upload_chunks_payload_and_places() {
+    fn transmit_chunks_the_payload_then_place_shows_it() {
         let image = Image::new(64, 64);
         let mut out = Vec::new();
-        upload(&mut out, 7, &image, 10, 5);
+        transmit(&mut out, 7, &image);
+        place(&mut out, 7, 10, 5);
         let text = String::from_utf8(out).unwrap();
         let commands: Vec<&str> = text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(commands[0].starts_with("\x1b_Ga=t,f=32,o=z,s=64,v=64,i=7,q=2,m="));

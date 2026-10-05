@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use crossterm::{ExecutableCommand, cursor, event, terminal};
 
-use crate::protocol::{ClientMsg, Decoder, ExitReason, ServerMsg, Target, recv, send};
+use crate::probe::{self, TerminalInfo};
+use crate::protocol::{ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send};
 use crate::socket;
 
 /// How long to wait for a freshly started server to start listening.
@@ -22,17 +23,27 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Attaches this terminal to `target`, starting a server if none is running.
 pub fn attach(socket: &Path, target: Target) -> Result<()> {
+    let terminal_info = detect_terminal();
+    // Thumbnails if the terminal can show them, unless told otherwise.
+    let kitty_overview = match std::env::var("TIRI_KITTY_OVERVIEW").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => terminal_info.kitty_graphics,
+    };
     let mut stream = connect_or_start(socket)?;
     let (width, height) = terminal::size()?;
+    let cell_pixels = probed_cell_pixels(&terminal_info, width, height).or_else(size_cell_pixels);
     send(
         &mut stream,
-        &ClientMsg::Hello {
+        &ClientMsg::Hello(Hello {
             width,
             height,
             target,
             cwd: std::env::current_dir()?,
-            kitty_overview: std::env::var_os("TIRI_KITTY_OVERVIEW").is_some(),
-        },
+            kitty_overview,
+            colors: terminal_info.colors,
+            cell_pixels,
+        }),
     )?;
     let mut decoder = Decoder::default();
     match recv(&mut stream, &mut decoder)? {
@@ -50,7 +61,17 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         let mut writer = stream.try_clone()?;
         thread::spawn(move || {
             while let Ok(event) = event::read() {
-                if send(&mut writer, &ClientMsg::Event(event)).is_err() {
+                // A resize may come with new cell proportions, say from a
+                // font size change. Only send them when the terminal says:
+                // many, Ghostty among them, leave pixel sizes out, and the
+                // size probed at attach still stands.
+                let resized = matches!(event, event::Event::Resize(..));
+                let pixels = if resized { size_cell_pixels() } else { None };
+                if send(&mut writer, &ClientMsg::Event(event)).is_err()
+                    || pixels.is_some_and(|p| {
+                        send(&mut writer, &ClientMsg::CellPixels(Some(p))).is_err()
+                    })
+                {
                     break;
                 }
             }
@@ -62,6 +83,33 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         ExitReason::ServerExited => println!("[tiri server exited]"),
     }
     Ok(())
+}
+
+/// The cell size in pixels from the probe: the terminal's own cell size
+/// report, or its text area divided by the size in cells.
+fn probed_cell_pixels(info: &TerminalInfo, cols: u16, rows: u16) -> Option<(u16, u16)> {
+    info.cell_pixels.or_else(|| {
+        let (w, h) = info.area_pixels?;
+        (cols > 0 && rows > 0).then(|| (w / cols, h / rows))
+    })
+}
+
+/// The cell size in pixels from the terminal's size, if it includes pixels.
+fn size_cell_pixels() -> Option<(u16, u16)> {
+    let size = terminal::window_size().ok()?;
+    (size.width > 0 && size.height > 0 && size.columns > 0 && size.rows > 0)
+        .then(|| (size.width / size.columns, size.height / size.rows))
+}
+
+/// Asks this terminal what it supports and which colors it uses. Needs
+/// raw mode for a moment, so the answers aren't echoed.
+fn detect_terminal() -> TerminalInfo {
+    if terminal::enable_raw_mode().is_err() {
+        return TerminalInfo::default();
+    }
+    let info = probe::probe().unwrap_or_default();
+    let _ = terminal::disable_raw_mode();
+    info
 }
 
 /// Writes the server's output to the terminal until it says goodbye.
