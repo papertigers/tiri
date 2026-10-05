@@ -27,6 +27,11 @@ pub struct Column {
     /// Index of the focused pane in `panes`.
     focus: usize,
     preset: usize,
+    /// The width preset to go back to when un-maximizing.
+    unmaximized: Option<usize>,
+    /// A pane shown fullscreen: the column takes the whole view width and
+    /// this pane its whole height, hiding the rest of the stack.
+    fullscreen: Option<PaneId>,
 }
 
 impl Column {
@@ -35,7 +40,13 @@ impl Column {
             panes: vec![pane],
             focus: 0,
             preset: DEFAULT_PRESET,
+            unmaximized: None,
+            fullscreen: None,
         }
+    }
+
+    pub fn fullscreen(&self) -> Option<PaneId> {
+        self.fullscreen
     }
 
     pub fn panes(&self) -> &[PaneId] {
@@ -53,6 +64,8 @@ impl Column {
     /// Takes out the pane at `idx`, keeping focus on the same pane if it
     /// stays, or on its neighbor if it was the one removed.
     fn take(&mut self, idx: usize) -> PaneId {
+        // Changing the stack under a fullscreen pane ends it.
+        self.fullscreen = None;
         let pane = self.panes.remove(idx);
         if idx < self.focus || self.focus >= self.panes.len() {
             self.focus = self.focus.saturating_sub(1);
@@ -156,7 +169,12 @@ impl Strip {
     }
 
     pub fn column_width(&self, idx: usize) -> u16 {
-        let fraction = WIDTH_PRESETS[self.columns[idx].preset];
+        let column = &self.columns[idx];
+        let fraction = if column.fullscreen.is_some() {
+            1.0
+        } else {
+            WIDTH_PRESETS[column.preset]
+        };
         ((f64::from(self.view_width) * fraction).floor() as u16).max(MIN_COLUMN_WIDTH)
     }
 
@@ -229,12 +247,18 @@ impl Strip {
 
     pub fn focus_up(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
+            // Moving around a fullscreen pane's stack would mean focusing
+            // panes it hides, so that ends fullscreen.
+            col.fullscreen = None;
             col.focus = col.focus.saturating_sub(1);
         }
     }
 
     pub fn focus_down(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
+            // Moving around a fullscreen pane's stack would mean focusing
+            // panes it hides, so that ends fullscreen.
+            col.fullscreen = None;
             col.focus = (col.focus + 1).min(col.panes.len() - 1);
         }
     }
@@ -286,6 +310,7 @@ impl Strip {
         };
         let pane = self.columns[self.focus].focused();
         let target = &mut self.columns[neighbor];
+        target.fullscreen = None;
         target.panes.push(pane);
         target.focus = target.panes.len() - 1;
         // Removing our column shifts the neighbor left if it was to the right.
@@ -313,7 +338,9 @@ impl Strip {
         } else {
             self.columns.remove(right);
         }
-        self.columns[self.focus].panes.push(pane);
+        let column = &mut self.columns[self.focus];
+        column.fullscreen = None;
+        column.panes.push(pane);
         self.scroll_to_focus();
     }
 
@@ -404,6 +431,38 @@ impl Strip {
     pub fn cycle_width(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
             col.preset = (col.preset + 1) % WIDTH_PRESETS.len();
+            col.unmaximized = None;
+            self.scroll_to_focus();
+        }
+    }
+
+    /// niri's `maximize-column`: toggles the focused column between the
+    /// full view width and the width it had before.
+    pub fn toggle_maximized(&mut self) {
+        let full = WIDTH_PRESETS.len() - 1;
+        if let Some(col) = self.columns.get_mut(self.focus) {
+            match col.unmaximized.take() {
+                Some(preset) => col.preset = preset,
+                None if col.preset != full => {
+                    col.unmaximized = Some(col.preset);
+                    col.preset = full;
+                }
+                None => {}
+            }
+            self.scroll_to_focus();
+        }
+    }
+
+    /// niri's `fullscreen-window`: toggles the focused pane filling the
+    /// whole view, its column at full width and the pane alone in it.
+    pub fn toggle_fullscreen(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus) {
+            let pane = col.focused();
+            col.fullscreen = if col.fullscreen == Some(pane) {
+                None
+            } else {
+                Some(pane)
+            };
             self.scroll_to_focus();
         }
     }
@@ -815,5 +874,61 @@ mod tests {
         assert!(strip.focus_pane(PaneId(0)));
         assert_eq!(strip.focus_index(), 0);
         assert!(!strip.focus_pane(PaneId(9)));
+    }
+
+    #[test]
+    fn maximize_toggles_back_to_the_previous_width() {
+        let mut strip = strip_with(2, 120);
+        strip.cycle_width(); // 1/2 -> 2/3
+        assert_eq!(strip.column_width(1), 80);
+        strip.toggle_maximized();
+        assert_eq!(strip.column_width(1), 120);
+        strip.toggle_maximized();
+        assert_eq!(strip.column_width(1), 80);
+        // Already full: nothing to toggle back to.
+        strip.cycle_width(); // -> full
+        strip.toggle_maximized();
+        assert_eq!(strip.column_width(1), 120);
+    }
+
+    #[test]
+    fn fullscreen_widens_the_column_and_stays_with_its_pane() {
+        let mut strip = strip_with(3, 100);
+        strip.consume_or_expel_left(); // [0] [1 2], focus on 2
+        strip.toggle_fullscreen();
+        assert_eq!(strip.columns()[1].fullscreen(), Some(PaneId(2)));
+        assert_eq!(strip.column_width(1), 100);
+        // Focusing another column keeps it; coming back finds it still on.
+        strip.focus_left();
+        assert_eq!(strip.columns()[1].fullscreen(), Some(PaneId(2)));
+        strip.focus_right();
+        strip.toggle_fullscreen();
+        assert_eq!(strip.columns()[1].fullscreen(), None);
+        assert_eq!(strip.column_width(1), 50);
+    }
+
+    #[test]
+    fn fullscreen_ends_when_its_stack_changes() {
+        let mut strip = strip_with(3, 100);
+        strip.consume_or_expel_left(); // [0] [1 2]
+        strip.toggle_fullscreen();
+        strip.focus_up();
+        assert_eq!(
+            strip.columns()[1].fullscreen(),
+            None,
+            "moving within the stack"
+        );
+
+        strip.toggle_fullscreen();
+        strip.focus_first();
+        strip.consume_or_expel_right(); // pane 0 joins [1 2]
+        assert_eq!(strip.columns()[0].fullscreen(), None, "consuming into it");
+
+        strip.toggle_fullscreen();
+        strip.expel_from_column();
+        assert!(
+            strip.columns().iter().all(|c| c.fullscreen().is_none()),
+            "expelling"
+        );
     }
 }

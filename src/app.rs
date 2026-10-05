@@ -64,6 +64,8 @@ enum Action {
     ConsumeIntoColumn,
     ExpelFromColumn,
     CycleWidth,
+    ToggleMaximized,
+    ToggleFullscreen,
     Center,
     Close,
     FocusWorkspaceDown,
@@ -467,6 +469,12 @@ impl App {
                 let cols = strip.column_width(idx).saturating_sub(2).max(1);
                 let heights = split_heights(area, col.panes().len());
                 for (id, h) in col.panes().iter().zip(heights) {
+                    // A fullscreen pane has its column to itself.
+                    let h = if col.fullscreen() == Some(*id) {
+                        area
+                    } else {
+                        h
+                    };
                     if let Some(pane) = self.panes.get_mut(id) {
                         pane.resize((h - 2).max(1) as u16, cols);
                     }
@@ -615,7 +623,12 @@ impl App {
         idx: usize,
     ) -> Vec<(PaneId, i32, i32, i32, i32)> {
         let (x, mut y, w, h) = self.column_box(client, ws, idx);
-        let panes = self.workspaces.list()[ws].strip().columns()[idx].panes();
+        let column = &self.workspaces.list()[ws].strip().columns()[idx];
+        // A fullscreen pane has its column to itself; the rest are hidden.
+        if let Some(id) = column.fullscreen() {
+            return vec![(id, x, y, w, h)];
+        }
+        let panes = column.panes();
         panes
             .iter()
             .zip(split_heights(h, panes.len()))
@@ -1013,6 +1026,14 @@ impl App {
                 self.workspaces.active_mut(id).cycle_width();
                 self.resize_panes();
             }
+            Action::ToggleMaximized => {
+                self.workspaces.active_mut(id).toggle_maximized();
+                self.resize_panes();
+            }
+            Action::ToggleFullscreen => {
+                self.workspaces.active_mut(id).toggle_fullscreen();
+                self.resize_panes();
+            }
             Action::Center => self.workspaces.active_mut(id).center_focused(),
             Action::Close => {
                 if let Some(pane_id) = self.workspaces.focused(id) {
@@ -1080,11 +1101,13 @@ impl App {
             let strip = self.workspaces.list()[ws].strip();
             let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;
-            for (row, (id, x, y, w, h)) in self.pane_boxes(client, ws, idx).into_iter().enumerate()
-            {
+            for (id, x, y, w, h) in self.pane_boxes(client, ws, idx) {
                 let Some(pane) = self.panes.get(&id) else {
                     continue;
                 };
+                // Its place in the stack, even when it's alone on screen
+                // because it's fullscreen.
+                let row = column.panes().iter().position(|&p| p == id).unwrap_or(0);
                 let focused =
                     ws == active_ws && idx == strip.focus_index() && row == column.focus_index();
                 let border = if focused {
@@ -1100,6 +1123,11 @@ impl App {
                     format!("{}.{}", idx + 1, row + 1)
                 } else {
                     format!("{}", idx + 1)
+                };
+                let number = if column.fullscreen() == Some(id) {
+                    format!("{number} [fullscreen]")
+                } else {
+                    number
                 };
                 let scrolled = client.scrolled(id, pane);
                 let title = if scrolled > 0 {
@@ -1337,7 +1365,7 @@ impl App {
 
         let overview = self.workspaces.in_overview(client.id);
         let hint = if client.prefix_pending {
-            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  o overview  x close  d detach  q kill server "
+            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  f max  F full  o overview  x close  d detach  q kill server "
         } else if overview && client.kitty_overview {
             "OVERVIEW (kitty)  hjkl select  u/i workspace  HJKL/U/I move  x close  t text  ⏎/o/Esc open "
         } else if overview {
@@ -1374,6 +1402,8 @@ fn prefix_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
         KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
+        KeyCode::Char('f') => Action::ToggleMaximized,
+        KeyCode::Char('F') => Action::ToggleFullscreen,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
         KeyCode::Char('x') => Action::Close,
@@ -1413,6 +1443,8 @@ fn overview_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('n') => Action::NewColumn,
         KeyCode::Char('r') => Action::CycleWidth,
+        KeyCode::Char('f') => Action::ToggleMaximized,
+        KeyCode::Char('F') => Action::ToggleFullscreen,
         KeyCode::Char('x') => Action::Close,
         KeyCode::Char('t') => Action::ToggleThumbnails,
         KeyCode::Char('o') | KeyCode::Enter | KeyCode::Esc => Action::ExitOverview,
@@ -1448,6 +1480,8 @@ fn alt_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
         KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
+        KeyCode::Char('f') => Action::ToggleMaximized,
+        KeyCode::Char('F') => Action::ToggleFullscreen,
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
         _ => return None,
