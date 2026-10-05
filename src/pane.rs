@@ -43,6 +43,9 @@ pub struct Pane {
     /// Input for the child that the PTY hasn't accepted yet.
     outgoing: Vec<u8>,
     child: Box<dyn Child + Send + Sync>,
+    /// The child has exited and been reaped. Its pid may belong to another
+    /// process now, so it must not be signalled.
+    reaped: bool,
     title: Option<String>,
     fallback_title: String,
     /// Bumped whenever the screen may have changed.
@@ -124,6 +127,7 @@ impl Pane {
             fd,
             outgoing: Vec::new(),
             child,
+            reaped: false,
             title: None,
             fallback_title,
             generation: 0,
@@ -388,6 +392,9 @@ impl Pane {
     /// Hangs up on the child, as closing a terminal window would. Doesn't
     /// wait for it to go: see [`Self::into_child`].
     pub fn kill(&self) {
+        if self.reaped {
+            return;
+        }
         let pid = self
             .child
             .process_id()
@@ -397,9 +404,17 @@ impl Pane {
         }
     }
 
-    /// The child process, to be reaped once it has exited.
-    pub fn into_child(self) -> Box<dyn Child + Send + Sync> {
-        self.child
+    /// Whether the child (the shell) has exited, collecting its exit
+    /// status if so.
+    pub fn child_exited(&mut self) -> bool {
+        self.reaped |= matches!(self.child.try_wait(), Ok(Some(_)));
+        self.reaped
+    }
+
+    /// The child process, to be reaped once it has exited, unless it has
+    /// been already.
+    pub fn into_unreaped_child(self) -> Option<Box<dyn Child + Send + Sync>> {
+        (!self.reaped).then_some(self.child)
     }
 }
 
@@ -452,7 +467,29 @@ mod tests {
 
     fn close(pane: Pane) {
         pane.kill();
-        let _ = pane.into_child().wait();
+        if let Some(mut child) = pane.into_unreaped_child() {
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
+    fn notices_the_shell_exiting_and_then_leaves_its_pid_alone() {
+        let mut pane = pane();
+        assert!(!pane.child_exited());
+        pane.write(b"exit\r");
+        pane.flush();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        // Read its output as the server would, answering any questions the
+        // shell asks its terminal on the way out.
+        while !pane.child_exited() {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            pane.read_ready();
+            pane.flush();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Reaped: there's nothing to signal or reap again.
+        pane.kill();
+        assert!(pane.into_unreaped_child().is_none());
     }
 
     #[test]

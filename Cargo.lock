@@ -1482,6 +1482,7 @@ dependencies = [
  "ratatui-core",
  "rustix",
  "serde",
+ "signal-hook 0.4.5",
  "tachyonfx",
  "unicode-width 0.2.2",
 ]

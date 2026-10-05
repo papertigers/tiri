@@ -43,9 +43,6 @@ const MAX_HEIGHT: u16 = 500;
 /// refuse to consume more panes than fit at this height.
 const MIN_PANE_HEIGHT: i32 = 5;
 
-/// How often to check on closed panes' children until they've exited.
-const REAP_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Bounds a client's claimed terminal size, so a bogus one can't make the
 /// server allocate enormous frames and terminals.
 fn clamp_size(width: u16, height: u16) -> (u16, u16) {
@@ -230,7 +227,7 @@ impl App {
         let watched = unsafe { (self.poller).add(&pane.fd(), PollEvent::readable(id.0 as usize)) };
         if let Err(e) = watched {
             pane.kill();
-            self.exited.push(pane.into_child());
+            self.exited.extend(pane.into_unreaped_child());
             return Err(e).context("couldn't watch the new pane's pty");
         }
         self.panes.insert(id, pane);
@@ -307,6 +304,7 @@ impl App {
             pane.flush();
         }
         if event.readable && !pane.read_ready() {
+            log::debug!("pane {}: its terminal closed", id.0);
             self.close_pane(id);
         }
     }
@@ -350,7 +348,7 @@ impl App {
             // If it's still running (it may only have closed its terminal),
             // losing the terminal should end it.
             pane.kill();
-            self.exited.push(pane.into_child());
+            self.exited.extend(pane.into_unreaped_child());
         }
         self.workspaces.remove(id);
         // Whatever shared its column grows into the space.
@@ -359,15 +357,24 @@ impl App {
 
     /// Collects the exit status of closed panes' children that have gone,
     /// so they don't linger as zombies.
-    pub fn reap_exited(&mut self) {
+    fn reap_exited(&mut self) {
         self.exited
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
-    /// When to look again for closed panes' children having exited, if any
-    /// haven't yet. Nothing else would wake the server when they do.
-    pub fn reap_deadline(&self) -> Option<Instant> {
-        (!self.exited.is_empty()).then(|| Instant::now() + REAP_INTERVAL)
+    /// Some child process has exited (the server got SIGCHLD). A pane whose
+    /// shell exited closes, as a terminal window would, even if something
+    /// the shell left running still has the terminal open; and closed
+    /// panes' children are reaped.
+    pub fn children_exited(&mut self) {
+        let done: Vec<PaneId> = (self.panes.iter_mut())
+            .filter_map(|(&id, pane)| pane.child_exited().then_some(id))
+            .collect();
+        for id in done {
+            log::debug!("pane {}: its shell exited", id.0);
+            self.close_pane(id);
+        }
+        self.reap_exited();
     }
 
     pub fn shutdown(&mut self) {

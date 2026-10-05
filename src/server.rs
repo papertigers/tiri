@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::Event;
 use polling::{Event as PollEvent, Events, Poller};
+use signal_hook::consts::SIGCHLD;
 
 use crate::app::{App, Client};
 use crate::config;
@@ -22,6 +23,8 @@ use crate::protocol::{ClientMsg, Decoder, ExitReason, ServerMsg, encode};
 /// Pane PTYs are keyed by pane id, which is a u32; these sit above them.
 /// (`usize::MAX` is reserved by `polling`.)
 const LISTENER_KEY: usize = usize::MAX - 1;
+/// The pipe the SIGCHLD handler writes to.
+const SIGCHLD_KEY: usize = usize::MAX - 2;
 const CONNECTION_KEY_BASE: usize = 1 << 32;
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -214,11 +217,26 @@ fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
     // SAFETY: deleted from the poller before `serve` returns.
     unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY)) }
         .context("couldn't watch the socket")?;
+
+    // A pane's shell exiting is a SIGCHLD; the handler writes to this pipe,
+    // which the poller watches along with everything else.
+    let (sigchld, sigchld_writer) = UnixStream::pair().context("couldn't make a signal pipe")?;
+    sigchld
+        .set_nonblocking(true)
+        .context("couldn't make the signal pipe non-blocking")?;
+    let handler = signal_hook::low_level::pipe::register(SIGCHLD, sigchld_writer)
+        .context("couldn't watch for exiting shells")?;
+    // SAFETY: deleted from the poller before `serve` returns.
+    unsafe { poller.add(&sigchld, PollEvent::readable(SIGCHLD_KEY)) }
+        .context("couldn't watch the signal pipe")?;
+
     let mut app = App::new(Arc::clone(&poller), config_path);
     let mut connections = HashMap::new();
-    let result = event_loop(listener, &poller, &mut app, &mut connections);
+    let result = event_loop(listener, &sigchld, &poller, &mut app, &mut connections);
     // However the loop ended, panes are killed and clients told.
     shut_down(&mut app, &poller, std::mem::take(&mut connections));
+    let _ = poller.delete(&sigchld);
+    signal_hook::low_level::unregister(handler);
     let _ = poller.delete(listener);
     result
 }
@@ -226,6 +244,7 @@ fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
 /// Runs until the server should stop: asked to, or out of panes.
 fn event_loop(
     listener: &UnixListener,
+    sigchld: &UnixStream,
     poller: &Poller,
     app: &mut App,
     connections: &mut HashMap<usize, Connection>,
@@ -233,6 +252,7 @@ fn event_loop(
     let now = Instant::now();
     let mut server = Server {
         listener,
+        sigchld,
         poller,
         app,
         connections,
@@ -262,6 +282,8 @@ fn event_loop(
 /// The event loop's state between turns.
 struct Server<'a> {
     listener: &'a UnixListener,
+    /// Readable when a child process has exited.
+    sigchld: &'a UnixStream,
     poller: &'a Poller,
     app: &'a mut App,
     connections: &'a mut HashMap<usize, Connection>,
@@ -290,8 +312,8 @@ impl Server<'_> {
         }
 
         // Wake for the next animation frame, a pane or thumbnail deadline,
-        // accepting again, reaping closed panes, or giving up on a first
-        // client that never came; otherwise only for I/O.
+        // accepting again, or giving up on a first client that never came;
+        // otherwise only for I/O and exiting children.
         let client_deadlines = (self.connections.values())
             .filter(|c| c.wants_frames())
             .filter_map(|c| c.client.as_ref())
@@ -300,7 +322,6 @@ impl Server<'_> {
             self.animating.then(|| self.last_draw + FRAME),
             (!self.had_panes).then_some(self.started + STARTUP_GRACE),
             self.accept_paused_until,
-            self.app.reap_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -314,6 +335,9 @@ impl Server<'_> {
                 .modify(self.listener, PollEvent::readable(LISTENER_KEY))
                 .context("couldn't watch the socket")?;
         }
+        (self.poller)
+            .modify(self.sigchld, PollEvent::readable(SIGCHLD_KEY))
+            .context("couldn't watch the signal pipe")?;
         for (&key, connection) in self.connections.iter_mut() {
             // After end of input a socket stays readable, to no purpose.
             let interest = PollEvent::new(key, !connection.eof, !connection.outgoing.is_empty());
@@ -346,6 +370,13 @@ impl Server<'_> {
                         log::warn!("couldn't accept a connection: {e}");
                         self.accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     }
+                }
+                SIGCHLD_KEY => {
+                    // Several signals may be pending as one wakeup; one look
+                    // at every child covers them all.
+                    let mut buf = [0u8; 64];
+                    while matches!((&*self.sigchld).read(&mut buf), Ok(n) if n > 0) {}
+                    self.app.children_exited();
                 }
                 key if key >= CONNECTION_KEY_BASE => {
                     if let Some(connection) = self.connections.get_mut(&key) {
@@ -396,7 +427,6 @@ impl Server<'_> {
                 client.copy(&text);
             }
         }
-        self.app.reap_exited();
     }
 
     /// Whether the server is done: asked to stop, out of panes, or never
@@ -434,6 +464,8 @@ impl Server<'_> {
         let changed = self.events.is_empty()
             || self.events.iter().any(|event| match event.key {
                 LISTENER_KEY => false,
+                // A shell exiting closes its pane.
+                SIGCHLD_KEY => true,
                 key if key >= CONNECTION_KEY_BASE => event.readable,
                 _ => true,
             });
