@@ -18,7 +18,6 @@ use crossterm::{ExecutableCommand, cursor, event, terminal};
 use polling::{Events, Poller};
 
 use app::App;
-use render::Renderer;
 
 const FRAME: Duration = Duration::from_millis(16);
 
@@ -46,8 +45,9 @@ fn run() -> Result<()> {
     let (width, height) = terminal::size()?;
     // Each argument names a workspace to start with.
     let names: Vec<String> = std::env::args().skip(1).collect();
-    let mut app = App::new(width, height, &names, Arc::clone(&poller))?;
-    let mut renderer = Renderer::default();
+    let mut app = App::new(&names, Arc::clone(&poller));
+    // This terminal is, for now, the one and only client.
+    let mut client = app.attach(width, height)?;
     let mut stdout = io::stdout().lock();
     let mut events = Events::new();
     let mut animating = false;
@@ -58,7 +58,7 @@ fn run() -> Result<()> {
         // update times out, whichever is sooner; otherwise only for I/O.
         let deadline = [
             animating.then(|| Instant::now() + FRAME),
-            app.next_deadline(),
+            app.next_deadline(&client),
         ]
         .into_iter()
         .flatten()
@@ -79,12 +79,9 @@ fn run() -> Result<()> {
         }
         loop {
             match input.try_recv() {
-                Ok(event::Event::Key(key)) => app.key(key)?,
-                Ok(event::Event::Paste(text)) => app.paste(&text),
-                Ok(event::Event::Resize(w, h)) => {
-                    app.resize(w, h);
-                    renderer.invalidate();
-                }
+                Ok(event::Event::Key(key)) => app.key(&mut client, key)?,
+                Ok(event::Event::Paste(text)) => app.paste(&client, &text),
+                Ok(event::Event::Resize(w, h)) => app.resize(&mut client, w, h),
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break 'main,
@@ -105,13 +102,14 @@ fn run() -> Result<()> {
         last_tick = now;
         animating = app.tick(dt.max(Duration::from_millis(1)));
 
-        let (frame, cursor) = app.draw();
-        stdout.write_all(&app.take_graphics())?;
-        renderer.draw(&mut stdout, frame, cursor)?;
+        let (frame, cursor) = app.draw(&mut client);
+        stdout.write_all(&client.take_graphics())?;
+        client.render(&mut stdout, frame, cursor)?;
     }
 
+    app.detach(&mut client);
     app.shutdown();
-    stdout.write_all(&app.take_graphics())?;
+    stdout.write_all(&client.take_graphics())?;
     stdout.flush()?;
     Ok(())
 }

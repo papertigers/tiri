@@ -1,6 +1,10 @@
-//! Application state: the workspaces, their panes, keybindings, and drawing.
+//! Application state, split in two: [`App`] holds what every attached
+//! client shares (the panes and the workspaces), and [`Client`] holds one
+//! terminal's own state (its size, its drawing, and its view of the
+//! workspaces). Keybindings and drawing act on behalf of a client.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,9 +19,9 @@ use crate::input::encode_key;
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
 use crate::pane::Pane;
-use crate::render::{Color, Frame, Style};
+use crate::render::{Color, Frame, Renderer, Style};
 use crate::thumbnail;
-use crate::workspace::Workspaces;
+use crate::workspace::{ClientId, Workspaces};
 
 /// The prefix key, tmux-style: Ctrl-a, then a command key.
 const PREFIX: char = 'a';
@@ -67,7 +71,7 @@ enum Action {
     Quit,
 }
 
-/// An overview thumbnail uploaded to the outer terminal.
+/// An overview thumbnail uploaded to a client's terminal.
 struct Thumbnail {
     /// Placement size in cells.
     size: (u16, u16),
@@ -76,171 +80,37 @@ struct Thumbnail {
     uploaded: Instant,
 }
 
-pub struct App {
-    workspaces: Workspaces,
-    panes: HashMap<PaneId, Pane>,
-    next_id: u32,
-    /// Watches every pane's PTY; panes are keyed by their id.
-    poller: Arc<Poller>,
+/// One attached terminal: its size, its prefix-key and overview settings,
+/// the thumbnails uploaded to it, and the renderer that remembers what it
+/// was last sent.
+pub struct Client {
+    id: ClientId,
     width: u16,
     height: u16,
     prefix_pending: bool,
-    /// Whether the overview shows kitty graphics thumbnails instead of text.
+    /// Whether this client's overview shows kitty graphics thumbnails
+    /// instead of text.
     kitty_overview: bool,
     thumbnails: HashMap<PaneId, Thumbnail>,
     /// Graphics protocol commands to send before the next frame.
     graphics: Vec<u8>,
-    pub quit: bool,
+    renderer: Renderer,
 }
 
-impl App {
-    /// Starts with a named workspace for each of `names` (plus the usual
-    /// empty one), and a shell in the first.
-    pub fn new(width: u16, height: u16, names: &[String], poller: Arc<Poller>) -> Result<Self> {
-        let mut app = Self {
-            workspaces: Workspaces::new(width, names),
-            panes: HashMap::new(),
-            next_id: 0,
-            poller,
-            width,
-            height,
-            prefix_pending: false,
-            kitty_overview: std::env::var_os("TIRI_KITTY_OVERVIEW").is_some(),
-            thumbnails: HashMap::new(),
-            graphics: Vec::new(),
-            quit: false,
-        };
-        app.open_column()?;
-        Ok(app)
-    }
-
-    /// True once every pane in every workspace has gone.
-    pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
-    }
-
-    /// Advances the scroll, slide and zoom animations. Returns true while
-    /// anything still moves.
-    pub fn tick(&mut self, dt: Duration) -> bool {
-        self.workspaces.tick(dt)
-    }
-
-    fn pane_rows(&self) -> u16 {
-        self.height.saturating_sub(STATUS_HEIGHT + 2).max(1)
-    }
-
-    fn open_column(&mut self) -> Result<()> {
-        let id = PaneId(self.next_id);
-        self.next_id += 1;
-        // Width isn't known until it's in the strip, so start narrow and fix it below.
-        let pane = Pane::spawn(self.pane_rows(), 1)?;
-        // SAFETY: the pane is deleted from the poller in `pane_exited` or
-        // `shutdown`, before it's dropped and its PTY closed.
-        unsafe {
-            self.poller
-                .add(pane.fd().as_raw_fd(), PollEvent::readable(id.0 as usize))
-        }
-        .context("failed to watch the new pane's pty")?;
-        self.panes.insert(id, pane);
-        self.workspaces.insert(id);
-        self.resize_panes();
-        Ok(())
-    }
-
-    /// Brings every pane's PTY size in line with its share of its column.
-    fn resize_panes(&mut self) {
-        let area = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
-        self.workspaces
-            .set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
-        for workspace in self.workspaces.list() {
-            let strip = workspace.strip();
-            for (idx, col) in strip.columns().iter().enumerate() {
-                let cols = strip.column_width(idx).saturating_sub(2).max(1);
-                let heights = split_heights(area, col.panes().len());
-                for (id, h) in col.panes().iter().zip(heights) {
-                    if let Some(pane) = self.panes.get_mut(id) {
-                        pane.resize((h - 2).max(1) as u16, cols);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn resize(&mut self, width: u16, height: u16) {
-        self.width = width;
-        self.height = height;
-        self.workspaces.set_view_width(width);
-        self.resize_panes();
-    }
-
-    /// Handles a pane's PTY becoming readable or writable.
-    pub fn pane_ready(&mut self, event: PollEvent) {
-        let id = PaneId(event.key as u32);
-        let Some(pane) = self.panes.get_mut(&id) else {
-            return;
-        };
-        if event.writable {
-            pane.flush();
-        }
-        if event.readable && !pane.read_ready() {
-            self.pane_exited(id);
-        }
-    }
-
-    /// Re-arms every pane's PTY with the poller, which reports each one only
-    /// once per arming. Panes with queued input also wait to be writable.
-    pub fn arm_panes(&self) {
-        for (id, pane) in &self.panes {
-            let interest = PollEvent::new(id.0 as usize, true, pane.wants_write());
-            // A failure means the PTY is gone, which reading will report.
-            let _ = self.poller.modify(pane.fd(), interest);
-        }
-    }
-
-    /// The next time something needs doing without any input: a pane's
-    /// synchronized update timing out, or a thumbnail due for a redraw.
-    pub fn next_deadline(&self) -> Option<Instant> {
-        let stale_thumbnails = self.thumbnails.iter().filter_map(|(id, thumb)| {
-            let pane = self.panes.get(id)?;
-            (pane.generation() != thumb.generation).then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
-        });
-        self.panes
-            .values()
-            .filter_map(Pane::sync_deadline)
-            .chain(stale_thumbnails)
-            .min()
-    }
-
+impl Client {
     /// Graphics commands to write before drawing the next frame.
     pub fn take_graphics(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.graphics)
     }
 
-    pub fn expire_syncs(&mut self, now: Instant) {
-        for pane in self.panes.values_mut() {
-            pane.expire_sync(now);
-        }
-    }
-
-    pub fn pane_exited(&mut self, id: PaneId) {
-        if let Some(mut pane) = self.panes.remove(&id) {
-            let _ = self.poller.delete(pane.fd());
-            pane.reap();
-        }
-        if self.thumbnails.remove(&id).is_some() {
-            kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
-        }
-        self.workspaces.remove(id);
-        // Whatever shared its column grows into the space.
-        self.resize_panes();
-    }
-
-    pub fn shutdown(&mut self) {
-        for pane in self.panes.values_mut() {
-            let _ = self.poller.delete(pane.fd());
-            pane.kill();
-        }
-        self.clear_thumbnails();
+    /// Sends `frame` to this client's terminal, as a diff against the last.
+    pub fn render(
+        &mut self,
+        out: &mut impl Write,
+        frame: Frame,
+        cursor: Option<(u16, u16)>,
+    ) -> io::Result<()> {
+        self.renderer.draw(out, frame, cursor)
     }
 
     fn clear_thumbnails(&mut self) {
@@ -249,16 +119,28 @@ impl App {
         }
     }
 
-    /// Thumbnails show once the overview has settled, since a placement's
-    /// size is fixed and the boxes change size while zooming.
-    fn showing_thumbnails(&self) -> bool {
-        self.kitty_overview && self.workspaces.in_overview() && !self.workspaces.is_animating()
+    /// Frees the thumbnails of panes that have since closed.
+    fn forget_closed_thumbnails(&mut self, panes: &HashMap<PaneId, Pane>) {
+        let graphics = &mut self.graphics;
+        self.thumbnails.retain(|id, _| {
+            let open = panes.contains_key(id);
+            if !open {
+                kitty::delete(graphics, THUMBNAIL_ID_BASE + id.0);
+            }
+            open
+        });
     }
 
     /// Uploads a thumbnail of `id` sized `size` cells if there's none yet, it
     /// changed size, or the pane changed and the last upload isn't too recent.
-    fn refresh_thumbnail(&mut self, id: PaneId, size: (u16, u16), now: Instant) {
-        let Some(pane) = self.panes.get(&id) else {
+    fn refresh_thumbnail(
+        &mut self,
+        panes: &HashMap<PaneId, Pane>,
+        id: PaneId,
+        size: (u16, u16),
+        now: Instant,
+    ) {
+        let Some(pane) = panes.get(&id) else {
             return;
         };
         let generation = pane.generation();
@@ -286,58 +168,287 @@ impl App {
         );
     }
 
+    /// The inner size of a pane's box in cells, as a thumbnail placement.
+    fn thumbnail_size(w: i32, h: i32) -> (u16, u16) {
+        let clamp = |n: i32| (n.max(1) as u16).min(kitty::MAX_CELLS);
+        (clamp(w - 2), clamp(h - 2))
+    }
+
     fn area_height(&self) -> i32 {
         i32::from(self.height.saturating_sub(STATUS_HEIGHT))
     }
+}
 
-    /// The height of a workspace row on screen: the whole pane area, or less
-    /// as the overview zooms out.
-    fn row_height(&self) -> i32 {
-        let area = self.area_height();
-        ((f64::from(area) * self.workspaces.zoom()).round() as i32).clamp(area.min(3), area)
+/// What every client shares: the panes, the workspaces and their columns.
+pub struct App {
+    workspaces: Workspaces,
+    panes: HashMap<PaneId, Pane>,
+    next_pane: u32,
+    next_client: u32,
+    /// Watches every pane's PTY; panes are keyed by their id.
+    poller: Arc<Poller>,
+    /// The terminal size panes are laid out for: that of the client most
+    /// recently used, recorded in `size_owner`.
+    layout_size: (u16, u16),
+    size_owner: Option<ClientId>,
+    pub quit: bool,
+}
+
+impl App {
+    /// Starts with a named workspace for each of `names` (plus the usual
+    /// empty one). The first client to attach gets a shell.
+    pub fn new(names: &[String], poller: Arc<Poller>) -> Self {
+        let layout_size = (80, 24);
+        Self {
+            workspaces: Workspaces::new(layout_size.0, names),
+            panes: HashMap::new(),
+            next_pane: 0,
+            next_client: 0,
+            poller,
+            layout_size,
+            size_owner: None,
+            quit: false,
+        }
     }
 
-    /// Where workspace `ws`'s row starts on screen. The active workspace is
-    /// centered; the others stack above and below it, sliding as the active
-    /// one changes. Zoomed out, a line between rows holds their labels.
-    fn row_top(&self, ws: usize) -> i32 {
-        let (area, row) = (self.area_height(), self.row_height());
-        let gap = if self.workspaces.zoom() < 1.0 { 1 } else { 0 };
+    /// Attaches a terminal of the given size. If there are no panes yet, it
+    /// starts with a shell.
+    pub fn attach(&mut self, width: u16, height: u16) -> Result<Client> {
+        let id = ClientId(self.next_client);
+        self.next_client += 1;
+        self.workspaces.add_client(id);
+        let client = Client {
+            id,
+            width,
+            height,
+            prefix_pending: false,
+            kitty_overview: std::env::var_os("TIRI_KITTY_OVERVIEW").is_some(),
+            thumbnails: HashMap::new(),
+            graphics: Vec::new(),
+            renderer: Renderer::default(),
+        };
+        self.lay_out_for(&client);
+        if self.panes.is_empty() {
+            self.open_column(&client)?;
+        }
+        Ok(client)
+    }
+
+    /// Detaches a client, leaving its graphics cleanup in its queue to send.
+    pub fn detach(&mut self, client: &mut Client) {
+        client.clear_thumbnails();
+        self.workspaces.remove_client(client.id);
+        if self.size_owner == Some(client.id) {
+            self.size_owner = None;
+        }
+    }
+
+    /// True once every pane in every workspace has gone.
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
+
+    /// Advances every client's scroll, slide and zoom animations. Returns
+    /// true while anything still moves.
+    pub fn tick(&mut self, dt: Duration) -> bool {
+        self.workspaces.tick(dt)
+    }
+
+    fn pane_rows(&self) -> u16 {
+        self.layout_size.1.saturating_sub(STATUS_HEIGHT + 2).max(1)
+    }
+
+    fn open_column(&mut self, client: &Client) -> Result<()> {
+        let id = PaneId(self.next_pane);
+        self.next_pane += 1;
+        // Width isn't known until it's in the strip, so start narrow and fix it below.
+        let pane = Pane::spawn(self.pane_rows(), 1)?;
+        // SAFETY: the pane is deleted from the poller in `pane_exited` or
+        // `shutdown`, before it's dropped and its PTY closed.
+        unsafe {
+            self.poller
+                .add(pane.fd().as_raw_fd(), PollEvent::readable(id.0 as usize))
+        }
+        .context("failed to watch the new pane's pty")?;
+        self.panes.insert(id, pane);
+        self.workspaces.insert(client.id, id);
+        self.resize_panes();
+        Ok(())
+    }
+
+    /// Lays panes out for `client`'s terminal size, making it the client
+    /// whose size counts. Called whenever a client is used, so panes follow
+    /// whichever terminal you're typing in.
+    fn lay_out_for(&mut self, client: &Client) {
+        let size = (client.width, client.height);
+        if self.size_owner == Some(client.id) && self.layout_size == size {
+            return;
+        }
+        self.size_owner = Some(client.id);
+        self.layout_size = size;
+        self.workspaces.set_view_width(size.0);
+        self.resize_panes();
+    }
+
+    /// Brings every pane's PTY size in line with its share of its column.
+    fn resize_panes(&mut self) {
+        let area = i32::from(self.layout_size.1.saturating_sub(STATUS_HEIGHT));
+        self.workspaces
+            .set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
+        for workspace in self.workspaces.list() {
+            let strip = workspace.strip();
+            for (idx, col) in strip.columns().iter().enumerate() {
+                let cols = strip.column_width(idx).saturating_sub(2).max(1);
+                let heights = split_heights(area, col.panes().len());
+                for (id, h) in col.panes().iter().zip(heights) {
+                    if let Some(pane) = self.panes.get_mut(id) {
+                        pane.resize((h - 2).max(1) as u16, cols);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A client's terminal changed size.
+    pub fn resize(&mut self, client: &mut Client, width: u16, height: u16) {
+        client.width = width;
+        client.height = height;
+        client.renderer.invalidate();
+        if self.size_owner == Some(client.id) || self.size_owner.is_none() {
+            self.lay_out_for(client);
+        }
+    }
+
+    /// Handles a pane's PTY becoming readable or writable.
+    pub fn pane_ready(&mut self, event: PollEvent) {
+        let id = PaneId(event.key as u32);
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if event.writable {
+            pane.flush();
+        }
+        if event.readable && !pane.read_ready() {
+            self.pane_exited(id);
+        }
+    }
+
+    /// Re-arms every pane's PTY with the poller, which reports each one only
+    /// once per arming. Panes with queued input also wait to be writable.
+    pub fn arm_panes(&self) {
+        for (id, pane) in &self.panes {
+            let interest = PollEvent::new(id.0 as usize, true, pane.wants_write());
+            // A failure means the PTY is gone, which reading will report.
+            let _ = self.poller.modify(pane.fd(), interest);
+        }
+    }
+
+    /// The next time something needs doing for `client` without any input:
+    /// a pane's synchronized update timing out, or a thumbnail due for a
+    /// redraw.
+    pub fn next_deadline(&self, client: &Client) -> Option<Instant> {
+        let stale_thumbnails = client.thumbnails.iter().filter_map(|(id, thumb)| {
+            let pane = self.panes.get(id)?;
+            (pane.generation() != thumb.generation).then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
+        });
+        self.panes
+            .values()
+            .filter_map(Pane::sync_deadline)
+            .chain(stale_thumbnails)
+            .min()
+    }
+
+    pub fn expire_syncs(&mut self, now: Instant) {
+        for pane in self.panes.values_mut() {
+            pane.expire_sync(now);
+        }
+    }
+
+    fn pane_exited(&mut self, id: PaneId) {
+        if let Some(mut pane) = self.panes.remove(&id) {
+            let _ = self.poller.delete(pane.fd());
+            pane.reap();
+        }
+        self.workspaces.remove(id);
+        // Whatever shared its column grows into the space.
+        self.resize_panes();
+    }
+
+    pub fn shutdown(&mut self) {
+        for pane in self.panes.values_mut() {
+            let _ = self.poller.delete(pane.fd());
+            pane.kill();
+        }
+    }
+
+    /// Thumbnails show once the overview has settled, since a placement's
+    /// size is fixed and the boxes change size while zooming.
+    fn showing_thumbnails(&self, client: &Client) -> bool {
+        client.kitty_overview
+            && self.workspaces.in_overview(client.id)
+            && !self.workspaces.is_animating(client.id)
+    }
+
+    /// The height of a workspace row on `client`'s screen: its whole pane
+    /// area, or less as its overview zooms out.
+    fn row_height(&self, client: &Client) -> i32 {
+        let area = client.area_height();
+        ((f64::from(area) * self.workspaces.zoom(client.id)).round() as i32)
+            .clamp(area.min(3), area)
+    }
+
+    /// Where workspace `ws`'s row starts on `client`'s screen. Its active
+    /// workspace is centered; the others stack above and below it, sliding
+    /// as the active one changes. Zoomed out, a line between rows holds
+    /// their labels.
+    fn row_top(&self, client: &Client, ws: usize) -> i32 {
+        let (area, row) = (client.area_height(), self.row_height(client));
+        let gap = if self.workspaces.zoom(client.id) < 1.0 {
+            1
+        } else {
+            0
+        };
         let pitch = f64::from(row + gap);
-        (area - row) / 2 + ((ws as f64 - self.workspaces.y()) * pitch).round() as i32
+        let from_active = ws as f64 - self.workspaces.y(client.id);
+        (area - row) / 2 + (from_active * pitch).round() as i32
     }
 
-    /// The workspaces with any part of their row on screen.
-    fn visible_workspaces(&self) -> Vec<usize> {
-        let (area, row) = (self.area_height(), self.row_height());
+    /// The workspaces with any part of their row on `client`'s screen.
+    fn visible_workspaces(&self, client: &Client) -> Vec<usize> {
+        let (area, row) = (client.area_height(), self.row_height(client));
         (0..self.workspaces.list().len())
             .filter(|&ws| {
-                let top = self.row_top(ws);
+                let top = self.row_top(client, ws);
                 top + row > 0 && top < area
             })
             .collect()
     }
 
     /// Where column `idx` of workspace `ws` is drawn: x, y, width, height.
-    fn column_box(&self, ws: usize, idx: usize) -> (i32, i32, i32, i32) {
-        let (x, w) = self.workspaces.list()[ws].strip().column_span(idx);
-        (x, self.row_top(ws), w, self.row_height())
+    fn column_box(&self, client: &Client, ws: usize, idx: usize) -> (i32, i32, i32, i32) {
+        let (x, w) = self.workspaces.column_span(client.id, ws, idx);
+        (x, self.row_top(client, ws), w, self.row_height(client))
     }
 
-    /// The columns of workspace `ws` that are at least partly on screen.
-    fn visible_columns(&self, ws: usize) -> Vec<usize> {
+    /// The columns of workspace `ws` at least partly on `client`'s screen.
+    fn visible_columns(&self, client: &Client, ws: usize) -> Vec<usize> {
         (0..self.workspaces.list()[ws].strip().columns().len())
             .filter(|&idx| {
-                let (x, _, w, _) = self.column_box(ws, idx);
-                x + w > 0 && x < i32::from(self.width)
+                let (x, _, w, _) = self.column_box(client, ws, idx);
+                x + w > 0 && x < i32::from(client.width)
             })
             .collect()
     }
 
     /// Where each pane in column `idx` of workspace `ws` is drawn, top to
     /// bottom, borders included: the column's box split among its panes.
-    fn pane_boxes(&self, ws: usize, idx: usize) -> Vec<(PaneId, i32, i32, i32, i32)> {
-        let (x, mut y, w, h) = self.column_box(ws, idx);
+    fn pane_boxes(
+        &self,
+        client: &Client,
+        ws: usize,
+        idx: usize,
+    ) -> Vec<(PaneId, i32, i32, i32, i32)> {
+        let (x, mut y, w, h) = self.column_box(client, ws, idx);
         let panes = self.workspaces.list()[ws].strip().columns()[idx].panes();
         panes
             .iter()
@@ -350,14 +461,9 @@ impl App {
             .collect()
     }
 
-    /// The inner size of a column's box in cells, as a thumbnail placement.
-    fn thumbnail_size(w: i32, h: i32) -> (u16, u16) {
-        let clamp = |n: i32| (n.max(1) as u16).min(kitty::MAX_CELLS);
-        (clamp(w - 2), clamp(h - 2))
-    }
-
-    pub fn paste(&mut self, text: &str) {
-        let Some(pane) = self.focused_pane_mut() else {
+    pub fn paste(&mut self, client: &Client, text: &str) {
+        self.lay_out_for(client);
+        let Some(pane) = self.focused_pane_mut(client) else {
             return;
         };
         if pane.bracketed_paste() {
@@ -367,152 +473,157 @@ impl App {
         }
     }
 
-    fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
-        let id = self.workspaces.focused()?;
+    fn focused_pane_mut(&mut self, client: &Client) -> Option<&mut Pane> {
+        let id = self.workspaces.focused(client.id)?;
         self.panes.get_mut(&id)
     }
 
-    pub fn key(&mut self, key: KeyEvent) -> Result<()> {
+    pub fn key(&mut self, client: &mut Client, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
+        self.lay_out_for(client);
         let is_prefix = key.code == KeyCode::Char(PREFIX) && key.modifiers == KeyModifiers::CONTROL;
 
-        if std::mem::take(&mut self.prefix_pending) {
+        if std::mem::take(&mut client.prefix_pending) {
             if is_prefix {
                 // Prefix twice sends it through to the pane.
-                if let Some(pane) = self.focused_pane_mut() {
+                if let Some(pane) = self.focused_pane_mut(client) {
                     pane.write(&[PREFIX as u8 - b'a' + 1]);
                 }
             } else if let Some(action) = prefix_binding(key) {
-                self.run(action)?;
+                self.run(client, action)?;
             }
             return Ok(());
         }
         if is_prefix {
-            self.prefix_pending = true;
+            client.prefix_pending = true;
             return Ok(());
         }
-        if self.workspaces.in_overview() {
+        if self.workspaces.in_overview(client.id) {
             // The overview takes the keyboard; nothing reaches the panes.
             if let Some(action) = overview_binding(key).or_else(|| alt_binding(key)) {
-                self.run(action)?;
+                self.run(client, action)?;
             }
             return Ok(());
         }
         if let Some(action) = alt_binding(key) {
-            return self.run(action);
+            return self.run(client, action);
         }
-        if let Some(pane) = self.focused_pane_mut() {
+        if let Some(pane) = self.focused_pane_mut(client) {
             let bytes = encode_key(key, pane.application_cursor());
             pane.write(&bytes);
         }
         Ok(())
     }
 
-    fn run(&mut self, action: Action) -> Result<()> {
+    fn run(&mut self, client: &mut Client, action: Action) -> Result<()> {
+        let id = client.id;
         match action {
-            Action::NewColumn => self.open_column()?,
-            Action::FocusLeft => self.workspaces.active_mut().focus_left(),
-            Action::FocusRight => self.workspaces.active_mut().focus_right(),
-            Action::FocusFirst => self.workspaces.active_mut().focus_first(),
-            Action::FocusLast => self.workspaces.active_mut().focus_last(),
-            Action::MoveLeft => self.workspaces.active_mut().move_left(),
-            Action::MoveRight => self.workspaces.active_mut().move_right(),
-            Action::FocusUp => self.workspaces.active_mut().focus_up(),
-            Action::FocusDown => self.workspaces.active_mut().focus_down(),
-            Action::MoveUp => self.workspaces.active_mut().move_up(),
-            Action::MoveDown => self.workspaces.active_mut().move_down(),
+            Action::NewColumn => self.open_column(client)?,
+            Action::FocusLeft => self.workspaces.active_mut(id).focus_left(),
+            Action::FocusRight => self.workspaces.active_mut(id).focus_right(),
+            Action::FocusFirst => self.workspaces.active_mut(id).focus_first(),
+            Action::FocusLast => self.workspaces.active_mut(id).focus_last(),
+            Action::MoveLeft => self.workspaces.active_mut(id).move_left(),
+            Action::MoveRight => self.workspaces.active_mut(id).move_right(),
+            Action::FocusUp => self.workspaces.active_mut(id).focus_up(),
+            Action::FocusDown => self.workspaces.active_mut(id).focus_down(),
+            Action::MoveUp => self.workspaces.active_mut(id).move_up(),
+            Action::MoveDown => self.workspaces.active_mut(id).move_down(),
             Action::ConsumeOrExpelLeft => {
-                self.workspaces.active_mut().consume_or_expel_left();
+                self.workspaces.active_mut(id).consume_or_expel_left();
                 self.resize_panes();
             }
             Action::ConsumeOrExpelRight => {
-                self.workspaces.active_mut().consume_or_expel_right();
+                self.workspaces.active_mut(id).consume_or_expel_right();
                 self.resize_panes();
             }
             Action::ConsumeIntoColumn => {
-                self.workspaces.active_mut().consume_into_column();
+                self.workspaces.active_mut(id).consume_into_column();
                 self.resize_panes();
             }
             Action::ExpelFromColumn => {
-                self.workspaces.active_mut().expel_from_column();
+                self.workspaces.active_mut(id).expel_from_column();
                 self.resize_panes();
             }
             Action::CycleWidth => {
-                self.workspaces.active_mut().cycle_width();
+                self.workspaces.active_mut(id).cycle_width();
                 self.resize_panes();
             }
-            Action::Center => self.workspaces.active_mut().center_focused(),
+            Action::Center => self.workspaces.active_mut(id).center_focused(),
             Action::Close => {
-                if let Some(id) = self.workspaces.focused() {
-                    if let Some(pane) = self.panes.get_mut(&id) {
+                if let Some(pane_id) = self.workspaces.focused(id) {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.kill();
                     }
-                    self.pane_exited(id);
+                    self.pane_exited(pane_id);
                 }
             }
-            Action::FocusWorkspaceDown => self.workspaces.focus_down(),
-            Action::FocusWorkspaceUp => self.workspaces.focus_up(),
-            Action::MoveColumnToWorkspaceDown => self.workspaces.move_column_down(),
-            Action::MoveColumnToWorkspaceUp => self.workspaces.move_column_up(),
+            Action::FocusWorkspaceDown => self.workspaces.focus_down(id),
+            Action::FocusWorkspaceUp => self.workspaces.focus_up(id),
+            Action::MoveColumnToWorkspaceDown => self.workspaces.move_column_down(id),
+            Action::MoveColumnToWorkspaceUp => self.workspaces.move_column_up(id),
             Action::ToggleOverview => {
-                let on = !self.workspaces.in_overview();
-                self.workspaces.set_overview(on);
+                let on = !self.workspaces.in_overview(id);
+                self.workspaces.set_overview(id, on);
             }
-            Action::ExitOverview => self.workspaces.set_overview(false),
-            Action::ToggleThumbnails => self.kitty_overview = !self.kitty_overview,
+            Action::ExitOverview => self.workspaces.set_overview(id, false),
+            Action::ToggleThumbnails => client.kitty_overview = !client.kitty_overview,
             Action::Quit => self.quit = true,
         }
         Ok(())
     }
 
-    /// Composes the visible part of the workspaces plus the status bar.
+    /// Composes `client`'s view of the workspaces plus its status bar.
     /// Returns the frame and where the cursor should be shown, if anywhere.
-    pub fn draw(&mut self) -> (Frame, Option<(u16, u16)>) {
-        let visible: Vec<(usize, usize)> = (self.visible_workspaces().into_iter())
+    pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
+        let visible: Vec<(usize, usize)> = (self.visible_workspaces(client).into_iter())
             .flat_map(|ws| {
-                self.visible_columns(ws)
+                self.visible_columns(client, ws)
                     .into_iter()
                     .map(move |idx| (ws, idx))
             })
             .collect();
 
-        let thumbnails = self.showing_thumbnails();
+        client.forget_closed_thumbnails(&self.panes);
+        let thumbnails = self.showing_thumbnails(client);
         if thumbnails {
             let now = Instant::now();
             for &(ws, idx) in &visible {
-                for (id, _, _, w, h) in self.pane_boxes(ws, idx) {
-                    self.refresh_thumbnail(id, Self::thumbnail_size(w, h), now);
+                for (id, _, _, w, h) in self.pane_boxes(client, ws, idx) {
+                    let size = Client::thumbnail_size(w, h);
+                    client.refresh_thumbnail(&self.panes, id, size, now);
                 }
             }
-        } else if !(self.kitty_overview && self.workspaces.in_overview())
-            && !self.thumbnails.is_empty()
-        {
-            self.clear_thumbnails();
+        } else if !(client.kitty_overview && self.workspaces.in_overview(client.id)) {
+            client.clear_thumbnails();
         }
+        let client: &Client = client;
 
-        let mut frame = Frame::new(self.width, self.height);
-        let overview = self.workspaces.in_overview();
-        let show_cursor = !overview && !self.workspaces.is_animating();
+        let mut frame = Frame::new(client.width, client.height);
+        let overview = self.workspaces.in_overview(client.id);
+        let show_cursor = !overview && !self.workspaces.is_animating(client.id);
         let mut cursor = None;
 
-        for ws in self.visible_workspaces() {
-            self.draw_workspace_label(&mut frame, ws);
+        for ws in self.visible_workspaces(client) {
+            self.draw_workspace_label(client, &mut frame, ws);
         }
         if overview {
-            self.draw_offscreen_indicators(&mut frame);
+            self.draw_offscreen_indicators(client, &mut frame);
         }
+        let active_ws = self.workspaces.active_index(client.id);
         for (ws, idx) in visible {
             let strip = self.workspaces.list()[ws].strip();
             let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;
-            let active = ws == self.workspaces.active_index();
-            for (row, (id, x, y, w, h)) in self.pane_boxes(ws, idx).into_iter().enumerate() {
+            for (row, (id, x, y, w, h)) in self.pane_boxes(client, ws, idx).into_iter().enumerate()
+            {
                 let Some(pane) = self.panes.get(&id) else {
                     continue;
                 };
-                let focused = active && idx == strip.focus_index() && row == column.focus_index();
+                let focused =
+                    ws == active_ws && idx == strip.focus_index() && row == column.focus_index();
                 let border = if focused {
                     Style {
                         bold: true,
@@ -534,7 +645,7 @@ impl App {
                     .collect();
                 frame.put_str(x + 2, y, &title, border);
 
-                let first_row = match self.thumbnails.get(&id) {
+                let first_row = match client.thumbnails.get(&id) {
                     Some(thumb) if thumbnails => {
                         let style = Style::fg(kitty::id_color(THUMBNAIL_ID_BASE + id.0));
                         let (cols, rows) = thumb.size;
@@ -552,14 +663,14 @@ impl App {
                 if focused && show_cursor && pane.cursor_visible() {
                     let (r, c) = pane.cursor();
                     let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r - first_row));
-                    if (0..i32::from(self.width)).contains(&cx) && cy < y + h - 1 {
+                    if (0..i32::from(client.width)).contains(&cx) && cy < y + h - 1 {
                         cursor = Some((cx as u16, cy as u16));
                     }
                 }
             }
         }
 
-        self.draw_status(&mut frame);
+        self.draw_status(client, &mut frame);
         (frame, cursor)
     }
 
@@ -582,9 +693,11 @@ impl App {
     /// Zoomed out, labels each workspace row on the line above it. An empty
     /// workspace gets a hint, or in the overview a placeholder box, so
     /// there's something to see and select.
-    fn draw_workspace_label(&self, frame: &mut Frame, ws: usize) {
-        let top = self.row_top(ws);
-        let active = ws == self.workspaces.active_index();
+    fn draw_workspace_label(&self, client: &Client, frame: &mut Frame, ws: usize) {
+        let top = self.row_top(client, ws);
+        let row_height = self.row_height(client);
+        let zoom = self.workspaces.zoom(client.id);
+        let active = ws == self.workspaces.active_index(client.id);
         let style = if active {
             Style {
                 bold: true,
@@ -593,7 +706,7 @@ impl App {
         } else {
             Style::fg(DIM_TEXT)
         };
-        if self.workspaces.zoom() < 1.0 {
+        if zoom < 1.0 {
             frame.put_str(
                 1,
                 top - 1,
@@ -611,33 +724,36 @@ impl App {
             (false, false) => "empty workspace",
         };
         let hint_width = hint.chars().count() as i32;
-        let middle = top + self.row_height() / 2;
-        if self.workspaces.in_overview() {
+        let middle = top + row_height / 2;
+        if self.workspaces.in_overview(client.id) {
             // A box the size of a default column, where one would open.
-            let zoom = self.workspaces.zoom();
-            let w = ((f64::from(self.width) * 0.5 * zoom).round() as i32).max(hint_width + 4);
-            let x = (i32::from(self.width) - w) / 2;
-            draw_box(frame, x, top, w, self.row_height(), style);
+            let w = ((f64::from(client.width) * 0.5 * zoom).round() as i32).max(hint_width + 4);
+            let x = (i32::from(client.width) - w) / 2;
+            draw_box(frame, x, top, w, row_height, style);
             frame.put_str(x + (w - hint_width) / 2, middle, hint, style);
         } else {
-            let x = (i32::from(self.width) - hint_width) / 2;
+            let x = (i32::from(client.width) - hint_width) / 2;
             frame.put_str(x, middle, hint, Style::fg(DIM_TEXT));
         }
     }
 
     /// In the overview, notes at the top and bottom edges for workspace rows
     /// scrolled out of sight, so none of them get forgotten.
-    fn draw_offscreen_indicators(&self, frame: &mut Frame) {
-        let (area, row) = (self.area_height(), self.row_height());
+    fn draw_offscreen_indicators(&self, client: &Client, frame: &mut Frame) {
+        let (area, row) = (client.area_height(), self.row_height(client));
         let count = self.workspaces.list().len();
-        let above = (0..count).filter(|&ws| self.row_top(ws) + row <= 0).count();
-        let below: Vec<usize> = (0..count).filter(|&ws| self.row_top(ws) >= area).collect();
+        let above = (0..count)
+            .filter(|&ws| self.row_top(client, ws) + row <= 0)
+            .count();
+        let below: Vec<usize> = (0..count)
+            .filter(|&ws| self.row_top(client, ws) >= area)
+            .collect();
         let style = Style {
             bg: STATUS_BG,
             ..Style::fg(STATUS_FG)
         };
         let mut note = |y: i32, text: String| {
-            let x = i32::from(self.width) - text.chars().count() as i32 - 1;
+            let x = i32::from(client.width) - text.chars().count() as i32 - 1;
             frame.put_str(x, y, &text, style);
         };
         if above > 0 {
@@ -653,13 +769,13 @@ impl App {
         }
     }
 
-    fn draw_status(&self, frame: &mut Frame) {
-        let y = i32::from(self.height) - 1;
+    fn draw_status(&self, client: &Client, frame: &mut Frame) {
+        let y = i32::from(client.height) - 1;
         let base = Style {
             bg: STATUS_BG,
             ..Style::fg(STATUS_FG)
         };
-        frame.put_str(0, y, &" ".repeat(usize::from(self.width)), base);
+        frame.put_str(0, y, &" ".repeat(usize::from(client.width)), base);
 
         let mut x = 0;
         let mut put = |frame: &mut Frame, s: &str, style: Style| {
@@ -669,7 +785,7 @@ impl App {
         put(frame, " tiri ", Style { bold: true, ..base });
 
         // The workspaces, top to bottom, ending with "+" for the empty one.
-        let active_ws = self.workspaces.active_index();
+        let active_ws = self.workspaces.active_index(client.id);
         for ws in 0..self.workspaces.list().len() {
             let style = if ws == active_ws {
                 Style {
@@ -692,7 +808,7 @@ impl App {
 
         // A minimap of the active workspace's columns: the focused one
         // filled, the rest hollow, dimmed when scrolled out of view.
-        let strip = self.workspaces.active();
+        let strip = self.workspaces.active(client.id);
         for idx in 0..strip.columns().len() {
             let label = if idx == strip.focus_index() {
                 "■ "
@@ -718,16 +834,17 @@ impl App {
             put(frame, label, style);
         }
 
-        let hint = if self.prefix_pending {
+        let overview = self.workspaces.in_overview(client.id);
+        let hint = if client.prefix_pending {
             "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  o overview  x close  q quit "
-        } else if self.workspaces.in_overview() && self.kitty_overview {
+        } else if overview && client.kitty_overview {
             "OVERVIEW (kitty)  hjkl select  u/i workspace  HJKL/U/I move  x close  t text  ⏎/o/Esc open "
-        } else if self.workspaces.in_overview() {
+        } else if overview {
             "OVERVIEW  hjkl select  u/i workspace  HJKL/U/I move  x close  t thumbnails  ⏎/o/Esc open "
         } else {
             "C-a or Alt: n/⏎ new  h/l focus  u/i workspace  r width  o overview "
         };
-        let hint_x = i32::from(self.width) - hint.chars().count() as i32;
+        let hint_x = i32::from(client.width) - hint.chars().count() as i32;
         if hint_x > x + 1 {
             frame.put_str(hint_x, y, hint, base);
         }
