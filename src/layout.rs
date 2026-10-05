@@ -97,6 +97,9 @@ pub struct Strip {
     zoom: f64,
     /// The most panes a column may hold before consuming is refused.
     max_stack: usize,
+    /// The zoom to use in the overview, when set by whoever owns this strip
+    /// (so stacked workspaces all shrink alike). Otherwise it fits itself.
+    overview_zoom: Option<f64>,
 }
 
 impl Strip {
@@ -110,7 +113,40 @@ impl Strip {
             overview: false,
             zoom: 1.0,
             max_stack: usize::MAX,
+            overview_zoom: None,
         }
+    }
+
+    pub fn set_overview_zoom(&mut self, zoom: Option<f64>) {
+        self.overview_zoom = zoom;
+    }
+
+    /// The overview zoom that would fit this whole strip on screen.
+    pub fn fit_zoom(&self) -> f64 {
+        let total = f64::from(self.total_width());
+        (f64::from(self.view_width) / total.max(1.0)).clamp(OVERVIEW_MIN_ZOOM, OVERVIEW_MAX_ZOOM)
+    }
+
+    pub fn contains(&self, pane: PaneId) -> bool {
+        self.locate(pane).is_some()
+    }
+
+    /// Takes the focused column out of the strip, for moving it elsewhere.
+    pub fn take_focused_column(&mut self) -> Option<Column> {
+        (!self.columns.is_empty()).then(|| self.remove_column(self.focus))
+    }
+
+    /// Adds a column taken from another strip to the right of the focused
+    /// one, and focuses it.
+    pub fn insert_column(&mut self, column: Column) {
+        let idx = if self.columns.is_empty() {
+            0
+        } else {
+            self.focus + 1
+        };
+        self.columns.insert(idx, column);
+        self.focus = idx;
+        self.scroll_to_focus();
     }
 
     pub fn set_max_stack(&mut self, max: usize) {
@@ -149,10 +185,6 @@ impl Strip {
 
     pub fn zoom(&self) -> f64 {
         self.zoom
-    }
-
-    pub fn in_overview(&self) -> bool {
-        self.overview
     }
 
     pub fn set_overview(&mut self, on: bool) {
@@ -435,7 +467,7 @@ impl Strip {
         }
         let total = f64::from(self.total_width());
         let view = f64::from(self.view_width);
-        let zoom = (view / total.max(1.0)).clamp(OVERVIEW_MIN_ZOOM, OVERVIEW_MAX_ZOOM);
+        let zoom = self.overview_zoom.unwrap_or_else(|| self.fit_zoom());
         // How much of the strip fits on screen at this zoom.
         let visible = view / zoom;
         let offset = if total <= visible || self.columns.is_empty() {

@@ -5,6 +5,7 @@ mod layout;
 mod pane;
 mod render;
 mod thumbnail;
+mod workspace;
 
 use std::io::{self, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -44,7 +45,9 @@ fn run() -> Result<()> {
     });
 
     let (width, height) = terminal::size()?;
-    let mut app = App::new(width, height, tx)?;
+    // Each argument names a workspace to start with.
+    let names: Vec<String> = std::env::args().skip(1).collect();
+    let mut app = App::new(width, height, &names, tx)?;
     let mut renderer = Renderer::default();
     let mut stdout = io::stdout().lock();
     let mut animating = false;
@@ -99,7 +102,7 @@ fn run() -> Result<()> {
             Duration::ZERO
         };
         last_tick = now;
-        animating = app.strip_mut().tick(dt.max(Duration::from_millis(1)));
+        animating = app.tick(dt.max(Duration::from_millis(1)));
 
         let (frame, cursor) = app.draw();
         stdout.write_all(&app.take_graphics())?;

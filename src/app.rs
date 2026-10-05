@@ -1,4 +1,4 @@
-//! Application state: the strip, its panes, keybindings, and drawing.
+//! Application state: the workspaces, their panes, keybindings, and drawing.
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -12,10 +12,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::Event;
 use crate::input::encode_key;
 use crate::kitty;
-use crate::layout::{PaneId, Strip, Visibility, split_heights};
+use crate::layout::{PaneId, Visibility, split_heights};
 use crate::pane::Pane;
 use crate::render::{Color, Frame, Style};
 use crate::thumbnail;
+use crate::workspace::Workspaces;
 
 /// The prefix key, tmux-style: Ctrl-a, then a command key.
 const PREFIX: char = 'a';
@@ -28,6 +29,7 @@ const FOCUSED_BORDER: Color = Color::Idx(12);
 const UNFOCUSED_BORDER: Color = Color::Idx(8);
 const STATUS_BG: Color = Color::Idx(236);
 const STATUS_FG: Color = Color::Idx(250);
+const DIM_TEXT: Color = Color::Idx(242);
 
 /// Kitty image ids for overview thumbnails are this plus the pane id.
 const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
@@ -54,6 +56,10 @@ enum Action {
     CycleWidth,
     Center,
     Close,
+    FocusWorkspaceDown,
+    FocusWorkspaceUp,
+    MoveColumnToWorkspaceDown,
+    MoveColumnToWorkspaceUp,
     ToggleOverview,
     ExitOverview,
     ToggleThumbnails,
@@ -70,7 +76,7 @@ struct Thumbnail {
 }
 
 pub struct App {
-    strip: Strip,
+    workspaces: Workspaces,
     panes: HashMap<PaneId, Pane>,
     next_id: u32,
     events: Sender<Event>,
@@ -86,9 +92,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(width: u16, height: u16, events: Sender<Event>) -> Result<Self> {
+    /// Starts with a named workspace for each of `names` (plus the usual
+    /// empty one), and a shell in the first.
+    pub fn new(width: u16, height: u16, names: &[String], events: Sender<Event>) -> Result<Self> {
         let mut app = Self {
-            strip: Strip::new(width),
+            workspaces: Workspaces::new(width, names),
             panes: HashMap::new(),
             next_id: 0,
             events,
@@ -104,12 +112,15 @@ impl App {
         Ok(app)
     }
 
+    /// True once every pane in every workspace has gone.
     pub fn is_empty(&self) -> bool {
-        self.strip.is_empty()
+        self.panes.is_empty()
     }
 
-    pub fn strip_mut(&mut self) -> &mut Strip {
-        &mut self.strip
+    /// Advances the scroll, slide and zoom animations. Returns true while
+    /// anything still moves.
+    pub fn tick(&mut self, dt: Duration) -> bool {
+        self.workspaces.tick(dt)
     }
 
     fn pane_rows(&self) -> u16 {
@@ -122,7 +133,7 @@ impl App {
         // Width isn't known until it's in the strip, so start narrow and fix it below.
         let pane = Pane::spawn(id, self.pane_rows(), 1, self.events.clone())?;
         self.panes.insert(id, pane);
-        self.strip.insert(id);
+        self.workspaces.insert(id);
         self.resize_panes();
         Ok(())
     }
@@ -130,14 +141,17 @@ impl App {
     /// Brings every pane's PTY size in line with its share of its column.
     fn resize_panes(&mut self) {
         let area = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
-        self.strip
+        self.workspaces
             .set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
-        for (idx, col) in self.strip.columns().iter().enumerate() {
-            let cols = self.strip.column_width(idx).saturating_sub(2).max(1);
-            let heights = split_heights(area, col.panes().len());
-            for (id, h) in col.panes().iter().zip(heights) {
-                if let Some(pane) = self.panes.get_mut(id) {
-                    pane.resize((h - 2).max(1) as u16, cols);
+        for workspace in self.workspaces.list() {
+            let strip = workspace.strip();
+            for (idx, col) in strip.columns().iter().enumerate() {
+                let cols = strip.column_width(idx).saturating_sub(2).max(1);
+                let heights = split_heights(area, col.panes().len());
+                for (id, h) in col.panes().iter().zip(heights) {
+                    if let Some(pane) = self.panes.get_mut(id) {
+                        pane.resize((h - 2).max(1) as u16, cols);
+                    }
                 }
             }
         }
@@ -146,7 +160,7 @@ impl App {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        self.strip.set_view_width(width);
+        self.workspaces.set_view_width(width);
         self.resize_panes();
     }
 
@@ -188,7 +202,7 @@ impl App {
         if self.thumbnails.remove(&id).is_some() {
             kitty::delete(&mut self.graphics, THUMBNAIL_ID_BASE + id.0);
         }
-        self.strip.remove(id);
+        self.workspaces.remove(id);
         // Whatever shared its column grows into the space.
         self.resize_panes();
     }
@@ -209,7 +223,7 @@ impl App {
     /// Thumbnails show once the overview has settled, since a placement's
     /// size is fixed and the boxes change size while zooming.
     fn showing_thumbnails(&self) -> bool {
-        self.kitty_overview && self.strip.in_overview() && !self.strip.is_animating()
+        self.kitty_overview && self.workspaces.in_overview() && !self.workspaces.is_animating()
     }
 
     /// Uploads a thumbnail of `id` sized `size` cells if there's none yet, it
@@ -243,21 +257,59 @@ impl App {
         );
     }
 
-    /// Where column `idx` is drawn: x, y, width, height.
-    fn column_box(&self, idx: usize) -> (i32, i32, i32, i32) {
-        let pane_height = i32::from(self.height.saturating_sub(STATUS_HEIGHT));
-        // Columns shrink vertically with the zoom, centered in the pane area.
-        let h = ((f64::from(pane_height) * self.strip.zoom()).round() as i32)
-            .clamp(pane_height.min(3), pane_height);
-        let (x, w) = self.strip.column_span(idx);
-        (x, (pane_height - h) / 2, w, h)
+    fn area_height(&self) -> i32 {
+        i32::from(self.height.saturating_sub(STATUS_HEIGHT))
     }
 
-    /// Where each pane in column `idx` is drawn, top to bottom, borders
-    /// included: the column's box split among its panes.
-    fn pane_boxes(&self, idx: usize) -> Vec<(PaneId, i32, i32, i32, i32)> {
-        let (x, mut y, w, h) = self.column_box(idx);
-        let panes = self.strip.columns()[idx].panes();
+    /// The height of a workspace row on screen: the whole pane area, or less
+    /// as the overview zooms out.
+    fn row_height(&self) -> i32 {
+        let area = self.area_height();
+        ((f64::from(area) * self.workspaces.zoom()).round() as i32).clamp(area.min(3), area)
+    }
+
+    /// Where workspace `ws`'s row starts on screen. The active workspace is
+    /// centered; the others stack above and below it, sliding as the active
+    /// one changes. Zoomed out, a line between rows holds their labels.
+    fn row_top(&self, ws: usize) -> i32 {
+        let (area, row) = (self.area_height(), self.row_height());
+        let gap = if self.workspaces.zoom() < 1.0 { 1 } else { 0 };
+        let pitch = f64::from(row + gap);
+        (area - row) / 2 + ((ws as f64 - self.workspaces.y()) * pitch).round() as i32
+    }
+
+    /// The workspaces with any part of their row on screen.
+    fn visible_workspaces(&self) -> Vec<usize> {
+        let (area, row) = (self.area_height(), self.row_height());
+        (0..self.workspaces.list().len())
+            .filter(|&ws| {
+                let top = self.row_top(ws);
+                top + row > 0 && top < area
+            })
+            .collect()
+    }
+
+    /// Where column `idx` of workspace `ws` is drawn: x, y, width, height.
+    fn column_box(&self, ws: usize, idx: usize) -> (i32, i32, i32, i32) {
+        let (x, w) = self.workspaces.list()[ws].strip().column_span(idx);
+        (x, self.row_top(ws), w, self.row_height())
+    }
+
+    /// The columns of workspace `ws` that are at least partly on screen.
+    fn visible_columns(&self, ws: usize) -> Vec<usize> {
+        (0..self.workspaces.list()[ws].strip().columns().len())
+            .filter(|&idx| {
+                let (x, _, w, _) = self.column_box(ws, idx);
+                x + w > 0 && x < i32::from(self.width)
+            })
+            .collect()
+    }
+
+    /// Where each pane in column `idx` of workspace `ws` is drawn, top to
+    /// bottom, borders included: the column's box split among its panes.
+    fn pane_boxes(&self, ws: usize, idx: usize) -> Vec<(PaneId, i32, i32, i32, i32)> {
+        let (x, mut y, w, h) = self.column_box(ws, idx);
+        let panes = self.workspaces.list()[ws].strip().columns()[idx].panes();
         panes
             .iter()
             .zip(split_heights(h, panes.len()))
@@ -287,7 +339,7 @@ impl App {
     }
 
     fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
-        let id = self.strip.focused()?;
+        let id = self.workspaces.focused()?;
         self.panes.get_mut(&id)
     }
 
@@ -312,7 +364,7 @@ impl App {
             self.prefix_pending = true;
             return Ok(());
         }
-        if self.strip.in_overview() {
+        if self.workspaces.in_overview() {
             // The overview takes the keyboard; nothing reaches the panes.
             if let Some(action) = overview_binding(key).or_else(|| alt_binding(key)) {
                 self.run(action)?;
@@ -332,88 +384,106 @@ impl App {
     fn run(&mut self, action: Action) -> Result<()> {
         match action {
             Action::NewColumn => self.open_column()?,
-            Action::FocusLeft => self.strip.focus_left(),
-            Action::FocusRight => self.strip.focus_right(),
-            Action::FocusFirst => self.strip.focus_first(),
-            Action::FocusLast => self.strip.focus_last(),
-            Action::MoveLeft => self.strip.move_left(),
-            Action::MoveRight => self.strip.move_right(),
-            Action::FocusUp => self.strip.focus_up(),
-            Action::FocusDown => self.strip.focus_down(),
-            Action::MoveUp => self.strip.move_up(),
-            Action::MoveDown => self.strip.move_down(),
+            Action::FocusLeft => self.workspaces.active_mut().focus_left(),
+            Action::FocusRight => self.workspaces.active_mut().focus_right(),
+            Action::FocusFirst => self.workspaces.active_mut().focus_first(),
+            Action::FocusLast => self.workspaces.active_mut().focus_last(),
+            Action::MoveLeft => self.workspaces.active_mut().move_left(),
+            Action::MoveRight => self.workspaces.active_mut().move_right(),
+            Action::FocusUp => self.workspaces.active_mut().focus_up(),
+            Action::FocusDown => self.workspaces.active_mut().focus_down(),
+            Action::MoveUp => self.workspaces.active_mut().move_up(),
+            Action::MoveDown => self.workspaces.active_mut().move_down(),
             Action::ConsumeOrExpelLeft => {
-                self.strip.consume_or_expel_left();
+                self.workspaces.active_mut().consume_or_expel_left();
                 self.resize_panes();
             }
             Action::ConsumeOrExpelRight => {
-                self.strip.consume_or_expel_right();
+                self.workspaces.active_mut().consume_or_expel_right();
                 self.resize_panes();
             }
             Action::ConsumeIntoColumn => {
-                self.strip.consume_into_column();
+                self.workspaces.active_mut().consume_into_column();
                 self.resize_panes();
             }
             Action::ExpelFromColumn => {
-                self.strip.expel_from_column();
+                self.workspaces.active_mut().expel_from_column();
                 self.resize_panes();
             }
             Action::CycleWidth => {
-                self.strip.cycle_width();
+                self.workspaces.active_mut().cycle_width();
                 self.resize_panes();
             }
-            Action::Center => self.strip.center_focused(),
+            Action::Center => self.workspaces.active_mut().center_focused(),
             Action::Close => {
-                if let Some(id) = self.strip.focused() {
+                if let Some(id) = self.workspaces.focused() {
                     if let Some(pane) = self.panes.get_mut(&id) {
                         pane.kill();
                     }
                     self.pane_exited(id);
                 }
             }
-            Action::ToggleOverview => self.strip.set_overview(!self.strip.in_overview()),
-            Action::ExitOverview => self.strip.set_overview(false),
+            Action::FocusWorkspaceDown => self.workspaces.focus_down(),
+            Action::FocusWorkspaceUp => self.workspaces.focus_up(),
+            Action::MoveColumnToWorkspaceDown => self.workspaces.move_column_down(),
+            Action::MoveColumnToWorkspaceUp => self.workspaces.move_column_up(),
+            Action::ToggleOverview => {
+                let on = !self.workspaces.in_overview();
+                self.workspaces.set_overview(on);
+            }
+            Action::ExitOverview => self.workspaces.set_overview(false),
             Action::ToggleThumbnails => self.kitty_overview = !self.kitty_overview,
             Action::Quit => self.quit = true,
         }
         Ok(())
     }
 
-    /// Composes the visible slice of the strip plus the status bar. Returns
-    /// the frame and where the cursor should be shown, if anywhere.
+    /// Composes the visible part of the workspaces plus the status bar.
+    /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&mut self) -> (Frame, Option<(u16, u16)>) {
-        let visible: Vec<usize> = (0..self.strip.columns().len())
-            .filter(|&idx| {
-                let (x, _, w, _) = self.column_box(idx);
-                x + w > 0 && x < i32::from(self.width)
+        let visible: Vec<(usize, usize)> = (self.visible_workspaces().into_iter())
+            .flat_map(|ws| {
+                self.visible_columns(ws)
+                    .into_iter()
+                    .map(move |idx| (ws, idx))
             })
             .collect();
 
         let thumbnails = self.showing_thumbnails();
         if thumbnails {
             let now = Instant::now();
-            for &idx in &visible {
-                for (id, _, _, w, h) in self.pane_boxes(idx) {
+            for &(ws, idx) in &visible {
+                for (id, _, _, w, h) in self.pane_boxes(ws, idx) {
                     self.refresh_thumbnail(id, Self::thumbnail_size(w, h), now);
                 }
             }
-        } else if !(self.kitty_overview && self.strip.in_overview()) && !self.thumbnails.is_empty()
+        } else if !(self.kitty_overview && self.workspaces.in_overview())
+            && !self.thumbnails.is_empty()
         {
             self.clear_thumbnails();
         }
 
         let mut frame = Frame::new(self.width, self.height);
-        let show_cursor = !self.strip.in_overview() && self.strip.zoom() == 1.0;
+        let overview = self.workspaces.in_overview();
+        let show_cursor = !overview && !self.workspaces.is_animating();
         let mut cursor = None;
 
-        for idx in visible {
-            let column = &self.strip.columns()[idx];
+        for ws in self.visible_workspaces() {
+            self.draw_workspace_label(&mut frame, ws);
+        }
+        if overview {
+            self.draw_offscreen_indicators(&mut frame);
+        }
+        for (ws, idx) in visible {
+            let strip = self.workspaces.list()[ws].strip();
+            let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;
-            for (row, (id, x, y, w, h)) in self.pane_boxes(idx).into_iter().enumerate() {
+            let active = ws == self.workspaces.active_index();
+            for (row, (id, x, y, w, h)) in self.pane_boxes(ws, idx).into_iter().enumerate() {
                 let Some(pane) = self.panes.get(&id) else {
                     continue;
                 };
-                let focused = idx == self.strip.focus_index() && row == column.focus_index();
+                let focused = active && idx == strip.focus_index() && row == column.focus_index();
                 let border = if focused {
                     Style {
                         bold: true,
@@ -464,6 +534,96 @@ impl App {
         (frame, cursor)
     }
 
+    /// Whether `ws` is the empty workspace that's always kept at the bottom.
+    fn is_new_workspace(&self, ws: usize) -> bool {
+        let list = self.workspaces.list();
+        ws + 1 == list.len() && list[ws].is_empty() && list[ws].name().is_none()
+    }
+
+    /// A workspace's name: its own, its position if it has none, or "+" for
+    /// the empty one at the bottom.
+    fn workspace_label(&self, ws: usize) -> String {
+        match self.workspaces.list()[ws].name() {
+            Some(name) => name.to_owned(),
+            None if self.is_new_workspace(ws) => "+".to_owned(),
+            None => format!("{}", ws + 1),
+        }
+    }
+
+    /// Zoomed out, labels each workspace row on the line above it. An empty
+    /// workspace gets a hint, or in the overview a placeholder box, so
+    /// there's something to see and select.
+    fn draw_workspace_label(&self, frame: &mut Frame, ws: usize) {
+        let top = self.row_top(ws);
+        let active = ws == self.workspaces.active_index();
+        let style = if active {
+            Style {
+                bold: true,
+                ..Style::fg(FOCUSED_BORDER)
+            }
+        } else {
+            Style::fg(DIM_TEXT)
+        };
+        if self.workspaces.zoom() < 1.0 {
+            frame.put_str(
+                1,
+                top - 1,
+                &format!(" {} ", self.workspace_label(ws)),
+                style,
+            );
+        }
+        if !self.workspaces.list()[ws].is_empty() {
+            return;
+        }
+        let hint = match (self.is_new_workspace(ws), active) {
+            (true, true) => "+ new workspace: C-a n opens a column",
+            (true, false) => "+ new workspace",
+            (false, true) => "empty workspace: C-a n opens a column",
+            (false, false) => "empty workspace",
+        };
+        let hint_width = hint.chars().count() as i32;
+        let middle = top + self.row_height() / 2;
+        if self.workspaces.in_overview() {
+            // A box the size of a default column, where one would open.
+            let zoom = self.workspaces.zoom();
+            let w = ((f64::from(self.width) * 0.5 * zoom).round() as i32).max(hint_width + 4);
+            let x = (i32::from(self.width) - w) / 2;
+            draw_box(frame, x, top, w, self.row_height(), style);
+            frame.put_str(x + (w - hint_width) / 2, middle, hint, style);
+        } else {
+            let x = (i32::from(self.width) - hint_width) / 2;
+            frame.put_str(x, middle, hint, Style::fg(DIM_TEXT));
+        }
+    }
+
+    /// In the overview, notes at the top and bottom edges for workspace rows
+    /// scrolled out of sight, so none of them get forgotten.
+    fn draw_offscreen_indicators(&self, frame: &mut Frame) {
+        let (area, row) = (self.area_height(), self.row_height());
+        let count = self.workspaces.list().len();
+        let above = (0..count).filter(|&ws| self.row_top(ws) + row <= 0).count();
+        let below: Vec<usize> = (0..count).filter(|&ws| self.row_top(ws) >= area).collect();
+        let style = Style {
+            bg: STATUS_BG,
+            ..Style::fg(STATUS_FG)
+        };
+        let mut note = |y: i32, text: String| {
+            let x = i32::from(self.width) - text.chars().count() as i32 - 1;
+            frame.put_str(x, y, &text, style);
+        };
+        if above > 0 {
+            note(0, format!(" ▲ {above} above "));
+        }
+        if let Some(&last) = below.last() {
+            let extra = if self.is_new_workspace(last) {
+                " (incl. new)"
+            } else {
+                ""
+            };
+            note(area - 1, format!(" ▼ {} below{extra} ", below.len()));
+        }
+    }
+
     fn draw_status(&self, frame: &mut Frame) {
         let y = i32::from(self.height) - 1;
         let base = Style {
@@ -479,37 +639,64 @@ impl App {
         };
         put(frame, " tiri ", Style { bold: true, ..base });
 
-        // A minimap of the strip: which columns are on screen right now.
-        for idx in 0..self.strip.columns().len() {
-            let label = format!(" {} ", idx + 1);
-            let style = if idx == self.strip.focus_index() {
+        // The workspaces, top to bottom, ending with "+" for the empty one.
+        let active_ws = self.workspaces.active_index();
+        for ws in 0..self.workspaces.list().len() {
+            let style = if ws == active_ws {
                 Style {
-                    bg: FOCUSED_BORDER,
-                    fg: Color::Idx(0),
+                    bg: STATUS_FG,
+                    fg: STATUS_BG,
+                    bold: true,
+                    ..base
+                }
+            } else if self.is_new_workspace(ws) {
+                Style {
+                    fg: DIM_TEXT,
+                    ..base
+                }
+            } else {
+                base
+            };
+            put(frame, &format!(" {} ", self.workspace_label(ws)), style);
+        }
+        put(frame, " │ ", base);
+
+        // A minimap of the active workspace's columns: the focused one
+        // filled, the rest hollow, dimmed when scrolled out of view.
+        let strip = self.workspaces.active();
+        for idx in 0..strip.columns().len() {
+            let label = if idx == strip.focus_index() {
+                "■ "
+            } else {
+                "□ "
+            };
+            let style = if idx == strip.focus_index() {
+                Style {
+                    fg: FOCUSED_BORDER,
                     bold: true,
                     ..base
                 }
             } else {
-                match self.strip.visibility(idx) {
+                match strip.visibility(idx) {
                     Visibility::Full => Style { bold: true, ..base },
                     Visibility::Partial => base,
                     Visibility::Hidden => Style {
-                        fg: Color::Idx(242),
+                        fg: DIM_TEXT,
                         ..base
                     },
                 }
             };
-            put(frame, &label, style);
+            put(frame, label, style);
         }
 
         let hint = if self.prefix_pending {
-            "C-a: n new  hjkl focus  HJKL move  [/] consume/expel  ,/. in/out  r width  o overview  x close  q quit "
-        } else if self.strip.in_overview() && self.kitty_overview {
-            "OVERVIEW (kitty)  h/l select  H/L move  x close  t text  ⏎/o/Esc open "
-        } else if self.strip.in_overview() {
-            "OVERVIEW  h/l select  H/L move  x close  t thumbnails  ⏎/o/Esc open "
+            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  o overview  x close  q quit "
+        } else if self.workspaces.in_overview() && self.kitty_overview {
+            "OVERVIEW (kitty)  hjkl select  u/i workspace  HJKL/U/I move  x close  t text  ⏎/o/Esc open "
+        } else if self.workspaces.in_overview() {
+            "OVERVIEW  hjkl select  u/i workspace  HJKL/U/I move  x close  t thumbnails  ⏎/o/Esc open "
         } else {
-            "C-a or Alt: n/⏎ new  h/l focus  r width  c center  o overview "
+            "C-a or Alt: n/⏎ new  h/l focus  u/i workspace  r width  o overview "
         };
         let hint_x = i32::from(self.width) - hint.chars().count() as i32;
         if hint_x > x + 1 {
@@ -531,6 +718,10 @@ fn prefix_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
         KeyCode::Char('J') => Action::MoveDown,
         KeyCode::Char('K') => Action::MoveUp,
+        KeyCode::Char('u') | KeyCode::PageDown => Action::FocusWorkspaceDown,
+        KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
+        KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
+        KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
         KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
         KeyCode::Char(']') => Action::ConsumeOrExpelRight,
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
@@ -564,6 +755,10 @@ fn overview_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('k') | KeyCode::Up => Action::FocusUp,
         KeyCode::Char('J') => Action::MoveDown,
         KeyCode::Char('K') => Action::MoveUp,
+        KeyCode::Char('u') | KeyCode::PageDown => Action::FocusWorkspaceDown,
+        KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
+        KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
+        KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
         KeyCode::Char('[') => Action::ConsumeOrExpelLeft,
         KeyCode::Char(']') => Action::ConsumeOrExpelRight,
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
@@ -598,6 +793,10 @@ fn alt_binding(key: KeyEvent) -> Option<Action> {
         // consume-or-expel is on Alt-{ and Alt-} instead.
         KeyCode::Char('{') => Action::ConsumeOrExpelLeft,
         KeyCode::Char('}') => Action::ConsumeOrExpelRight,
+        KeyCode::Char('u') | KeyCode::PageDown => Action::FocusWorkspaceDown,
+        KeyCode::Char('i') | KeyCode::PageUp => Action::FocusWorkspaceUp,
+        KeyCode::Char('U') => Action::MoveColumnToWorkspaceDown,
+        KeyCode::Char('I') => Action::MoveColumnToWorkspaceUp,
         KeyCode::Char(',') => Action::ConsumeIntoColumn,
         KeyCode::Char('.') => Action::ExpelFromColumn,
         KeyCode::Char('r') => Action::CycleWidth,
