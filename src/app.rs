@@ -6,12 +6,13 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use polling::{Event as PollEvent, Poller};
 
@@ -19,6 +20,7 @@ use crate::input::encode_key;
 use crate::kitty;
 use crate::layout::{PaneId, Visibility, split_heights};
 use crate::pane::Pane;
+use crate::protocol::{Target, WorkspaceInfo};
 use crate::render::{Color, Frame, Renderer, Style};
 use crate::thumbnail;
 use crate::workspace::{ClientId, Workspaces};
@@ -68,6 +70,7 @@ enum Action {
     ToggleOverview,
     ExitOverview,
     ToggleThumbnails,
+    Detach,
     Quit,
 }
 
@@ -87,6 +90,10 @@ pub struct Client {
     id: ClientId,
     width: u16,
     height: u16,
+    /// Where panes this client opens start.
+    cwd: PathBuf,
+    /// Set when the client asks to detach; the server then lets it go.
+    detach_requested: bool,
     prefix_pending: bool,
     /// Whether this client's overview shows kitty graphics thumbnails
     /// instead of text.
@@ -98,6 +105,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn detach_requested(&self) -> bool {
+        self.detach_requested
+    }
+
     /// Graphics commands to write before drawing the next frame.
     pub fn take_graphics(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.graphics)
@@ -211,27 +222,70 @@ impl App {
         }
     }
 
-    /// Attaches a terminal of the given size. If there are no panes yet, it
-    /// starts with a shell.
-    pub fn attach(&mut self, width: u16, height: u16) -> Result<Client> {
+    /// Attaches a terminal of the given size to `target`. A new workspace,
+    /// or a server with no panes yet, starts with a shell in `cwd`.
+    pub fn attach(
+        &mut self,
+        width: u16,
+        height: u16,
+        target: &Target,
+        cwd: PathBuf,
+        kitty_overview: bool,
+    ) -> Result<Client> {
+        let workspace = match target {
+            Target::Default => None,
+            Target::Existing(name) => match self.workspaces.find(name) {
+                Some(idx) => Some(idx),
+                None => bail!("no workspace named {name:?}"),
+            },
+            Target::New(name) => {
+                if self.workspaces.find(name).is_some() {
+                    bail!("there's already a workspace named {name:?}");
+                }
+                Some(self.workspaces.create_named(name.clone()))
+            }
+        };
+
         let id = ClientId(self.next_client);
         self.next_client += 1;
         self.workspaces.add_client(id);
+        if let Some(idx) = workspace {
+            self.workspaces.set_active(id, idx);
+        }
         let client = Client {
             id,
             width,
             height,
+            cwd,
+            detach_requested: false,
             prefix_pending: false,
-            kitty_overview: std::env::var_os("TIRI_KITTY_OVERVIEW").is_some(),
+            kitty_overview,
             thumbnails: HashMap::new(),
             graphics: Vec::new(),
             renderer: Renderer::default(),
         };
         self.lay_out_for(&client);
-        if self.panes.is_empty() {
+        if matches!(target, Target::New(_)) || self.panes.is_empty() {
             self.open_column(&client)?;
         }
         Ok(client)
+    }
+
+    /// Every workspace, for `tiri ls`.
+    pub fn workspace_infos(&self) -> Vec<WorkspaceInfo> {
+        (0..self.workspaces.list().len())
+            .map(|ws| {
+                let workspace = &self.workspaces.list()[ws];
+                WorkspaceInfo {
+                    name: workspace.name().map(str::to_owned),
+                    label: self.workspace_label(ws),
+                    panes: (workspace.strip().columns().iter())
+                        .map(|c| c.panes().len())
+                        .sum(),
+                    clients: self.workspaces.clients_on(ws),
+                }
+            })
+            .collect()
     }
 
     /// Detaches a client, leaving its graphics cleanup in its queue to send.
@@ -262,7 +316,7 @@ impl App {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         // Width isn't known until it's in the strip, so start narrow and fix it below.
-        let pane = Pane::spawn(self.pane_rows(), 1)?;
+        let pane = Pane::spawn(self.pane_rows(), 1, &client.cwd)?;
         // SAFETY: the pane is deleted from the poller in `pane_exited` or
         // `shutdown`, before it's dropped and its PTY closed.
         unsafe {
@@ -570,6 +624,7 @@ impl App {
             }
             Action::ExitOverview => self.workspaces.set_overview(id, false),
             Action::ToggleThumbnails => client.kitty_overview = !client.kitty_overview,
+            Action::Detach => client.detach_requested = true,
             Action::Quit => self.quit = true,
         }
         Ok(())
@@ -836,7 +891,7 @@ impl App {
 
         let overview = self.workspaces.in_overview(client.id);
         let hint = if client.prefix_pending {
-            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  o overview  x close  q quit "
+            "C-a: n new  hjkl focus  HJKL move  u/i workspace  U/I move to ws  [/] consume/expel  ,/. in/out  r width  o overview  x close  d detach  q kill server "
         } else if overview && client.kitty_overview {
             "OVERVIEW (kitty)  hjkl select  u/i workspace  HJKL/U/I move  x close  t text  ⏎/o/Esc open "
         } else if overview {
@@ -876,6 +931,7 @@ fn prefix_binding(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('c') => Action::Center,
         KeyCode::Char('o') => Action::ToggleOverview,
         KeyCode::Char('x') => Action::Close,
+        KeyCode::Char('d') => Action::Detach,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
     };

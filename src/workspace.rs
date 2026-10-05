@@ -118,6 +118,40 @@ impl Workspaces {
         &self.list
     }
 
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.list.iter().position(|w| w.name() == Some(name))
+    }
+
+    /// Adds a named workspace just above the empty one at the bottom, and
+    /// returns its index.
+    pub fn create_named(&mut self, name: String) -> usize {
+        let idx = self.list.len() - 1;
+        let workspace = self.new_workspace(Some(name));
+        for view in self.views.values_mut() {
+            view.strips
+                .insert(idx, StripView::settled(&workspace.strip, None));
+            if view.active >= idx {
+                view.active += 1;
+                view.y += 1.0;
+            }
+        }
+        self.list.insert(idx, workspace);
+        idx
+    }
+
+    /// Puts `client` on workspace `idx` straight away, without sliding there.
+    pub fn set_active(&mut self, client: ClientId, idx: usize) {
+        let view = self.view_mut(client);
+        view.active = idx;
+        view.y = idx as f64;
+        self.normalize();
+    }
+
+    /// How many clients are on workspace `idx`.
+    pub fn clients_on(&self, idx: usize) -> usize {
+        self.views.values().filter(|v| v.active == idx).count()
+    }
+
     pub fn active_index(&self, client: ClientId) -> usize {
         self.view(client).active
     }
@@ -568,5 +602,26 @@ mod tests {
         settle(&mut ws);
         assert!(ws.in_overview(A) && !ws.in_overview(B));
         assert_eq!((ws.zoom(A), ws.zoom(B)), (0.5, 1.0));
+    }
+
+    #[test]
+    fn named_workspaces_are_created_above_the_empty_one() {
+        let mut ws = with_client(&["work"]);
+        ws.focus_down(A); // onto the empty one
+        let idx = ws.create_named("play".into());
+        assert_eq!(idx, 1);
+        assert_eq!(
+            shape(&ws),
+            [
+                (Some("work"), vec![]),
+                (Some("play"), vec![]),
+                (None, vec![])
+            ]
+        );
+        // A was on the empty workspace, which moved down a place.
+        assert_eq!(ws.active_index(A), 2);
+        assert_eq!(ws.find("play"), Some(1));
+        ws.set_active(A, 1);
+        assert_eq!((ws.active_index(A), ws.y(A), ws.clients_on(1)), (1, 1.0, 1));
     }
 }

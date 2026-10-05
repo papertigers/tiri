@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -54,9 +55,9 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Starts the user's shell in a new PTY. Its output is read with
-    /// [`Self::read_ready`] once [`Self::fd`] polls readable.
-    pub fn spawn(rows: u16, cols: u16) -> Result<Self> {
+    /// Starts the user's shell in a new PTY, in `cwd`. Its output is read
+    /// with [`Self::read_ready`] once [`Self::fd`] polls readable.
+    pub fn spawn(rows: u16, cols: u16, cwd: &Path) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(pty_size(rows, cols))
             .context("failed to open pty")?;
@@ -65,9 +66,7 @@ impl Pane {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TIRI", "1");
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
-        }
+        cmd.cwd(cwd);
         let child = pair
             .slave
             .spawn_command(cmd)
