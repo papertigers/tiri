@@ -3,10 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Workspaces stacked vertically, niri-style, each with its own strip of
-//! columns. They're tiri's sessions: named workspaces stay until closed even
-//! when empty, unnamed ones disappear once nobody is on them and they're
-//! empty, and there's always one empty workspace at the bottom to start
-//! something new in.
+//! columns. Named workspaces stay until closed, even when empty; unnamed
+//! ones disappear once nobody is on them and they're empty; and there's
+//! always one empty workspace at the bottom to start something new in.
 //!
 //! The workspaces and their columns are shared. Each attached client has its
 //! own [`View`] of them: which workspace it's on, whether its overview is
