@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Application state, split in two: [`App`] holds what every attached
 //! client shares (the panes and the workspaces), and [`Client`] holds one
 //! terminal's own state (its size, its drawing, and its view of the

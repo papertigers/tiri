@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The niri-style scrollable strip: an unbounded row of columns with a
 //! viewport sliding over it. Opening a column never resizes the others; the
 //! viewport scrolls instead. Each column is a stack of one or more panes

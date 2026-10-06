@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The tiri server: owns every pane and workspace, and serves the clients
 //! attached over its Unix socket. Everything runs on one `polling` loop:
 //! pane PTYs, the listening socket and client connections are all

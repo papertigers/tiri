@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! tiri's own colors: pane borders, the status bar, labels and hints, and
 //! the selection. Pane contents keep their programs' and the terminal's
 //! colors whatever the theme.

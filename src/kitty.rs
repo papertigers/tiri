@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The kitty graphics protocol, as far as the overview needs it: uploading
 //! images, and showing them through Unicode placeholders so they live in
 //! ordinary text cells that scroll and clip like everything else.

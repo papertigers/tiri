@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Rasterizing a terminal grid into a small RGBA image for the overview,
 //! using a built-in 8x8 bitmap font. Thumbnails are viewed shrunk, so the
 //! goal is the right shapes and colors rather than pretty text.
