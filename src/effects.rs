@@ -498,7 +498,11 @@ mod tests {
     #[test]
     fn placeholder_cells_keep_their_colors() {
         let mut new = filled("n");
-        let id = Style::fg(Color::Rgb(0, 0, 7));
+        let id = Style {
+            fg: Color::Rgb(0, 0, 7),
+            underline_color: Color::Rgb(0, 0, 7),
+            ..Style::default()
+        };
         new.put(5, 5, &kitty::placeholder(0, 0), id);
         let mut transition =
             Transition::new(filled("o"), true, &Palette::default());
@@ -509,6 +513,7 @@ mod tests {
             &[ms(0), ms(140), ms(141), ms(141 + 100)],
         );
         assert_eq!(frame.content(5, 5).2.fg, Color::Rgb(0, 0, 7));
+        assert_eq!(frame.content(5, 5).2.underline_color, Color::Rgb(0, 0, 7));
     }
 
     #[test]

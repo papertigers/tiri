@@ -30,6 +30,10 @@ pub struct Style {
     pub underline: bool,
     pub inverse: bool,
     pub strikeout: bool,
+    /// The underline color - used by kitty graphics placeholders to
+    /// identify a placement even when the cell is not underlined.
+    /// https://sw.kovidgoyal.net/kitty/underlines/
+    pub underline_color: Color,
 }
 
 impl Style {
@@ -302,6 +306,7 @@ fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     out.queue(SetAttribute(Attribute::Reset))?;
     out.queue(SetForegroundColor(color(s.fg)))?;
     out.queue(SetBackgroundColor(color(s.bg)))?;
+    set_underline_color(out, s.underline_color)?;
     for (on, attr) in [
         (s.bold, Attribute::Bold),
         (s.dim, Attribute::Dim),
@@ -317,6 +322,16 @@ fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     Ok(())
 }
 
+/// Writes SGR's underline color directly - it can carry kitty graphics
+/// metadata even when ordinary colored output has been disabled.
+fn set_underline_color(out: &mut impl Write, color: Color) -> io::Result<()> {
+    match color {
+        Color::Default => out.write_all(b"\x1b[59m"),
+        Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
+        Color::Rgb(r, g, b) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
+    }
+}
+
 fn color(c: Color) -> style::Color {
     match c {
         Color::Default => style::Color::Reset,
@@ -328,6 +343,18 @@ fn color(c: Color) -> style::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_underline_color() {
+        let mut out = Vec::new();
+        apply_style(
+            &mut out,
+            Style { underline_color: Color::Rgb(1, 2, 3), ..Style::default() },
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[58;2;1;2;3m"), "{out:?}");
+    }
 
     #[test]
     fn put_str_gives_characters_their_width() {

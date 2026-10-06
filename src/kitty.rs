@@ -20,9 +20,6 @@ use crate::thumbnail::Image;
 /// foreground color, and which part of the image in two combining marks.
 pub const PLACEHOLDER: char = '\u{10EEEE}';
 
-/// Each image has a single virtual placement, with this id.
-const PLACEMENT_ID: u32 = 1;
-
 /// Payloads are sent in chunks of at most this many base64 bytes.
 const CHUNK: usize = 4096;
 
@@ -371,16 +368,16 @@ pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
 /// creating or resizing its virtual placement. The terminal scales the
 /// image to fit.
 ///
-/// The placement always gets the same id, so it replaces the previous one.
-/// Re-uploading an image keeps its placements, and an unnumbered placement
-/// is added alongside them; placeholders then use whichever the terminal
-/// finds first, which after a resize is often one with the old size.
+/// The placement uses the image id too. Each image has one placement, so this
+/// replaces its previous size without colliding with another image's placement.
+/// This was found on iTerm2 which treats placement ids as global rather
+/// than scoping them to an image. Re-uploading an image keeps its placements,
+/// and an unnumbered placement is added alongside them; placeholders then use
+/// whichever the terminal finds first, which after a resize is often one with
+/// the old size.
 pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
-    write!(
-        out,
-        "\x1b_Ga=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows},q=2\x1b\\"
-    )
-    .expect("writing to memory can't fail");
+    write!(out, "\x1b_Ga=p,U=1,i={id},p={id},c={cols},r={rows},q=2\x1b\\")
+        .expect("writing to memory can't fail");
 }
 
 /// Frees image `id` and its placements.
@@ -442,7 +439,7 @@ mod tests {
         assert!(upload.iter().all(|c| c.contains("q=2,m=")), "{upload:?}");
         assert_eq!(
             commands[commands.len() - 1],
-            "\x1b_Ga=p,U=1,i=7,p=1,c=10,r=5,q=2"
+            "\x1b_Ga=p,U=1,i=7,p=7,c=10,r=5,q=2"
         );
 
         // The payload decodes back to the image.
@@ -453,5 +450,18 @@ mod tests {
         let zlib = BASE64.decode(payload).unwrap();
         let rgba = miniz_oxide::inflate::decompress_to_vec_zlib(&zlib).unwrap();
         assert_eq!(rgba, image.rgba);
+    }
+
+    #[test]
+    fn placements_are_unique_between_images() {
+        let mut out = Vec::new();
+
+        // 6 7 lol
+        place(&mut out, 6, 10, 5);
+        place(&mut out, 7, 10, 5);
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("i=6,p=6"));
+        assert!(text.contains("i=7,p=7"));
     }
 }

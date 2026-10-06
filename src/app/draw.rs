@@ -140,7 +140,12 @@ impl App {
             let top = content_top(pane, h - 2, scrolled);
             match client.thumbnails.get(&id) {
                 Some(thumb) if thumbnails => {
-                    let style = Style::fg(kitty::id_color(image_id(id)));
+                    let id = kitty::id_color(image_id(id));
+                    let style = Style {
+                        fg: id,
+                        underline_color: id,
+                        ..Style::default()
+                    };
                     let (cols, rows) = thumb.size;
                     for r in 0..rows {
                         for c in 0..cols {

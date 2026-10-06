@@ -102,6 +102,7 @@ fn cell_style(
     Style {
         fg: term_color(pane, cell.fg),
         bg: term_color(pane, cell.bg),
+        underline_color: Color::Default,
         bold: flags.contains(Flags::BOLD),
         dim: flags.contains(Flags::DIM) || is_dim_named(cell.fg),
         italic: flags.contains(Flags::ITALIC),
