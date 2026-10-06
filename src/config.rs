@@ -15,9 +15,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 use knus::ast::{Literal, SpannedNode, TypeName};
 use knus::decode::{Context, Kind};
 use knus::errors::{DecodeError, ExpectedType};
-use knus::span::Spanned;
+use knus::span::{Span, Spanned};
 use knus::traits::{DecodeScalar, ErrorSpan};
-use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, LabeledSpan, SourceCode};
+use miette::{
+    Diagnostic, GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, SourceCode,
+};
 
 use crate::keys::{Action, Bindings, Key, Table};
 use crate::render::Color;
@@ -44,8 +46,9 @@ impl Default for Config {
 /// [`DEFAULT`], parsed once. A test checks that it parses.
 static BUILT_IN: LazyLock<Config> = LazyLock::new(|| {
     decode("default-config.kdl", DEFAULT)
-        .map_err(|e| e.to_string())
-        .and_then(|raw| raw.resolve(None))
+        .and_then(|raw| {
+            (raw.resolve(None)).map_err(|p| report("default-config.kdl", DEFAULT, &[&p]))
+        })
         .expect("the default config is valid")
 });
 
@@ -66,7 +69,7 @@ impl Config {
     pub fn parse(file: &str, text: &str) -> Result<Config, ConfigError> {
         decode(file, text)?
             .resolve(Some(Config::default().bindings))
-            .map_err(|problem| ConfigError::plain(file, problem))
+            .map_err(|problem| report(file, text, &[&problem]))
     }
 }
 
@@ -145,43 +148,86 @@ impl Diagnostic for InFile<'_> {
 fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
     knus::parse(file, text).map_err(|e| {
         let problems: Vec<&dyn Diagnostic> = e.related().into_iter().flatten().collect();
-        let Some(first) = problems.first() else {
+        if problems.is_empty() {
             return ConfigError::plain(file, e.to_string());
-        };
-        let line = first
-            .labels()
-            .and_then(|mut labels| labels.next())
-            .map(|label| {
-                let before = &text.as_bytes()[..label.offset().min(text.len())];
-                before.iter().filter(|&&b| b == b'\n').count() + 1
-            });
-        let mut summary = match line {
-            Some(line) => format!("{}:{line}: {first}", file_name(file)),
-            None => format!("{}: {first}", file_name(file)),
-        };
-        if problems.len() > 1 {
-            write!(summary, " (and {} more)", problems.len() - 1)
-                .expect("writing to memory can't fail");
         }
-
-        // Each problem with the lines at fault, as plain text: it goes to
-        // the server's log and to terminals.
-        let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
-        let mut report = format!("{file} has errors:\n");
-        for problem in &problems {
-            let shown = InFile {
-                problem: *problem,
-                text: e.source_code().unwrap_or(&text),
-            };
-            if handler.render_report(&mut report, &shown).is_err() {
-                writeln!(report, "  {problem}").expect("writing to memory can't fail");
-            }
-        }
-        ConfigError {
-            summary,
-            report: report.trim_end().to_owned(),
-        }
+        report(file, text, &problems)
     })
+}
+
+/// The error for `problems` in config `text`: the first in one line, with
+/// its line number, and all of them with the lines at fault quoted.
+fn report(file: &str, text: &str, problems: &[&dyn Diagnostic]) -> ConfigError {
+    let first = problems[0];
+    let line = first
+        .labels()
+        .and_then(|mut labels| labels.next())
+        .map(|label| {
+            let before = &text.as_bytes()[..label.offset().min(text.len())];
+            before.iter().filter(|&&b| b == b'\n').count() + 1
+        });
+    let mut summary = match line {
+        Some(line) => format!("{}:{line}: {first}", file_name(file)),
+        None => format!("{}: {first}", file_name(file)),
+    };
+    if problems.len() > 1 {
+        write!(summary, " (and {} more)", problems.len() - 1)
+            .expect("writing to memory can't fail");
+    }
+
+    // As plain text: it goes to the server's log and to terminals.
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let source = NamedSource::new(file, text.to_owned());
+    let mut report = format!("{file} has errors:\n");
+    for problem in problems {
+        let shown = InFile {
+            problem: *problem,
+            text: &source,
+        };
+        if handler.render_report(&mut report, &shown).is_err() {
+            writeln!(report, "  {problem}").expect("writing to memory can't fail");
+        }
+    }
+    ConfigError {
+        summary,
+        report: report.trim_end().to_owned(),
+    }
+}
+
+/// A mistake found after parsing, such as a name that isn't defined, and
+/// where in the file it is.
+#[derive(Debug)]
+struct Problem {
+    message: String,
+    /// What's at fault there, under the quoted line.
+    label: &'static str,
+    at: Option<Span>,
+}
+
+impl Problem {
+    fn at(span: Span, label: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            label,
+            at: Some(span),
+        }
+    }
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Problem {}
+
+impl Diagnostic for Problem {
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
+        let span = self.at?;
+        let label = LabeledSpan::new_with_span(Some(self.label.to_owned()), span);
+        Some(Box::new(std::iter::once(label)))
+    }
 }
 
 /// Where the config file is: under `$XDG_CONFIG_HOME`, or `~/.config`.
@@ -193,15 +239,17 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("tiri").join("config.kdl"))
 }
 
-/// The file as written, before theme names are looked up.
+/// The file as written, before theme names are looked up. Names keep where
+/// they were written, for errors about them.
 #[derive(knus::Decode, Debug, Default)]
+#[knus(span_type = Span)]
 struct RawConfig {
     #[knus(child, unwrap(argument), default)]
-    theme: Option<String>,
+    theme: Option<Spanned<String, Span>>,
     #[knus(children(name = "define-theme"))]
     themes: Vec<RawTheme>,
     #[knus(child, unwrap(argument), default)]
-    prefix: Option<ConfigKey>,
+    prefix: Option<Spanned<ConfigKey, Span>>,
     #[knus(child, default)]
     prefix_binds: RawBinds,
     #[knus(child, default)]
@@ -212,6 +260,7 @@ struct RawConfig {
 
 /// A section of key bindings, as in `binds { Alt+h { focus-column-left; } }`.
 #[derive(knus::Decode, Debug, Default)]
+#[knus(span_type = Span)]
 struct RawBinds {
     #[knus(children)]
     binds: Vec<RawBind>,
@@ -221,11 +270,17 @@ struct RawBinds {
 #[derive(Debug)]
 struct RawBind {
     key: Key,
+    /// Where the key is written.
+    at: Span,
     action: Option<Action>,
 }
 
-impl<S: ErrorSpan> knus::Decode<S> for RawBind {
-    fn decode_node(node: &SpannedNode<S>, ctx: &mut Context<S>) -> Result<Self, DecodeError<S>> {
+impl knus::Decode<Span> for RawBind {
+    fn decode_node(
+        node: &SpannedNode<Span>,
+        ctx: &mut Context<Span>,
+    ) -> Result<Self, DecodeError<Span>> {
+        let at = *node.node_name.span();
         let key = node
             .node_name
             .parse::<Key>()
@@ -247,11 +302,16 @@ impl<S: ErrorSpan> knus::Decode<S> for RawBind {
                     "unbind takes nothing",
                 ));
             }
-            return Ok(RawBind { key, action: None });
+            return Ok(RawBind {
+                key,
+                at,
+                action: None,
+            });
         }
         let action = Action::decode_node(child, ctx)?;
         Ok(RawBind {
             key,
+            at,
             action: Some(action),
         })
     }
@@ -276,25 +336,40 @@ fn only_a_name<S: ErrorSpan>(node: &SpannedNode<S>, ctx: &mut Context<S>, messag
 }
 
 impl RawBinds {
-    /// Applies these bindings on top of `table`.
-    fn apply_to(self, table: &mut Table, section: &str) -> Result<(), String> {
+    /// Applies these bindings on top of `table`. The prefix key can't be
+    /// bound: it always starts a prefix binding (or, pressed twice, is
+    /// typed). A built-in binding it takes over goes quietly.
+    fn apply_to(self, table: &mut Table, section: &str, prefix: Key) -> Result<(), Problem> {
         let mut seen = HashSet::new();
         for bind in self.binds {
             if !seen.insert(bind.key) {
-                return Err(format!("{section} has {} more than once", bind.key));
+                return Err(Problem::at(
+                    bind.at,
+                    "bound again here",
+                    format!("{section} has {} more than once", bind.key),
+                ));
+            }
+            if bind.key == prefix && bind.action.is_some() {
+                return Err(Problem::at(
+                    bind.at,
+                    "the prefix key",
+                    format!("{section} binds {prefix}, which is the prefix key"),
+                ));
             }
             table.set(bind.key, bind.action);
         }
+        table.set(prefix, None);
         Ok(())
     }
 }
 
 #[derive(knus::Decode, Debug)]
+#[knus(span_type = Span)]
 struct RawTheme {
     #[knus(argument)]
-    name: String,
+    name: Spanned<String, Span>,
     #[knus(property(name = "based-on"), default)]
-    based_on: Option<String>,
+    based_on: Option<Spanned<String, Span>>,
     #[knus(child, unwrap(argument), default)]
     focused_border: Option<ConfigColor>,
     #[knus(child, unwrap(argument), default)]
@@ -314,20 +389,26 @@ struct RawTheme {
 }
 
 impl RawConfig {
-    /// Looks names up, and lays this config's bindings over `bindings`.
     /// Looks names up, and lays this config's bindings over `base`: the
     /// built-in ones, or nothing for the config that defines those.
-    fn resolve(self, base: Option<Bindings>) -> Result<Config, String> {
-        let mut bindings = match (base, self.prefix) {
+    fn resolve(self, base: Option<Bindings>) -> Result<Config, Problem> {
+        let prefix = self.prefix.map(|prefix| prefix.0);
+        let mut bindings = match (base, prefix) {
             (Some(base), None) => base,
-            (Some(base), Some(ConfigKey(prefix))) => Bindings { prefix, ..base },
-            (None, Some(ConfigKey(prefix))) => Bindings {
+            (Some(base), Some(prefix)) => Bindings { prefix, ..base },
+            (None, Some(prefix)) => Bindings {
                 prefix,
                 prefix_binds: Table::default(),
                 binds: Table::default(),
                 overview_binds: Table::default(),
             },
-            (None, None) => return Err("no prefix is set".to_owned()),
+            (None, None) => {
+                return Err(Problem {
+                    message: "no prefix is set".to_owned(),
+                    label: "",
+                    at: None,
+                });
+            }
         };
         let prefix = bindings.prefix;
         for (binds, table, section) in [
@@ -343,30 +424,26 @@ impl RawConfig {
                 "overview-binds",
             ),
         ] {
-            // The prefix key always starts a prefix binding (or, pressed
-            // twice, is typed), so it can't do anything else.
-            if (binds.binds.iter()).any(|bind| bind.key == prefix && bind.action.is_some()) {
-                return Err(format!("{section} binds {prefix}, which is the prefix key"));
-            }
-            binds.apply_to(table, section)?;
-            // A built-in binding it takes over goes quietly.
-            table.set(prefix, None);
+            binds.apply_to(table, section, prefix)?;
         }
 
         let mut defined: Vec<(String, Theme)> = Vec::new();
         for raw in self.themes {
-            let taken =
-                Theme::named(&raw.name).is_some() || defined.iter().any(|(n, _)| *n == raw.name);
-            if taken {
-                return Err(format!("there's already a theme named {:?}", raw.name));
+            let name: &str = &raw.name;
+            if Theme::named(name).is_some() || defined.iter().any(|(n, _)| n == name) {
+                return Err(Problem::at(
+                    *raw.name.span(),
+                    "taken",
+                    format!("there's already a theme named {name:?}"),
+                ));
             }
             // Themes can build on built-in ones, or ones defined above.
             let base = match &raw.based_on {
                 None => Theme::default(),
-                Some(name) => lookup(name, &defined)
-                    .ok_or_else(|| unknown_theme("based-on", name, &defined))?,
+                Some(base) => lookup(base, &defined)
+                    .ok_or_else(|| unknown_theme("based-on", base, &defined))?,
             };
-            let name = raw.name.clone();
+            let name = name.to_owned();
             defined.push((name, raw.apply_to(base)));
         }
         let theme = match &self.theme {
@@ -408,14 +485,18 @@ fn lookup(name: &str, defined: &[(String, Theme)]) -> Option<Theme> {
         .or_else(|| Theme::named(name))
 }
 
-fn unknown_theme(setting: &str, name: &str, defined: &[(String, Theme)]) -> String {
+/// That `name`, given for `setting`, isn't a theme defined so far.
+fn unknown_theme(
+    setting: &str,
+    name: &Spanned<String, Span>,
+    defined: &[(String, Theme)],
+) -> Problem {
     let names: Vec<&str> = (Theme::ALL.iter().map(|(n, _)| *n))
         .chain(defined.iter().map(|(n, _)| n.as_str()))
         .collect();
-    format!(
-        "{setting} {name:?} isn't a theme; there's {}",
-        names.join(", ")
-    )
+    let known = names.join(", ");
+    let message = format!("{setting} {:?} isn't a theme; there's {known}", **name);
+    Problem::at(*name.span(), "not a theme, or not defined yet", message)
 }
 
 /// A key as written in the config's `prefix`, as in "Ctrl+a".
@@ -632,7 +713,7 @@ mod tests {
         let err = parse("prefix \"Alt+o\"\nbinds { Alt+o { detach; }; }").unwrap_err();
         assert_eq!(
             err.summary,
-            "config.kdl: binds binds Alt+o, which is the prefix key"
+            "config.kdl:2: binds binds Alt+o, which is the prefix key"
         );
         // Unbinding it is fine, if unneeded.
         assert!(parse("prefix \"Alt+o\"\nbinds { Alt+o { unbind; }; }").is_ok());
@@ -672,13 +753,33 @@ mod tests {
             "{report}"
         );
         assert!(!report.ends_with('\n'));
+    }
 
-        let err = Config::parse("/etc/config.kdl", "theme \"nope\"").unwrap_err();
+    #[test]
+    fn mistakes_in_names_say_where_they_are() {
+        let summary = |text: &str| parse(text).unwrap_err().summary;
         assert_eq!(
-            err.summary,
-            "config.kdl: theme \"nope\" isn't a theme; there's default, oxide"
+            summary("// a comment\ntheme \"nope\""),
+            "config.kdl:2: theme \"nope\" isn't a theme; there's default, oxide"
         );
-        assert!(err.to_string().starts_with("/etc/config.kdl: theme"));
+        assert_eq!(
+            summary("define-theme \"a\" {}\n\ndefine-theme \"b\" based-on=\"c\" {}"),
+            "config.kdl:3: based-on \"c\" isn't a theme; there's default, oxide, a"
+        );
+        assert_eq!(
+            summary("define-theme \"oxide\" {}"),
+            "config.kdl:1: there's already a theme named \"oxide\""
+        );
+        assert_eq!(
+            summary("binds {\n    Alt+h { detach; }\n    Alt+h { detach; }\n}"),
+            "config.kdl:3: binds has Alt+h more than once"
+        );
+        // And the report quotes the line, labelled.
+        let report = parse("binds {\n    Alt+h { detach; }\n    Alt+h { detach; }\n}")
+            .unwrap_err()
+            .to_string();
+        assert!(report.contains("3 │     Alt+h { detach; }"), "{report}");
+        assert!(report.contains("bound again here"), "{report}");
     }
 
     #[test]

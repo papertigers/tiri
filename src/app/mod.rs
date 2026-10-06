@@ -105,21 +105,21 @@ impl App {
         } = hello;
         let (width, height) = clamp_size(width, height);
         // Edits to the config apply from the next attach, for everyone. A
-        // config with mistakes is left out, with a word to whoever attached:
-        // refusing would shut them out of their own panes.
-        let config_error = self
-            .config_path
-            .as_ref()
-            .and_then(|path| match Config::load(path) {
-                Ok(config) => {
-                    self.config = config;
-                    None
-                }
+        // config with mistakes gives way to the default one, with a word to
+        // whoever attached: refusing would shut them out of their own panes,
+        // and keeping whatever loaded last would depend on what came before
+        // (on a first run, nothing has).
+        let config_error = self.config_path.as_ref().and_then(|path| {
+            let (config, error) = match Config::load(path) {
+                Ok(config) => (config, None),
                 Err(e) => {
-                    log::warn!("keeping the config as it was: {e}");
-                    Some(e.summary)
+                    log::warn!("using the default config: {e}");
+                    (Config::default(), Some(e.summary))
                 }
-            });
+            };
+            self.config = config;
+            error
+        });
         let workspace = match &target {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
@@ -163,7 +163,7 @@ impl App {
             paste: None,
         };
         if let Some(error) = config_error {
-            client.notify(format!("{error}; config not applied"));
+            client.notify(format!("{error}; using the default config"));
         }
         self.lay_out_for(&client);
         if (matches!(target, Target::New(_)) || self.panes.is_empty())
