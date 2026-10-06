@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::layout::{OVERVIEW_MAX_ZOOM, PaneId, Strip, StripView};
+use crate::layout::{
+    ColumnWidths, OVERVIEW_MAX_ZOOM, PaneId, Strip, StripView,
+};
 
 /// Time constant for the vertical slide between workspaces; matches the
 /// strip's horizontal scrolling.
@@ -61,6 +63,7 @@ pub struct Workspaces {
     list: Vec<Workspace>,
     view_width: u16,
     max_stack: usize,
+    column_widths: ColumnWidths,
     views: HashMap<ClientId, View>,
 }
 
@@ -72,6 +75,7 @@ impl Workspaces {
             list: Vec::new(),
             view_width,
             max_stack: usize::MAX,
+            column_widths: ColumnWidths::default(),
             views: HashMap::new(),
         };
         for name in names {
@@ -85,6 +89,7 @@ impl Workspaces {
     fn new_workspace(&self, name: Option<String>) -> Workspace {
         let mut strip = Strip::new(self.view_width);
         strip.set_max_stack(self.max_stack);
+        strip.set_column_widths(&self.column_widths);
         Workspace { name, strip }
     }
 
@@ -310,6 +315,14 @@ impl Workspaces {
         let zoom = self.overview_zoom();
         for view in self.views.values_mut() {
             settle(view, &self.list, zoom);
+        }
+    }
+
+    /// Sets the widths columns cycle through and open at, everywhere.
+    pub fn set_column_widths(&mut self, widths: &ColumnWidths) {
+        self.column_widths.clone_from(widths);
+        for workspace in &mut self.list {
+            workspace.strip.set_column_widths(widths);
         }
     }
 

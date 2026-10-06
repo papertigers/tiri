@@ -27,6 +27,7 @@ use miette::{
 };
 
 use crate::keys::{Action, Bindings, Key, Table};
+use crate::layout::{ColumnWidth, ColumnWidths};
 use crate::render::Color;
 use crate::theme::Theme;
 
@@ -34,10 +35,11 @@ use crate::theme::Theme;
 pub const DEFAULT: &str = include_str!("default-config.kdl");
 
 /// What the config file sets, resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub theme: Theme,
     pub bindings: Bindings,
+    pub column_widths: ColumnWidths,
 }
 
 impl Default for Config {
@@ -81,7 +83,7 @@ impl Config {
     /// add to and override the built-in ones.
     pub fn parse(file: &str, text: &str) -> Result<Config, ConfigError> {
         decode(file, text)?
-            .resolve(Some(Config::default().bindings))
+            .resolve(Some(Config::default()))
             .map_err(|problem| report(file, text, &[&problem]))
     }
 }
@@ -261,6 +263,89 @@ struct RawConfig {
     binds: RawBinds,
     #[knus(child, default)]
     overview_binds: RawBinds,
+    #[knus(child, default)]
+    layout: RawLayout,
+}
+
+/// The `layout` section, niri's way of giving column widths.
+#[derive(knus::Decode, Debug, Default)]
+#[knus(span_type = Span)]
+struct RawLayout {
+    #[knus(child)]
+    preset_column_widths: Option<RawWidths>,
+    #[knus(child)]
+    default_column_width: Option<RawWidths>,
+}
+
+/// A list of widths, and where it's written.
+#[derive(knus::Decode, Debug)]
+#[knus(span_type = Span)]
+struct RawWidths {
+    #[knus(span)]
+    span: Span,
+    #[knus(children)]
+    widths: Vec<RawWidth>,
+}
+
+/// A column width as written: `proportion 0.5;` or `fixed 80;`.
+#[derive(knus::Decode, Debug)]
+#[knus(span_type = Span)]
+enum RawWidth {
+    Proportion(#[knus(argument)] Spanned<f64, Span>),
+    Fixed(#[knus(argument)] Spanned<u16, Span>),
+}
+
+impl RawWidth {
+    fn resolve(&self) -> Result<ColumnWidth, Problem> {
+        match self {
+            RawWidth::Proportion(share) if **share > 0.0 && **share <= 1.0 => {
+                Ok(ColumnWidth::Proportion(**share))
+            }
+            RawWidth::Proportion(share) => Err(Problem::at(
+                *share.span(),
+                "a share of the screen's width",
+                "a proportion is above 0 and at most 1",
+            )),
+            RawWidth::Fixed(cells) if **cells > 0 => {
+                Ok(ColumnWidth::Fixed(**cells))
+            }
+            RawWidth::Fixed(cells) => Err(Problem::at(
+                *cells.span(),
+                "characters wide",
+                "a fixed width is at least 1",
+            )),
+        }
+    }
+}
+
+impl RawLayout {
+    /// These widths over `base`'s.
+    fn resolve(self, mut base: ColumnWidths) -> Result<ColumnWidths, Problem> {
+        if let Some(presets) = self.preset_column_widths {
+            if presets.widths.is_empty() {
+                return Err(Problem::at(
+                    presets.span,
+                    "empty",
+                    "preset-column-widths needs at least one width",
+                ));
+            }
+            base.presets = (presets.widths.iter())
+                .map(RawWidth::resolve)
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(default) = self.default_column_width {
+            let [width] = &default.widths[..] else {
+                return Err(Problem::at(
+                    default.span,
+                    "one width",
+                    "default-column-width takes one width, as in \
+                     `default-column-width { proportion 0.5; }`",
+                ));
+            };
+            base.default = width.resolve()?;
+        }
+        Ok(base)
+    }
 }
 
 /// A section of key bindings, as in `binds { Alt+h { focus-column-left; } }`.
@@ -399,7 +484,12 @@ struct RawTheme {
 impl RawConfig {
     /// Looks names up, and lays this config's bindings over `base`: the
     /// built-in ones, or nothing for the config that defines those.
-    fn resolve(self, base: Option<Bindings>) -> Result<Config, Problem> {
+    fn resolve(self, base: Option<Config>) -> Result<Config, Problem> {
+        let (base, base_widths) = match base {
+            Some(base) => (Some(base.bindings), base.column_widths),
+            None => (None, ColumnWidths::default()),
+        };
+        let column_widths = self.layout.resolve(base_widths)?;
         let prefix = self.prefix.map(|prefix| prefix.0);
         let mut bindings = match (base, prefix) {
             (Some(base), None) => base,
@@ -457,7 +547,7 @@ impl RawConfig {
             Some(name) => lookup(name, &defined)
                 .ok_or_else(|| unknown_theme("theme", name, &defined))?,
         };
-        Ok(Config { theme, bindings })
+        Ok(Config { theme, bindings, column_widths })
     }
 }
 
@@ -805,6 +895,58 @@ mod tests {
                 .to_string();
         assert!(report.contains("3 │     Alt+h { detach; }"), "{report}");
         assert!(report.contains("bound again here"), "{report}");
+    }
+
+    #[test]
+    fn the_default_column_widths() {
+        assert_eq!(Config::default().column_widths, ColumnWidths::default());
+    }
+
+    #[test]
+    fn sets_column_widths() {
+        use ColumnWidth::{Fixed, Proportion};
+        let config = parse(
+            "layout {
+                preset-column-widths { proportion 0.25; fixed 80; }
+                default-column-width { fixed 100; }
+            }",
+        )
+        .unwrap();
+        assert_eq!(config.column_widths.presets, [Proportion(0.25), Fixed(80)]);
+        assert_eq!(config.column_widths.default, Fixed(100));
+        // Leaving one out keeps the default's.
+        let config =
+            parse("layout { default-column-width { proportion 1.0; }; }")
+                .unwrap();
+        assert_eq!(
+            config.column_widths.presets,
+            ColumnWidths::default().presets
+        );
+        assert_eq!(config.column_widths.default, Proportion(1.0));
+    }
+
+    #[test]
+    fn explains_column_width_mistakes() {
+        let summary = |text: &str| parse(text).unwrap_err().summary;
+        assert_eq!(
+            summary(
+                "layout {\n    preset-column-widths { proportion 1.5; }\n}"
+            ),
+            "config.kdl:2: a proportion is above 0 and at most 1"
+        );
+        assert_eq!(
+            summary("layout { default-column-width { fixed 0; }; }"),
+            "config.kdl:1: a fixed width is at least 1"
+        );
+        assert_eq!(
+            summary("layout {\n\n    preset-column-widths {}\n}"),
+            "config.kdl:3: preset-column-widths needs at least one width"
+        );
+        let two =
+            summary("layout { default-column-width { fixed 9; fixed 10; }; }");
+        assert!(two.contains("takes one width"), "{two}");
+        let unknown = summary("layout { preset-column-widths { half; }; }");
+        assert!(unknown.starts_with("config.kdl:1:"), "{unknown}");
     }
 
     #[test]

@@ -121,6 +121,7 @@ impl App {
                     (Config::default(), Some(e.summary))
                 }
             };
+            self.workspaces.set_column_widths(&config.column_widths);
             self.config = config;
             error
         });

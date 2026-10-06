@@ -9,10 +9,45 @@
 
 use std::time::Duration;
 
-/// Column widths as fractions of the viewport, cycled with "cycle width".
-pub const WIDTH_PRESETS: [f64; 4] = [1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0];
-const DEFAULT_PRESET: usize = 1;
 const MIN_COLUMN_WIDTH: u16 = 8;
+
+/// How wide a column is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnWidth {
+    /// A share of the view's width, from just above 0 to 1.
+    Proportion(f64),
+    /// So many cells, borders included.
+    Fixed(u16),
+}
+
+/// The full view width, as maximizing makes a column.
+const FULL_WIDTH: ColumnWidth = ColumnWidth::Proportion(1.0);
+
+/// The widths `switch-preset-column-width` steps through, and the width
+/// new columns start at. The config sets these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnWidths {
+    /// Never empty.
+    pub presets: Vec<ColumnWidth>,
+    pub default: ColumnWidth,
+}
+
+impl Default for ColumnWidths {
+    /// As the default config has them: a third, a half, two thirds and
+    /// the whole width, starting at a half.
+    fn default() -> Self {
+        use ColumnWidth::Proportion;
+        Self {
+            presets: vec![
+                Proportion(0.33333),
+                Proportion(0.5),
+                Proportion(0.66667),
+                Proportion(1.0),
+            ],
+            default: Proportion(0.5),
+        }
+    }
+}
 
 /// Time constant for the viewport easing; ~95% of the way there after 3x this.
 const SCROLL_TAU: f64 = 0.05;
@@ -24,26 +59,26 @@ const OVERVIEW_MIN_ZOOM: f64 = 0.25;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u32);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     /// Top to bottom; never empty.
     panes: Vec<PaneId>,
     /// Index of the focused pane in `panes`.
     focus: usize,
-    preset: usize,
-    /// The width preset to go back to when un-maximizing.
-    unmaximized: Option<usize>,
+    width: ColumnWidth,
+    /// The width to go back to when un-maximizing.
+    unmaximized: Option<ColumnWidth>,
     /// A pane shown fullscreen: the column takes the whole view width and
     /// this pane its whole height, hiding the rest of the stack.
     fullscreen: Option<PaneId>,
 }
 
 impl Column {
-    fn new(pane: PaneId) -> Self {
+    fn new(pane: PaneId, width: ColumnWidth) -> Self {
         Self {
             panes: vec![pane],
             focus: 0,
-            preset: DEFAULT_PRESET,
+            width,
             unmaximized: None,
             fullscreen: None,
         }
@@ -118,6 +153,7 @@ pub struct Strip {
     target_offset: i32,
     /// The most panes a column may hold before consuming is refused.
     max_stack: usize,
+    widths: ColumnWidths,
 }
 
 impl Strip {
@@ -128,7 +164,14 @@ impl Strip {
             view_width,
             target_offset: 0,
             max_stack: usize::MAX,
+            widths: ColumnWidths::default(),
         }
+    }
+
+    /// Sets the widths to cycle through and to open columns at. Columns
+    /// already open keep their widths.
+    pub fn set_column_widths(&mut self, widths: &ColumnWidths) {
+        self.widths.clone_from(widths);
     }
 
     /// The overview zoom that would fit this whole strip on screen.
@@ -178,13 +221,24 @@ impl Strip {
 
     pub fn column_width(&self, idx: usize) -> u16 {
         let column = &self.columns[idx];
-        let fraction = if column.fullscreen.is_some() {
-            1.0
+        if column.fullscreen.is_some() {
+            self.cells(FULL_WIDTH)
         } else {
-            WIDTH_PRESETS[column.preset]
+            self.cells(column.width)
+        }
+    }
+
+    /// `width` in cells, in this strip's view.
+    fn cells(&self, width: ColumnWidth) -> u16 {
+        let cells = match width {
+            // A share written with a few decimals, like 0.33333, should
+            // still come to a whole third of 99, not just under it.
+            ColumnWidth::Proportion(share) => {
+                (f64::from(self.view_width) * share + 1e-3).floor() as u16
+            }
+            ColumnWidth::Fixed(cells) => cells.min(self.view_width),
         };
-        ((f64::from(self.view_width) * fraction).floor() as u16)
-            .max(MIN_COLUMN_WIDTH)
+        cells.max(MIN_COLUMN_WIDTH)
     }
 
     /// Left edge of column `idx` in strip coordinates.
@@ -211,7 +265,7 @@ impl Strip {
 
     /// Opens a new column to the right of the focused one and focuses it.
     pub fn insert(&mut self, pane: PaneId) {
-        self.insert_column(Column::new(pane));
+        self.insert_column(Column::new(pane, self.widths.default));
     }
 
     /// Removes `pane`, and its column if it was the last pane there.
@@ -357,7 +411,8 @@ impl Strip {
             Side::Left => self.focus,
             Side::Right => self.focus + 1,
         };
-        self.columns.insert(idx, Column::new(pane));
+        let column = Column::new(pane, self.widths.default);
+        self.columns.insert(idx, column);
         self.focus = idx;
         self.scroll_to_focus();
     }
@@ -420,24 +475,37 @@ impl Strip {
         }
     }
 
+    /// niri's `switch-preset-column-width`: the focused column takes the
+    /// next preset width. A width that isn't one of them (the presets
+    /// changed since, say) goes to the next wider preset.
     pub fn cycle_width(&mut self) {
-        if let Some(col) = self.columns.get_mut(self.focus) {
-            col.preset = (col.preset + 1) % WIDTH_PRESETS.len();
-            col.unmaximized = None;
-            self.scroll_to_focus();
-        }
+        let Some(col) = self.columns.get(self.focus) else {
+            return;
+        };
+        let presets = &self.widths.presets;
+        let next = match presets.iter().position(|w| *w == col.width) {
+            Some(i) => presets[(i + 1) % presets.len()],
+            None => {
+                let now = self.cells(col.width);
+                let wider = presets.iter().find(|w| self.cells(**w) > now);
+                *wider.unwrap_or(&presets[0])
+            }
+        };
+        let col = &mut self.columns[self.focus];
+        col.width = next;
+        col.unmaximized = None;
+        self.scroll_to_focus();
     }
 
     /// niri's `maximize-column`: toggles the focused column between the
     /// full view width and the width it had before.
     pub fn toggle_maximized(&mut self) {
-        let full = WIDTH_PRESETS.len() - 1;
         if let Some(col) = self.columns.get_mut(self.focus) {
             match col.unmaximized.take() {
-                Some(preset) => col.preset = preset,
-                None if col.preset != full => {
-                    col.unmaximized = Some(col.preset);
-                    col.preset = full;
+                Some(width) => col.width = width,
+                None if col.width != FULL_WIDTH => {
+                    col.unmaximized = Some(col.width);
+                    col.width = FULL_WIDTH;
                 }
                 None => {}
             }
@@ -908,6 +976,48 @@ mod tests {
         assert!(strip.focus_pane(PaneId(0)));
         assert_eq!(strip.focus_index(), 0);
         assert!(!strip.focus_pane(PaneId(9)));
+    }
+
+    #[test]
+    fn presets_come_from_the_config() {
+        use ColumnWidth::{Fixed, Proportion};
+        let mut strip = Strip::new(100);
+        strip.set_column_widths(&ColumnWidths {
+            presets: vec![Fixed(40), Proportion(0.75)],
+            default: Fixed(30),
+        });
+        strip.insert(PaneId(0));
+        assert_eq!(strip.column_width(0), 30, "the default width");
+        strip.cycle_width(); // 30 isn't a preset: the next wider one
+        assert_eq!(strip.column_width(0), 40);
+        strip.cycle_width();
+        assert_eq!(strip.column_width(0), 75);
+        strip.cycle_width(); // round again
+        assert_eq!(strip.column_width(0), 40);
+
+        // New presets leave open columns as they are.
+        strip.set_column_widths(&ColumnWidths::default());
+        assert_eq!(strip.column_width(0), 40);
+        strip.cycle_width(); // the next wider: a half
+        assert_eq!(strip.column_width(0), 50);
+    }
+
+    #[test]
+    fn shares_written_as_decimals_divide_exactly() {
+        let mut strip = Strip::new(99);
+        strip.set_column_widths(&ColumnWidths {
+            default: ColumnWidth::Proportion(0.33333),
+            ..ColumnWidths::default()
+        });
+        strip.insert(PaneId(0));
+        assert_eq!(strip.column_width(0), 33);
+        // A fixed width wider than the view is the view.
+        strip.set_column_widths(&ColumnWidths {
+            default: ColumnWidth::Fixed(500),
+            ..ColumnWidths::default()
+        });
+        strip.insert(PaneId(1));
+        assert_eq!(strip.column_width(1), 99);
     }
 
     #[test]

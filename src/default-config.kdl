@@ -35,6 +35,21 @@ theme "default"
     selection-bg "reverse"
 }
 
+// Column widths, as niri gives them. switch-preset-column-width (Ctrl+a r)
+// steps the focused column through preset-column-widths; new columns open
+// at default-column-width. A proportion is a share of the screen's width,
+// above 0 and at most 1; fixed is a number of characters, borders included,
+// as in `fixed 80`.
+layout {
+    preset-column-widths {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+        proportion 1.0
+    }
+    default-column-width { proportion 0.5; }
+}
+
 // Key bindings. Keys are written like niri's: a key, after any of Ctrl+,
 // Alt+ and Shift+, as in Alt+Enter or Shift+h. Shift+h, Shift+H and H are
 // the same key. Characters KDL keeps for itself, like [ , and {, go in

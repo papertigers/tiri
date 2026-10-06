@@ -85,7 +85,7 @@ There are three sets of keys:
 | `.` | `Alt+.` | `.` | Expel the focused pane into a column of its own |
 | `u` `i` / `PgDn` `PgUp` | `Alt+u` `Alt+i` | `u` `i` | Go to the workspace below or above |
 | `U` `I` | `Alt+U` `Alt+I` | `U` `I` | Move the column to the workspace below or above |
-| `r` | `Alt+r` | `r` | Switch the column's width: ⅓, ½, ⅔ or full |
+| `r` | `Alt+r` | `r` | Switch the column's width: ⅓, ½, ⅔ or full, [or your own](#column-widths) |
 | `f` | `Alt+f` | `f` | Maximize the column, or put it back |
 | `F` | `Alt+F` | `F` | Make the pane fullscreen in its column, or put it back |
 | `c` | `Alt+c` | | Center the column |
@@ -166,6 +166,26 @@ binds {
 Keys are written like niri's: `Alt+Enter`, `Ctrl+b`, `Shift+h` (or just
 `H`), `PageUp`, `F5`. Characters KDL keeps for itself go in quotes, such
 as `"["` and `"Alt+,"`.
+
+### Column widths
+
+`Ctrl+a r` steps the focused column through preset widths, and new
+columns open at a default width. Set both as niri does:
+
+```kdl
+layout {
+    preset-column-widths {
+        proportion 0.5
+        proportion 0.75
+        fixed 100
+    }
+    default-column-width { proportion 0.5; }
+}
+```
+
+A `proportion` is a share of the screen's width, above 0 and at most 1.
+`fixed` is a number of characters, borders included. Columns already open
+keep their width when you change the presets.
 
 ### Themes
 
