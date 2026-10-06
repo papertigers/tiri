@@ -2,7 +2,15 @@
 name = "tiri"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "niri inspired terminal multiplexer"
 license = "MPL-2.0"
+repository = "https://github.com/papertigers/tiri"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "niri"]
+categories = ["command-line-utilities"]
+# What building needs; the screenshots in docs/ stay on GitHub.
+include = ["src/**", "README.md", "LICENSE"]
 
 [dependencies]
 alacritty_terminal = "0.26"
