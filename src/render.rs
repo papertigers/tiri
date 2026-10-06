@@ -274,7 +274,8 @@ impl Renderer {
         }
 
         let mut pos: Option<(u16, u16)> = None;
-        let mut current: Option<Style> = None;
+        // Every frame ends with a reset, and the first starts with one.
+        let mut current = Style::default();
         for y in 0..frame.height {
             for x in 0..frame.width {
                 let i =
@@ -288,9 +289,9 @@ impl Renderer {
                 if pos != Some((x, y)) {
                     out.queue(cursor::MoveTo(x, y))?;
                 }
-                if current != Some(cell.style) {
-                    apply_style(out, cell.style)?;
-                    current = Some(cell.style);
+                if current != cell.style {
+                    change_style(out, current, cell.style)?;
+                    current = cell.style;
                 }
                 out.queue(style::Print(&cell.sym))?;
                 // Where terminals may disagree on how far that moved the
@@ -313,66 +314,100 @@ impl Renderer {
     }
 }
 
-fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
-    use style::{Attribute, SetAttribute};
-    out.queue(SetAttribute(Attribute::Reset))?;
-    set_color(out, 38, s.fg)?;
-    set_color(out, 48, s.bg)?;
-    set_color(out, 58, s.underline_color)?;
-    for (on, attr) in [
-        (s.bold, Attribute::Bold),
-        (s.dim, Attribute::Dim),
-        (s.italic, Attribute::Italic),
-        (s.underline, Attribute::Underlined),
-        (s.inverse, Attribute::Reverse),
-        (s.strikeout, Attribute::CrossedOut),
-    ] {
-        if on {
-            out.queue(SetAttribute(attr))?;
-        }
-    }
-    Ok(())
-}
-
-/// Sets the foreground (`base` 38), background (48) or underline (58)
-/// color, just after a reset. The default needs nothing, as the reset has
-/// set it already.
+/// Changes the terminal's style from `from` to `to`, in one sequence that
+/// only names what differs: a fade changes a color or two from one cell
+/// to the next, and over ssh every byte of it counts.
 ///
 /// Written here rather than with crossterm, which leaves colors out when
 /// NO_COLOR is set: tiri passes on the colors programs in its panes chose,
 /// and kitty placeholders need theirs to name their image.
-fn set_color(out: &mut impl Write, base: u8, color: Color) -> io::Result<()> {
-    match color {
-        Color::Default => Ok(()),
-        Color::Idx(i) => write!(out, "\x1b[{base};5;{i}m"),
-        Color::Rgb(r, g, b) => write!(out, "\x1b[{base};2;{r};{g};{b}m"),
+fn change_style(
+    out: &mut impl Write,
+    from: Style,
+    to: Style,
+) -> io::Result<()> {
+    let mut params = String::new();
+    let mut add = |param: &str| {
+        if !params.is_empty() {
+            params.push(';');
+        }
+        params.push_str(param);
+    };
+    // One code turns off both bold and dim, so the one staying goes back on.
+    let bold_or_dim_off = (from.bold && !to.bold) || (from.dim && !to.dim);
+    if bold_or_dim_off {
+        add("22");
     }
+    for (was, is, on, off) in [
+        (from.bold && !bold_or_dim_off, to.bold, "1", ""),
+        (from.dim && !bold_or_dim_off, to.dim, "2", ""),
+        (from.italic, to.italic, "3", "23"),
+        (from.underline, to.underline, "4", "24"),
+        (from.inverse, to.inverse, "7", "27"),
+        (from.strikeout, to.strikeout, "9", "29"),
+    ] {
+        if was != is {
+            add(if is { on } else { off });
+        }
+    }
+    for (was, is, base) in [
+        (from.fg, to.fg, 38),
+        (from.bg, to.bg, 48),
+        (from.underline_color, to.underline_color, 58),
+    ] {
+        if was != is {
+            add(&match is {
+                // 39, 49 and 59.
+                Color::Default => format!("{}", base + 1),
+                Color::Idx(i) => format!("{base};5;{i}"),
+                Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
+            });
+        }
+    }
+    if params.is_empty() {
+        return Ok(());
+    }
+    write!(out, "\x1b[{params}m")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn styled(style: Style) -> String {
+    fn change(from: Style, to: Style) -> String {
         let mut out = Vec::new();
-        apply_style(&mut out, style).unwrap();
+        change_style(&mut out, from, to).unwrap();
         String::from_utf8(out).unwrap()
     }
 
     #[test]
-    fn writes_colors_after_the_reset() {
-        let out = styled(Style {
+    fn style_changes_are_one_sequence_of_what_differs() {
+        let plain = Style::default();
+        let colored = Style {
             fg: Color::Idx(3),
             bg: Color::Rgb(4, 5, 6),
             underline_color: Color::Rgb(1, 2, 3),
-            ..Style::default()
-        });
-        assert_eq!(out, "\x1b[0m\x1b[38;5;3m\x1b[48;2;4;5;6m\x1b[58;2;1;2;3m");
+            ..plain
+        };
+        assert_eq!(
+            change(plain, colored),
+            "\x1b[38;5;3;48;2;4;5;6;58;2;1;2;3m"
+        );
+        // A fade's next cell: only the foreground moved.
+        let next = Style { fg: Color::Rgb(9, 9, 9), ..colored };
+        assert_eq!(change(colored, next), "\x1b[38;2;9;9;9m");
+        assert_eq!(change(colored, plain), "\x1b[39;49;59m");
+        assert_eq!(change(plain, plain), "");
     }
 
     #[test]
-    fn default_colors_need_only_the_reset() {
-        assert_eq!(styled(Style::default()), "\x1b[0m");
+    fn turning_off_bold_keeps_dim() {
+        let both = Style { bold: true, dim: true, ..Style::default() };
+        let dim = Style { dim: true, ..Style::default() };
+        assert_eq!(change(both, dim), "\x1b[22;2m");
+        assert_eq!(change(dim, both), "\x1b[1m");
+        let italic = Style { italic: true, ..Style::default() };
+        assert_eq!(change(italic, Style::default()), "\x1b[23m");
     }
 
     #[test]
@@ -454,6 +489,102 @@ mod tests {
         f.put_wide(1, 0, "界", Style::default());
         f.put(1, 0, "b", Style::default());
         assert_eq!(f.cells[2].sym, " ");
+    }
+
+    /// Random styles, frame after frame, replayed through a terminal
+    /// emulator: every cell must come out with its own colors and
+    /// attributes, whatever the cells before it had.
+    #[test]
+    fn style_changes_reproduce_every_cell() {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::{Config, cell::Flags, test::TermSize};
+        use alacritty_terminal::vte::ansi::{self, NamedColor, Processor, Rgb};
+
+        const W: u16 = 20;
+        const H: u16 = 4;
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(W.into(), H.into()),
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        let mut renderer = Renderer::default();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let color = |rand: &mut dyn FnMut(u64) -> u64| match rand(3) {
+            0 => Color::Default,
+            1 => Color::Idx(rand(256) as u8),
+            _ => Color::Rgb(rand(4) as u8, rand(4) as u8, rand(4) as u8),
+        };
+        let expect = |c: Color, default: NamedColor| match c {
+            Color::Default => ansi::Color::Named(default),
+            Color::Idx(i) => ansi::Color::Indexed(i),
+            Color::Rgb(r, g, b) => ansi::Color::Spec(Rgb { r, g, b }),
+        };
+        for step in 0..200 {
+            let mut frame = Frame::new(W, H);
+            for y in 0..i32::from(H) {
+                for x in 0..i32::from(W) {
+                    let style = Style {
+                        fg: color(&mut rand),
+                        bg: color(&mut rand),
+                        underline_color: color(&mut rand),
+                        bold: rand(2) == 0,
+                        dim: rand(2) == 0,
+                        italic: rand(2) == 0,
+                        underline: rand(2) == 0,
+                        inverse: rand(2) == 0,
+                        strikeout: rand(2) == 0,
+                    };
+                    // Leave some cells as they were, so runs get skipped.
+                    if rand(4) != 0 {
+                        frame.put(x, y, "x", style);
+                    }
+                }
+            }
+            let styles: Vec<Style> =
+                frame.cells.iter().map(|c| c.style).collect();
+            let mut out = Vec::new();
+            renderer.draw(&mut out, &[], frame, None).unwrap();
+            parser.advance(&mut term, &out);
+            for (i, want) in styles.iter().enumerate() {
+                let (x, y) = (i % usize::from(W), i / usize::from(W));
+                let cell = &term.grid()[Point::new(Line(y as i32), Column(x))];
+                let at = format!("frame {step}, cell ({x}, {y})");
+                assert_eq!(
+                    cell.fg,
+                    expect(want.fg, NamedColor::Foreground),
+                    "{at}"
+                );
+                assert_eq!(
+                    cell.bg,
+                    expect(want.bg, NamedColor::Background),
+                    "{at}"
+                );
+                let underline_color = match want.underline_color {
+                    Color::Default => None,
+                    c => Some(expect(c, NamedColor::Foreground)),
+                };
+                assert_eq!(cell.underline_color(), underline_color, "{at}");
+                for (flag, on) in [
+                    (Flags::BOLD, want.bold),
+                    (Flags::DIM, want.dim),
+                    (Flags::ITALIC, want.italic),
+                    (Flags::UNDERLINE, want.underline),
+                    (Flags::INVERSE, want.inverse),
+                    (Flags::STRIKEOUT, want.strikeout),
+                ] {
+                    assert_eq!(cell.flags.contains(flag), on, "{at}: {flag:?}");
+                }
+            }
+        }
     }
 
     /// Renders a series of frames and replays the bytes through a terminal
