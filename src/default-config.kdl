@@ -59,6 +59,14 @@ layout {
     }
 }
 
+// New panes fade in, the overview fades in and out, and the view slides
+// to follow the focus. With `off`, everything changes at once instead:
+// calmer, and much lighter over a slow ssh link, where every frame of an
+// animation is sent in full.
+animations {
+    /-off
+}
+
 // Key bindings. Keys are written like niri's: a key, after any of Ctrl+,
 // Alt+ and Shift+, as in Alt+Enter or Shift+h. Shift+h, Shift+H and H are
 // the same key. Characters KDL keeps for itself, like [ , and {, go in

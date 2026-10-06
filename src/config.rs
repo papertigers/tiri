@@ -40,6 +40,8 @@ pub struct Config {
     pub theme: Theme,
     pub bindings: Bindings,
     pub size_presets: SizePresets,
+    /// Whether things fade and slide, or change at once.
+    pub animations: bool,
 }
 
 impl Default for Config {
@@ -265,6 +267,16 @@ struct RawConfig {
     overview_binds: RawBinds,
     #[knus(child, default)]
     layout: RawLayout,
+    #[knus(child)]
+    animations: Option<RawAnimations>,
+}
+
+/// The `animations` section, niri's way of turning them off.
+#[derive(knus::Decode, Debug, Default)]
+#[knus(span_type = Span)]
+struct RawAnimations {
+    #[knus(child)]
+    off: bool,
 }
 
 /// The `layout` section, niri's way of giving column widths.
@@ -572,7 +584,8 @@ impl RawConfig {
             Some(name) => lookup(name, &defined)
                 .ok_or_else(|| unknown_theme("theme", name, &defined))?,
         };
-        Ok(Config { theme, bindings, size_presets })
+        let animations = self.animations.is_none_or(|a| !a.off);
+        Ok(Config { theme, bindings, size_presets, animations })
     }
 }
 
@@ -756,6 +769,16 @@ mod tests {
 
     fn key(s: &str) -> Key {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn animations_are_on_unless_turned_off() {
+        assert!(Config::default().animations);
+        assert!(parse("animations {}").unwrap().animations);
+        assert!(!parse("animations { off; }").unwrap().animations);
+        let off = DEFAULT.replace("/-off", "off");
+        assert_ne!(off, DEFAULT);
+        assert!(!parse(&off).unwrap().animations);
     }
 
     #[test]

@@ -206,6 +206,21 @@ A `proportion` is a share of the screen's width or height, above 0 and at
 most 1. `fixed` is a number of characters across or lines down, borders
 included. Columns and panes keep their size when you change the presets.
 
+### Animations
+
+New panes fade in, the overview fades in and out, and the view slides to
+follow the focus. Turn that off, as in niri, and everything changes at
+once:
+
+```kdl
+animations {
+    off
+}
+```
+
+Over a slow ssh link this helps a lot: every frame of an animation is sent
+in full, so opening the overview sends about 50 times less without them.
+
 ### Themes
 
 Themes color tiri's own borders, status bar and hints; pane contents keep

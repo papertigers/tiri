@@ -378,6 +378,15 @@ impl Workspaces {
         settle(view, &self.list, zoom);
     }
 
+    /// Puts every client's view straight where it's heading.
+    pub fn snap_all(&mut self) {
+        let zoom = self.overview_zoom();
+        for view in self.views.values_mut() {
+            view.y = view.active as f64;
+            settle(view, &self.list, zoom);
+        }
+    }
+
     /// `client`'s zoom: 1.0, or less in the overview.
     pub fn zoom(&self, client: ClientId) -> f64 {
         self.overview_zoom_for(self.view(client)).unwrap_or(1.0)

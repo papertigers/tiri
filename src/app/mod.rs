@@ -212,8 +212,13 @@ impl App {
     }
 
     /// Advances every client's scroll and slide animations. Returns true
-    /// while anything still moves.
+    /// while anything still moves. With animations off, everything goes
+    /// straight where it's heading.
     pub fn tick(&mut self, dt: Duration) -> bool {
+        if !self.config.animations {
+            self.workspaces.snap_all();
+            return false;
+        }
         self.workspaces.tick(dt)
     }
 
@@ -240,7 +245,9 @@ impl App {
         self.panes.insert(id, pane);
         self.workspaces.insert(client.id, id);
         self.resize_panes();
-        client.effects.pane_opened(id, &client.palette);
+        if self.config.animations {
+            client.effects.pane_opened(id, &client.palette);
+        }
         Ok(())
     }
 

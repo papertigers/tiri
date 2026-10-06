@@ -170,6 +170,9 @@ impl App {
         }
         self.workspaces.set_overview(client.id, on);
         self.workspaces.snap(client.id);
+        if !self.config.animations {
+            return;
+        }
         if let Some(from) = client.renderer.last_frame().cloned() {
             client.transition =
                 Some(Transition::new(from, on, &client.palette));
