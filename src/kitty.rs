@@ -383,7 +383,7 @@ pub fn id_color(id: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// How hard [`transmit`] compresses an image.
+/// How hard [`compress`] works at an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     /// For an image that's soon replaced, as in a fade: an animation
@@ -394,20 +394,42 @@ pub enum Compression {
     Small,
 }
 
+/// An image compressed for [`transmit_compressed`].
+pub struct Compressed {
+    width: usize,
+    height: usize,
+    zlib: Vec<u8>,
+}
+
+/// Compresses `image` for uploading. The slow part of an upload, and
+/// separate from writing it out so that several can run at once.
+pub fn compress(image: &Image, compression: Compression) -> Compressed {
+    let level = match compression {
+        Compression::Fast => 1,
+        Compression::Small => 6,
+    };
+    Compressed {
+        width: image.width,
+        height: image.height,
+        zlib: miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, level),
+    }
+}
+
 /// Uploads `image` as image `id`, replacing any earlier one.
+#[cfg(test)]
 pub fn transmit(
     out: &mut Vec<u8>,
     id: u32,
     image: &Image,
     compression: Compression,
 ) {
-    let level = match compression {
-        Compression::Fast => 1,
-        Compression::Small => 6,
-    };
-    let compressed =
-        miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, level);
-    let payload = BASE64.encode(compressed);
+    transmit_compressed(out, id, &compress(image, compression));
+}
+
+/// Uploads an image [`compress`]ed already as image `id`, replacing any
+/// earlier one.
+pub fn transmit_compressed(out: &mut Vec<u8>, id: u32, image: &Compressed) {
+    let payload = BASE64.encode(&image.zlib);
     let chunks = payload.as_bytes().chunks(CHUNK);
     let last = chunks.len().saturating_sub(1);
     for (n, chunk) in chunks.enumerate() {
