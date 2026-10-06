@@ -128,7 +128,9 @@ impl App {
             Target::Default => None,
             Target::Existing(name) => match self.workspaces.find(name) {
                 Some(idx) => Some(idx),
-                None => bail!("no workspace named {name:?}; `tiri ls` lists them"),
+                None => {
+                    bail!("no workspace named {name:?}; `tiri ls` lists them")
+                }
             },
             Target::New(name) => {
                 if self.workspaces.find(name).is_some() {
@@ -229,7 +231,9 @@ impl App {
         pane.set_palette(client.palette);
         // SAFETY: the pane is deleted from the poller in `close_pane` or
         // `shutdown`, before it's dropped and its PTY closed.
-        let watched = unsafe { (self.poller).add(&pane.fd(), PollEvent::readable(id.0 as usize)) };
+        let watched = unsafe {
+            (self.poller).add(&pane.fd(), PollEvent::readable(id.0 as usize))
+        };
         if let Err(e) = watched {
             pane.kill();
             self.exited.extend(pane.into_unreaped_child());
@@ -265,8 +269,7 @@ impl App {
     /// Brings every pane's PTY size in line with its share of its column.
     fn resize_panes(&mut self) {
         let area = i32::from(self.layout_size.1.saturating_sub(STATUS_HEIGHT));
-        self.workspaces
-            .set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
+        self.workspaces.set_max_stack((area / MIN_PANE_HEIGHT).max(1) as usize);
         for workspace in self.workspaces.list() {
             let strip = workspace.strip();
             for (idx, col) in strip.columns().iter().enumerate() {
@@ -274,11 +277,8 @@ impl App {
                 let heights = split_heights(area, col.panes().len());
                 for (id, h) in col.panes().iter().zip(heights) {
                     // A fullscreen pane has its column to itself.
-                    let h = if col.fullscreen() == Some(*id) {
-                        area
-                    } else {
-                        h
-                    };
+                    let h =
+                        if col.fullscreen() == Some(*id) { area } else { h };
                     if let Some(pane) = self.panes.get_mut(id) {
                         pane.resize((h - 2).max(1) as u16, cols);
                     }
@@ -318,7 +318,8 @@ impl App {
     /// once per arming. Panes with queued input also wait to be writable.
     pub fn arm_panes(&self) {
         for (id, pane) in &self.panes {
-            let interest = PollEvent::new(id.0 as usize, true, pane.wants_write());
+            let interest =
+                PollEvent::new(id.0 as usize, true, pane.wants_write());
             // A failure means the PTY is gone, which reading will report.
             let _ = self.poller.modify(pane.fd(), interest);
         }
@@ -328,10 +329,12 @@ impl App {
     /// a pane's synchronized update timing out, a thumbnail due for a
     /// redraw, or a notice due to come down.
     pub fn next_deadline(&self, client: &Client) -> Option<Instant> {
-        let stale_thumbnails = client.thumbnails.iter().filter_map(|(id, thumb)| {
-            let pane = self.panes.get(id)?;
-            (pane.generation() != thumb.generation).then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
-        });
+        let stale_thumbnails =
+            client.thumbnails.iter().filter_map(|(id, thumb)| {
+                let pane = self.panes.get(id)?;
+                (pane.generation() != thumb.generation)
+                    .then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
+            });
         self.panes
             .values()
             .filter_map(Pane::sync_deadline)
@@ -363,8 +366,7 @@ impl App {
     /// Collects the exit status of closed panes' children that have gone,
     /// so they don't linger as zombies.
     fn reap_exited(&mut self) {
-        self.exited
-            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        self.exited.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
     /// Some child process has exited (the server got SIGCHLD). A pane whose
@@ -407,10 +409,7 @@ impl App {
                 if bracketed {
                     pane.write(b"\x1b[200~");
                 }
-                Paste {
-                    pane: id,
-                    bracketed,
-                }
+                Paste { pane: id, bracketed }
             }
         };
         client.paste = (!last).then_some(paste);
@@ -432,9 +431,6 @@ impl App {
     /// Text programs in panes have copied (OSC 52), for passing on to the
     /// clients' clipboards.
     pub fn take_copied(&mut self) -> Vec<String> {
-        self.panes
-            .values_mut()
-            .flat_map(Pane::take_copied)
-            .collect()
+        self.panes.values_mut().flat_map(Pane::take_copied).collect()
     }
 }

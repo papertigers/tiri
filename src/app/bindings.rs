@@ -33,15 +33,15 @@ impl App {
             (true, false) => {
                 let action = (bindings.prefix_binds.get(key))
                     .or_else(|| bindings.prefix_binds.get(key.without_ctrl()?));
-                return action.map_or(Ok(()), |action| self.run(client, action));
+                return action
+                    .map_or(Ok(()), |action| self.run(client, action));
             }
             (false, true) => {
                 client.prefix_pending = true;
                 return Ok(());
             }
-            (false, false) if overview => {
-                (bindings.overview_binds.get(key)).or_else(|| bindings.binds.get(key))
-            }
+            (false, false) if overview => (bindings.overview_binds.get(key))
+                .or_else(|| bindings.binds.get(key)),
             (false, false) => bindings.binds.get(key),
         };
         if let Some(action) = action {
@@ -67,14 +67,28 @@ impl App {
         let id = client.id;
         match action {
             Action::NewColumn => self.open_column(client)?,
-            Action::FocusColumnLeft => self.workspaces.active_mut(id).focus_left(),
-            Action::FocusColumnRight => self.workspaces.active_mut(id).focus_right(),
-            Action::FocusColumnFirst => self.workspaces.active_mut(id).focus_first(),
-            Action::FocusColumnLast => self.workspaces.active_mut(id).focus_last(),
-            Action::MoveColumnLeft => self.workspaces.active_mut(id).move_left(),
-            Action::MoveColumnRight => self.workspaces.active_mut(id).move_right(),
+            Action::FocusColumnLeft => {
+                self.workspaces.active_mut(id).focus_left()
+            }
+            Action::FocusColumnRight => {
+                self.workspaces.active_mut(id).focus_right()
+            }
+            Action::FocusColumnFirst => {
+                self.workspaces.active_mut(id).focus_first()
+            }
+            Action::FocusColumnLast => {
+                self.workspaces.active_mut(id).focus_last()
+            }
+            Action::MoveColumnLeft => {
+                self.workspaces.active_mut(id).move_left()
+            }
+            Action::MoveColumnRight => {
+                self.workspaces.active_mut(id).move_right()
+            }
             Action::FocusPaneUp => self.workspaces.active_mut(id).focus_up(),
-            Action::FocusPaneDown => self.workspaces.active_mut(id).focus_down(),
+            Action::FocusPaneDown => {
+                self.workspaces.active_mut(id).focus_down()
+            }
             Action::MovePaneUp => self.workspaces.active_mut(id).move_up(),
             Action::MovePaneDown => self.workspaces.active_mut(id).move_down(),
             Action::ConsumeOrExpelPaneLeft => {
@@ -83,12 +97,24 @@ impl App {
             Action::ConsumeOrExpelPaneRight => {
                 self.workspaces.active_mut(id).consume_or_expel_right();
             }
-            Action::ConsumePaneIntoColumn => self.workspaces.active_mut(id).consume_into_column(),
-            Action::ExpelPaneFromColumn => self.workspaces.active_mut(id).expel_from_column(),
-            Action::SwitchPresetColumnWidth => self.workspaces.active_mut(id).cycle_width(),
-            Action::MaximizeColumn => self.workspaces.active_mut(id).toggle_maximized(),
-            Action::FullscreenPane => self.workspaces.active_mut(id).toggle_fullscreen(),
-            Action::CenterColumn => self.workspaces.active_mut(id).center_focused(),
+            Action::ConsumePaneIntoColumn => {
+                self.workspaces.active_mut(id).consume_into_column()
+            }
+            Action::ExpelPaneFromColumn => {
+                self.workspaces.active_mut(id).expel_from_column()
+            }
+            Action::SwitchPresetColumnWidth => {
+                self.workspaces.active_mut(id).cycle_width()
+            }
+            Action::MaximizeColumn => {
+                self.workspaces.active_mut(id).toggle_maximized()
+            }
+            Action::FullscreenPane => {
+                self.workspaces.active_mut(id).toggle_fullscreen()
+            }
+            Action::CenterColumn => {
+                self.workspaces.active_mut(id).center_focused()
+            }
             Action::ClosePane => {
                 if let Some(pane_id) = self.workspaces.focused(id) {
                     self.close_pane(pane_id);
@@ -96,14 +122,20 @@ impl App {
             }
             Action::FocusWorkspaceDown => self.workspaces.focus_down(id),
             Action::FocusWorkspaceUp => self.workspaces.focus_up(id),
-            Action::MoveColumnToWorkspaceDown => self.workspaces.move_column_down(id),
-            Action::MoveColumnToWorkspaceUp => self.workspaces.move_column_up(id),
+            Action::MoveColumnToWorkspaceDown => {
+                self.workspaces.move_column_down(id)
+            }
+            Action::MoveColumnToWorkspaceUp => {
+                self.workspaces.move_column_up(id)
+            }
             Action::ToggleOverview => {
                 let on = !self.workspaces.in_overview(id);
                 self.set_overview(client, on);
             }
             Action::CloseOverview => self.set_overview(client, false),
-            Action::ToggleThumbnails => client.kitty_overview = !client.kitty_overview,
+            Action::ToggleThumbnails => {
+                client.kitty_overview = !client.kitty_overview
+            }
             Action::Detach => client.detach_requested = true,
             Action::KillServer => self.quit = true,
         }
@@ -121,7 +153,8 @@ impl App {
         self.workspaces.set_overview(client.id, on);
         self.workspaces.snap(client.id);
         if let Some(from) = client.renderer.last_frame().cloned() {
-            client.transition = Some(Transition::new(from, on, &client.palette));
+            client.transition =
+                Some(Transition::new(from, on, &client.palette));
         }
     }
 }

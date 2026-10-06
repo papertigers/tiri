@@ -22,7 +22,8 @@ use knus::errors::{DecodeError, ExpectedType};
 use knus::span::{Span, Spanned};
 use knus::traits::{DecodeScalar, ErrorSpan};
 use miette::{
-    Diagnostic, GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, SourceCode,
+    Diagnostic, GraphicalReportHandler, GraphicalTheme, LabeledSpan,
+    NamedSource, SourceCode,
 };
 
 use crate::keys::{Action, Bindings, Key, Table};
@@ -51,7 +52,8 @@ impl Default for Config {
 static BUILT_IN: LazyLock<Config> = LazyLock::new(|| {
     decode("default-config.kdl", DEFAULT)
         .and_then(|raw| {
-            (raw.resolve(None)).map_err(|p| report("default-config.kdl", DEFAULT, &[&p]))
+            (raw.resolve(None))
+                .map_err(|p| report("default-config.kdl", DEFAULT, &[&p]))
         })
         .expect("the default config is valid")
 });
@@ -62,8 +64,15 @@ impl Config {
         let file = path.display().to_string();
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(e) => return Err(ConfigError::plain(&file, format!("couldn't read it: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config::default());
+            }
+            Err(e) => {
+                return Err(ConfigError::plain(
+                    &file,
+                    format!("couldn't read it: {e}"),
+                ));
+            }
         };
         Config::parse(&file, &text)
     }
@@ -106,10 +115,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn file_name(file: &str) -> &str {
-    Path::new(file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(file)
+    Path::new(file).file_name().and_then(|name| name.to_str()).unwrap_or(file)
 }
 
 /// One of knus's errors, to be shown against the file's text. On its own
@@ -151,7 +157,8 @@ impl Diagnostic for InFile<'_> {
 /// Decodes config `text` without looking names up.
 fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
     knus::parse(file, text).map_err(|e| {
-        let problems: Vec<&dyn Diagnostic> = e.related().into_iter().flatten().collect();
+        let problems: Vec<&dyn Diagnostic> =
+            e.related().into_iter().flatten().collect();
         if problems.is_empty() {
             return ConfigError::plain(file, e.to_string());
         }
@@ -163,10 +170,8 @@ fn decode(file: &str, text: &str) -> Result<RawConfig, ConfigError> {
 /// its line number, and all of them with the lines at fault quoted.
 fn report(file: &str, text: &str, problems: &[&dyn Diagnostic]) -> ConfigError {
     let first = problems[0];
-    let line = first
-        .labels()
-        .and_then(|mut labels| labels.next())
-        .map(|label| {
+    let line =
+        first.labels().and_then(|mut labels| labels.next()).map(|label| {
             let before = &text.as_bytes()[..label.offset().min(text.len())];
             before.iter().filter(|&&b| b == b'\n').count() + 1
         });
@@ -180,22 +185,18 @@ fn report(file: &str, text: &str, problems: &[&dyn Diagnostic]) -> ConfigError {
     }
 
     // As plain text: it goes to the server's log and to terminals.
-    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let handler =
+        GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
     let source = NamedSource::new(file, text.to_owned());
     let mut report = format!("{file} has errors:\n");
     for problem in problems {
-        let shown = InFile {
-            problem: *problem,
-            text: &source,
-        };
+        let shown = InFile { problem: *problem, text: &source };
         if handler.render_report(&mut report, &shown).is_err() {
-            writeln!(report, "  {problem}").expect("writing to memory can't fail");
+            writeln!(report, "  {problem}")
+                .expect("writing to memory can't fail");
         }
     }
-    ConfigError {
-        summary,
-        report: report.trim_end().to_owned(),
-    }
+    ConfigError { summary, report: report.trim_end().to_owned() }
 }
 
 /// A mistake found after parsing, such as a name that isn't defined, and
@@ -210,11 +211,7 @@ struct Problem {
 
 impl Problem {
     fn at(span: Span, label: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            label,
-            at: Some(span),
-        }
+        Self { message: message.into(), label, at: Some(span) }
     }
 }
 
@@ -229,7 +226,8 @@ impl std::error::Error for Problem {}
 impl Diagnostic for Problem {
     fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
         let span = self.at?;
-        let label = LabeledSpan::new_with_span(Some(self.label.to_owned()), span);
+        let label =
+            LabeledSpan::new_with_span(Some(self.label.to_owned()), span);
         Some(Box::new(std::iter::once(label)))
     }
 }
@@ -239,7 +237,10 @@ pub fn default_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".config"))
+        })?;
     Some(base.join("tiri").join("config.kdl"))
 }
 
@@ -306,24 +307,20 @@ impl knus::Decode<Span> for RawBind {
                     "unbind takes nothing",
                 ));
             }
-            return Ok(RawBind {
-                key,
-                at,
-                action: None,
-            });
+            return Ok(RawBind { key, at, action: None });
         }
         let action = Action::decode_node(child, ctx)?;
-        Ok(RawBind {
-            key,
-            at,
-            action: Some(action),
-        })
+        Ok(RawBind { key, at, action: Some(action) })
     }
 }
 
 /// Reports anything on `node` besides its name and children: a type,
 /// arguments or properties.
-fn only_a_name<S: ErrorSpan>(node: &SpannedNode<S>, ctx: &mut Context<S>, message: &str) {
+fn only_a_name<S: ErrorSpan>(
+    node: &SpannedNode<S>,
+    ctx: &mut Context<S>,
+    message: &str,
+) {
     if let Some(type_name) = &node.type_name {
         ctx.emit_error(DecodeError::unexpected(type_name, "type", message));
     }
@@ -343,7 +340,12 @@ impl RawBinds {
     /// Applies these bindings on top of `table`. The prefix key can't be
     /// bound: it always starts a prefix binding (or, pressed twice, is
     /// typed). A built-in binding it takes over goes quietly.
-    fn apply_to(self, table: &mut Table, section: &str, prefix: Key) -> Result<(), Problem> {
+    fn apply_to(
+        self,
+        table: &mut Table,
+        section: &str,
+        prefix: Key,
+    ) -> Result<(), Problem> {
         let mut seen = HashSet::new();
         for bind in self.binds {
             if !seen.insert(bind.key) {
@@ -357,7 +359,9 @@ impl RawBinds {
                 return Err(Problem::at(
                     bind.at,
                     "the prefix key",
-                    format!("{section} binds {prefix}, which is the prefix key"),
+                    format!(
+                        "{section} binds {prefix}, which is the prefix key"
+                    ),
                 ));
             }
             table.set(bind.key, bind.action);
@@ -416,11 +420,7 @@ impl RawConfig {
         };
         let prefix = bindings.prefix;
         for (binds, table, section) in [
-            (
-                self.prefix_binds,
-                &mut bindings.prefix_binds,
-                "prefix-binds",
-            ),
+            (self.prefix_binds, &mut bindings.prefix_binds, "prefix-binds"),
             (self.binds, &mut bindings.binds, "binds"),
             (
                 self.overview_binds,
@@ -434,7 +434,9 @@ impl RawConfig {
         let mut defined: Vec<(String, Theme)> = Vec::new();
         for raw in self.themes {
             let name: &str = &raw.name;
-            if Theme::named(name).is_some() || defined.iter().any(|(n, _)| n == name) {
+            if Theme::named(name).is_some()
+                || defined.iter().any(|(n, _)| n == name)
+            {
                 return Err(Problem::at(
                     *raw.name.span(),
                     "taken",
@@ -452,9 +454,8 @@ impl RawConfig {
         }
         let theme = match &self.theme {
             None => Theme::default(),
-            Some(name) => {
-                lookup(name, &defined).ok_or_else(|| unknown_theme("theme", name, &defined))?
-            }
+            Some(name) => lookup(name, &defined)
+                .ok_or_else(|| unknown_theme("theme", name, &defined))?,
         };
         Ok(Config { theme, bindings })
     }
@@ -499,7 +500,8 @@ fn unknown_theme(
         .chain(defined.iter().map(|(n, _)| n.as_str()))
         .collect();
     let known = names.join(", ");
-    let message = format!("{setting} {:?} isn't a theme; there's {known}", **name);
+    let message =
+        format!("{setting} {:?} isn't a theme; there's {known}", **name);
     Problem::at(*name.span(), "not a theme, or not defined yet", message)
 }
 
@@ -508,7 +510,10 @@ fn unknown_theme(
 struct ConfigKey(Key);
 
 impl<S: ErrorSpan> DecodeScalar<S> for ConfigKey {
-    fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
+    fn type_check(
+        type_name: &Option<Spanned<TypeName, S>>,
+        ctx: &mut Context<S>,
+    ) {
         no_type_name(type_name.as_ref(), ctx, "key");
     }
 
@@ -518,7 +523,9 @@ impl<S: ErrorSpan> DecodeScalar<S> for ConfigKey {
     ) -> Result<Self, DecodeError<S>> {
         let Literal::String(s) = &**value else {
             ctx.emit_error(DecodeError::scalar_kind(Kind::String, value));
-            return Ok(ConfigKey(Key::from_event(KeyEvent::from(KeyCode::Null))));
+            return Ok(ConfigKey(Key::from_event(KeyEvent::from(
+                KeyCode::Null,
+            ))));
         };
         match s.parse() {
             Ok(key) => Ok(ConfigKey(key)),
@@ -535,7 +542,10 @@ impl<S: ErrorSpan> DecodeScalar<S> for ConfigKey {
 struct ConfigColor(Color);
 
 impl<S: ErrorSpan> DecodeScalar<S> for ConfigColor {
-    fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
+    fn type_check(
+        type_name: &Option<Spanned<TypeName, S>>,
+        ctx: &mut Context<S>,
+    ) {
         no_type_name(type_name.as_ref(), ctx, "color");
     }
 
@@ -544,7 +554,9 @@ impl<S: ErrorSpan> DecodeScalar<S> for ConfigColor {
         ctx: &mut Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let color = match &**value {
-            Literal::String(s) => parse_hex(s).ok_or("colors are written \"#rrggbb\""),
+            Literal::String(s) => {
+                parse_hex(s).ok_or("colors are written \"#rrggbb\"")
+            }
             Literal::Int(i) => u8::try_from(i)
                 .map(Color::Idx)
                 .map_err(|_| "palette colors are 0 to 255"),
@@ -565,7 +577,10 @@ impl<S: ErrorSpan> DecodeScalar<S> for ConfigColor {
 struct SelectionBg(Option<Color>);
 
 impl<S: ErrorSpan> DecodeScalar<S> for SelectionBg {
-    fn type_check(type_name: &Option<Spanned<TypeName, S>>, ctx: &mut Context<S>) {
+    fn type_check(
+        type_name: &Option<Spanned<TypeName, S>>,
+        ctx: &mut Context<S>,
+    ) {
         no_type_name(type_name.as_ref(), ctx, "color");
     }
 
@@ -576,7 +591,8 @@ impl<S: ErrorSpan> DecodeScalar<S> for SelectionBg {
         if matches!(&**value, Literal::String(s) if &**s == "reverse") {
             return Ok(SelectionBg(None));
         }
-        ConfigColor::raw_decode(value, ctx).map(|ConfigColor(color)| SelectionBg(Some(color)))
+        ConfigColor::raw_decode(value, ctx)
+            .map(|ConfigColor(color)| SelectionBg(Some(color)))
     }
 }
 
@@ -601,11 +617,7 @@ fn parse_hex(s: &str) -> Option<Color> {
         return None;
     }
     let value = u32::from_str_radix(hex, 16).ok()?;
-    Some(Color::Rgb(
-        (value >> 16) as u8,
-        (value >> 8) as u8,
-        value as u8,
-    ))
+    Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
 }
 
 #[cfg(test)]
@@ -683,7 +695,9 @@ mod tests {
     #[test]
     fn explains_binding_mistakes() {
         let err = |text| format!("{:#}", parse(text).unwrap_err());
-        let twice = err("binds { Alt+h { detach; }; Alt+H { detach; }; Alt+h { detach; }; }");
+        let twice = err(
+            "binds { Alt+h { detach; }; Alt+H { detach; }; Alt+h { detach; }; }",
+        );
         assert!(twice.contains("binds has Alt+h more than once"), "{twice}");
         let bad_key = err("binds { Super+h { detach; }; }");
         assert!(
@@ -714,13 +728,16 @@ mod tests {
         let b = parse(r#"prefix "Alt+o""#).unwrap().bindings;
         assert_eq!(b.binds.get(key("Alt+o")), None);
         // Binding it yourself is a mistake.
-        let err = parse("prefix \"Alt+o\"\nbinds { Alt+o { detach; }; }").unwrap_err();
+        let err = parse("prefix \"Alt+o\"\nbinds { Alt+o { detach; }; }")
+            .unwrap_err();
         assert_eq!(
             err.summary,
             "config.kdl:2: binds binds Alt+o, which is the prefix key"
         );
         // Unbinding it is fine, if unneeded.
-        assert!(parse("prefix \"Alt+o\"\nbinds { Alt+o { unbind; }; }").is_ok());
+        assert!(
+            parse("prefix \"Alt+o\"\nbinds { Alt+o { unbind; }; }").is_ok()
+        );
     }
 
     #[test]
@@ -744,7 +761,8 @@ mod tests {
         );
         let report = err.to_string();
         assert!(
-            report.starts_with("/home/me/.config/tiri/config.kdl has errors:\n"),
+            report
+                .starts_with("/home/me/.config/tiri/config.kdl has errors:\n"),
             "{report}"
         );
         // Both problems, each quoting its line, and none of knus's wrapping.
@@ -767,7 +785,9 @@ mod tests {
             "config.kdl:2: theme \"nope\" isn't a theme; there's default, oxide"
         );
         assert_eq!(
-            summary("define-theme \"a\" {}\n\ndefine-theme \"b\" based-on=\"c\" {}"),
+            summary(
+                "define-theme \"a\" {}\n\ndefine-theme \"b\" based-on=\"c\" {}"
+            ),
             "config.kdl:3: based-on \"c\" isn't a theme; there's default, oxide, a"
         );
         assert_eq!(
@@ -779,9 +799,10 @@ mod tests {
             "config.kdl:3: binds has Alt+h more than once"
         );
         // And the report quotes the line, labelled.
-        let report = parse("binds {\n    Alt+h { detach; }\n    Alt+h { detach; }\n}")
-            .unwrap_err()
-            .to_string();
+        let report =
+            parse("binds {\n    Alt+h { detach; }\n    Alt+h { detach; }\n}")
+                .unwrap_err()
+                .to_string();
         assert!(report.contains("3 │     Alt+h { detach; }"), "{report}");
         assert!(report.contains("bound again here"), "{report}");
     }
@@ -840,10 +861,14 @@ mod tests {
     fn explains_mistakes() {
         let err = |text| format!("{:#}", parse(text).unwrap_err());
         assert!(
-            err(r#"theme "nope""#)
-                .contains(r#"theme "nope" isn't a theme; there's default, oxide"#)
+            err(r#"theme "nope""#).contains(
+                r#"theme "nope" isn't a theme; there's default, oxide"#
+            )
         );
-        assert!(err(r#"define-theme "oxide""#).contains("already a theme named \"oxide\""));
+        assert!(
+            err(r#"define-theme "oxide""#)
+                .contains("already a theme named \"oxide\"")
+        );
         let bad_color = err(r#"define-theme "x" { dim "red"; }"#);
         assert!(bad_color.contains("#rrggbb"), "{bad_color}");
         // Points at the line.

@@ -102,8 +102,10 @@ pub struct WorkspaceInfo {
 
 /// Encodes `msg` with its length prefix, ready to write to a socket.
 pub fn encode(msg: &impl Serialize) -> Vec<u8> {
-    let body = postcard::to_stdvec(msg).expect("protocol messages always serialize");
-    let len = u32::try_from(body.len()).expect("messages are far smaller than 4 GiB");
+    let body =
+        postcard::to_stdvec(msg).expect("protocol messages always serialize");
+    let len =
+        u32::try_from(body.len()).expect("messages are far smaller than 4 GiB");
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&body);
@@ -132,11 +134,7 @@ impl Decoder {
     }
 
     fn with_limit(limit: usize) -> Self {
-        Self {
-            buf: Vec::new(),
-            start: 0,
-            limit,
-        }
+        Self { buf: Vec::new(), start: 0, limit }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -151,7 +149,8 @@ impl Decoder {
         let Some(header) = buf.get(..4) else {
             return Ok(None);
         };
-        let len = u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
+        let len =
+            u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
         if len > self.limit {
             bail!("message of {len} bytes is too big");
         }
@@ -200,7 +199,8 @@ mod tests {
 
     #[test]
     fn messages_survive_arriving_a_byte_at_a_time() {
-        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        let key =
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
         let mut bytes = encode(&ClientMsg::Event(key.clone()));
         bytes.extend(encode(&ClientMsg::KillServer));
 
@@ -212,7 +212,9 @@ mod tests {
                 got.push(msg);
             }
         }
-        assert!(matches!(&got[..], [ClientMsg::Event(e), ClientMsg::KillServer] if *e == key));
+        assert!(
+            matches!(&got[..], [ClientMsg::Event(e), ClientMsg::KillServer] if *e == key)
+        );
     }
 
     #[test]
@@ -225,10 +227,8 @@ mod tests {
         decoder.push(&encode(&paste));
         assert!(decoder.next::<ClientMsg>().is_err());
 
-        let paste = ClientMsg::Paste {
-            text: "x".repeat(PASTE_CHUNK),
-            last: true,
-        };
+        let paste =
+            ClientMsg::Paste { text: "x".repeat(PASTE_CHUNK), last: true };
         let mut decoder = Decoder::from_client();
         decoder.push(&encode(&paste));
         assert!(matches!(
@@ -251,14 +251,14 @@ mod tests {
         send(&mut wire, &ServerMsg::Exit(ExitReason::Detached)).unwrap();
         let mut reader = &wire[..];
         let mut decoder = Decoder::from_server();
-        let first: ServerMsg = recv(&mut reader, &mut decoder).unwrap().unwrap();
+        let first: ServerMsg =
+            recv(&mut reader, &mut decoder).unwrap().unwrap();
         assert!(matches!(first, ServerMsg::Output(b) if b == b"hello"));
-        let second: ServerMsg = recv(&mut reader, &mut decoder).unwrap().unwrap();
+        let second: ServerMsg =
+            recv(&mut reader, &mut decoder).unwrap().unwrap();
         assert!(matches!(second, ServerMsg::Exit(ExitReason::Detached)));
         assert!(
-            recv::<ServerMsg>(&mut reader, &mut decoder)
-                .unwrap()
-                .is_none()
+            recv::<ServerMsg>(&mut reader, &mut decoder).unwrap().is_none()
         );
     }
 }

@@ -12,13 +12,17 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use alacritty_terminal::Term;
-use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
+use alacritty_terminal::event::{
+    Event as TermEvent, EventListener, WindowSize,
+};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{
+    Child, CommandBuilder, MasterPty, PtySize, native_pty_system,
+};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
@@ -92,10 +96,8 @@ impl Pane {
 
         // Everything that can fail comes before the shell starts, so a
         // failure never leaves one running with nobody to reap it.
-        let fd = pair
-            .master
-            .as_raw_fd()
-            .context("pty has no file descriptor")?;
+        let fd =
+            pair.master.as_raw_fd().context("pty has no file descriptor")?;
         // SAFETY: `fd` belongs to `pair.master`, which is alive here.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         fcntl_getfl(borrowed)
@@ -104,8 +106,9 @@ impl Pane {
 
         // The shell portable-pty will pick: $SHELL, or the user's own.
         let shell = cmd.get_shell();
-        let child = (pair.slave.spawn_command(cmd))
-            .with_context(|| format!("couldn't start {shell} in {}", cwd.display()))?;
+        let child = (pair.slave.spawn_command(cmd)).with_context(|| {
+            format!("couldn't start {shell} in {}", cwd.display())
+        })?;
         // Drop our copy of the subsidiary side so reads see EOF when the child exits.
         drop(pair.slave);
 
@@ -261,7 +264,8 @@ impl Pane {
     /// Runs `feed`, which gives the emulator output, and counts the lines
     /// that scrolls into history.
     fn track_scroll(&mut self, feed: impl FnOnce(&mut Self)) {
-        let alt_screen = |pane: &Self| pane.term.mode().contains(TermMode::ALT_SCREEN);
+        let alt_screen =
+            |pane: &Self| pane.term.mode().contains(TermMode::ALT_SCREEN);
         let (before, was_alt) = (self.history_size(), alt_screen(self));
         // History growing counts them, until it's full and stops growing.
         // The grid's display offset still can then: once it's scrolled
@@ -294,7 +298,8 @@ impl Pane {
     /// How many lines have scrolled into history since `mark`, or None if
     /// history was cleared since, taking what was there with it.
     pub fn scrolled_since(&self, mark: ScrollMark) -> Option<usize> {
-        (mark.epoch == self.scroll.epoch).then(|| (self.scroll.lines - mark.lines) as usize)
+        (mark.epoch == self.scroll.epoch)
+            .then(|| (self.scroll.lines - mark.lines) as usize)
     }
 
     /// When the child is mid synchronized update, the time at which we stop
@@ -319,7 +324,9 @@ impl Pane {
                 TermEvent::PtyWrite(text) => self.write(text.as_bytes()),
                 TermEvent::Title(title) => self.title = Some(title),
                 TermEvent::ResetTitle => self.title = None,
-                TermEvent::ClipboardStore(_, text) if text.len() <= MAX_COPY => {
+                TermEvent::ClipboardStore(_, text)
+                    if text.len() <= MAX_COPY =>
+                {
                     self.copied.push(text);
                 }
                 TermEvent::ClipboardStore(_, text) => {
@@ -423,12 +430,7 @@ impl Pane {
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
-    PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
+    PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
 /// Queues the emulator's events for the pane to handle after each parse.

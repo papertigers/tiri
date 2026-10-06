@@ -49,7 +49,10 @@ pub(super) fn draw_screen(
         let fy = y + row;
         for col in 0..w {
             let fx = x + i32::from(col);
-            if fx < 0 || fx >= i32::from(frame.width()) || fy < 0 || fy >= i32::from(frame.height())
+            if fx < 0
+                || fx >= i32::from(frame.width())
+                || fy < 0
+                || fy >= i32::from(frame.height())
             {
                 continue;
             }
@@ -91,7 +94,10 @@ pub(super) fn draw_screen(
     }
 }
 
-fn cell_style(pane: &Pane, cell: &alacritty_terminal::term::cell::Cell) -> Style {
+fn cell_style(
+    pane: &Pane,
+    cell: &alacritty_terminal::term::cell::Cell,
+) -> Style {
     let flags = cell.flags;
     Style {
         fg: term_color(pane, cell.fg),
@@ -116,7 +122,9 @@ fn term_color(pane: &Pane, color: TermColor) -> Color {
     let rgb = |c: alacritty_terminal::vte::ansi::Rgb| Color::Rgb(c.r, c.g, c.b);
     match color {
         TermColor::Spec(c) => rgb(c),
-        TermColor::Indexed(i) => pane.palette(usize::from(i)).map_or(Color::Idx(i), rgb),
+        TermColor::Indexed(i) => {
+            pane.palette(usize::from(i)).map_or(Color::Idx(i), rgb)
+        }
         TermColor::Named(n) => {
             if let Some(c) = pane.palette(n as usize) {
                 return rgb(c);

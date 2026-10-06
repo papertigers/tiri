@@ -24,7 +24,8 @@ use rustix::fs::{FlockOperation, flock};
 
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
-    ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target, recv, send,
+    ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target,
+    recv, send,
 };
 use crate::socket;
 
@@ -41,18 +42,22 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         Err(_) => terminal_info.kitty_graphics,
     };
     // Before starting a server that would have nobody to serve.
-    let (width, height) = terminal::size()
-        .context("couldn't get the terminal's size; tiri needs to run in a terminal")?;
-    let talking = || format!("couldn't talk to the tiri server at {}", socket.display());
+    let (width, height) = terminal::size().context(
+        "couldn't get the terminal's size; tiri needs to run in a terminal",
+    )?;
+    let talking =
+        || format!("couldn't talk to the tiri server at {}", socket.display());
     let mut stream = connect_or_start(socket)?;
-    let cell_pixels = probed_cell_pixels(&terminal_info, width, height).or_else(size_cell_pixels);
+    let cell_pixels = probed_cell_pixels(&terminal_info, width, height)
+        .or_else(size_cell_pixels);
     send(
         &mut stream,
         &ClientMsg::Hello(Hello {
             width,
             height,
             target,
-            cwd: std::env::current_dir().context("couldn't read the current directory")?,
+            cwd: std::env::current_dir()
+                .context("couldn't read the current directory")?,
             kitty_overview,
             colors: terminal_info.colors,
             cell_pixels,
@@ -93,14 +98,14 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
                 let resized = matches!(event, event::Event::Resize(..));
                 let pixels = if resized { size_cell_pixels() } else { None };
                 let sent = match event {
-                    event::Event::Paste(text) => {
-                        paste_messages(&text).try_for_each(|msg| send(&mut writer, &msg))
-                    }
+                    event::Event::Paste(text) => paste_messages(&text)
+                        .try_for_each(|msg| send(&mut writer, &msg)),
                     event => send(&mut writer, &ClientMsg::Event(event)),
                 };
                 if sent.is_err()
                     || pixels.is_some_and(|p| {
-                        send(&mut writer, &ClientMsg::CellPixels(Some(p))).is_err()
+                        send(&mut writer, &ClientMsg::CellPixels(Some(p)))
+                            .is_err()
                     })
                 {
                     break;
@@ -145,7 +150,11 @@ fn paste_messages(text: &str) -> impl Iterator<Item = ClientMsg> {
 
 /// The cell size in pixels from the probe: the terminal's own cell size
 /// report, or its text area divided by the size in cells.
-fn probed_cell_pixels(info: &TerminalInfo, cols: u16, rows: u16) -> Option<(u16, u16)> {
+fn probed_cell_pixels(
+    info: &TerminalInfo,
+    cols: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
     info.cell_pixels.or_else(|| {
         let (w, h) = info.area_pixels?;
         (cols > 0 && rows > 0).then(|| (w / cols, h / rows))
@@ -171,7 +180,11 @@ fn detect_terminal() -> TerminalInfo {
 }
 
 /// Writes the server's output to the terminal until it says goodbye.
-fn relay(stream: &mut UnixStream, decoder: &mut Decoder, socket: &Path) -> Result<ExitReason> {
+fn relay(
+    stream: &mut UnixStream,
+    decoder: &mut Decoder,
+    socket: &Path,
+) -> Result<ExitReason> {
     let mut stdout = io::stdout().lock();
     loop {
         let msg = recv(stream, decoder).map_err(|e| {
@@ -214,14 +227,19 @@ pub fn list(socket: &Path) -> Result<()> {
                 if ws.panes == 0 && ws.name.is_none() {
                     continue;
                 }
-                let plural =
-                    |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+                let plural = |n: usize, word: &str| {
+                    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+                };
                 let attached = if ws.clients > 0 {
                     format!(" ({} attached)", plural(ws.clients, "client"))
                 } else {
                     String::new()
                 };
-                println!("{}: {}{attached}", ws.label, plural(ws.panes, "pane"));
+                println!(
+                    "{}: {}{attached}",
+                    ws.label,
+                    plural(ws.panes, "pane")
+                );
             }
             Ok(())
         }
@@ -256,7 +274,9 @@ fn connect(socket: &Path) -> Result<Option<UnixStream>> {
         {
             Ok(None)
         }
-        Err(e) => Err(e).with_context(|| format!("couldn't connect to {}", socket.display())),
+        Err(e) => Err(e).with_context(|| {
+            format!("couldn't connect to {}", socket.display())
+        }),
     }
 }
 
@@ -279,8 +299,9 @@ fn connect_or_start(socket: &Path) -> Result<UnixStream> {
     }
     // A socket nobody answers on was left by a server that died.
     if socket.exists() {
-        std::fs::remove_file(socket)
-            .with_context(|| format!("couldn't remove stale {}", socket.display()))?;
+        std::fs::remove_file(socket).with_context(|| {
+            format!("couldn't remove stale {}", socket.display())
+        })?;
     }
     start_server(socket)?;
     let deadline = Instant::now() + SERVER_START_TIMEOUT;
@@ -314,8 +335,11 @@ fn start_server(socket: &Path) -> Result<()> {
         .create(true)
         .append(true)
         .open(&log_path)
-        .with_context(|| format!("couldn't open the server log {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("couldn't find the tiri executable")?;
+        .with_context(|| {
+            format!("couldn't open the server log {}", log_path.display())
+        })?;
+    let exe =
+        std::env::current_exe().context("couldn't find the tiri executable")?;
     let mut command = Command::new(exe);
     command
         .arg("--socket")
@@ -348,10 +372,9 @@ fn start_server(socket: &Path) -> Result<()> {
     }
     // Reap the session leader, which exits straight away. The server itself
     // is adopted by init, so nothing waits on it.
-    let mut leader = command.spawn().context("couldn't start the tiri server")?;
-    leader
-        .wait()
-        .context("couldn't wait for the tiri server to start")?;
+    let mut leader =
+        command.spawn().context("couldn't start the tiri server")?;
+    leader.wait().context("couldn't wait for the tiri server to start")?;
     Ok(())
 }
 

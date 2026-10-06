@@ -95,12 +95,7 @@ impl Workspaces {
             .iter()
             .map(|w| StripView::settled(&w.strip, None))
             .collect();
-        let view = View {
-            active: 0,
-            y: 0.0,
-            overview: false,
-            strips,
-        };
+        let view = View { active: 0, y: 0.0, overview: false, strips };
         self.views.insert(client, view);
     }
 
@@ -165,7 +160,8 @@ impl Workspaces {
 
     /// Focuses `pane` for `client`, moving to its workspace if need be.
     pub fn focus_pane(&mut self, client: ClientId, pane: PaneId) -> bool {
-        let Some(idx) = self.list.iter().position(|w| w.strip.contains(pane)) else {
+        let Some(idx) = self.list.iter().position(|w| w.strip.contains(pane))
+        else {
             return false;
         };
         self.list[idx].strip.focus_pane(pane);
@@ -216,7 +212,9 @@ impl Workspaces {
 
     /// Removes `pane` from whichever workspace has it.
     pub fn remove(&mut self, pane: PaneId) -> bool {
-        let Some(workspace) = self.list.iter_mut().find(|w| w.strip.contains(pane)) else {
+        let Some(workspace) =
+            self.list.iter_mut().find(|w| w.strip.contains(pane))
+        else {
             return false;
         };
         workspace.strip.remove(pane);
@@ -289,10 +287,8 @@ impl Workspaces {
                 idx += 1;
             }
         }
-        let needs_bottom = self
-            .list
-            .last()
-            .is_none_or(|w| !w.is_empty() || w.name.is_some());
+        let needs_bottom =
+            self.list.last().is_none_or(|w| !w.is_empty() || w.name.is_some());
         if needs_bottom {
             let workspace = self.new_workspace(None);
             let zoom = self.overview_zoom();
@@ -367,9 +363,18 @@ impl Workspaces {
 
     /// Column `idx` of workspace `ws`'s left edge and width on `client`'s
     /// screen.
-    pub fn column_span(&self, client: ClientId, ws: usize, idx: usize) -> (i32, i32) {
+    pub fn column_span(
+        &self,
+        client: ClientId,
+        ws: usize,
+        idx: usize,
+    ) -> (i32, i32) {
         let zoom = self.zoom(client);
-        self.view(client).strips[ws].column_span(&self.list[ws].strip, idx, zoom)
+        self.view(client).strips[ws].column_span(
+            &self.list[ws].strip,
+            idx,
+            zoom,
+        )
     }
 
     pub fn is_animating(&self, client: ClientId) -> bool {
@@ -388,14 +393,17 @@ impl Workspaces {
         let mut moving = false;
         for view in self.views.values_mut() {
             let zoom = view.overview.then_some(overview_zoom);
-            for (strip_view, workspace) in view.strips.iter_mut().zip(&self.list) {
+            for (strip_view, workspace) in
+                view.strips.iter_mut().zip(&self.list)
+            {
                 moving |= strip_view.tick(&workspace.strip, zoom, dt);
             }
             let target = view.active as f64;
             if (target - view.y).abs() < 0.01 {
                 view.y = target;
             } else {
-                view.y += (target - view.y) * (1.0 - (-dt.as_secs_f64() / SLIDE_TAU).exp());
+                view.y += (target - view.y)
+                    * (1.0 - (-dt.as_secs_f64() / SLIDE_TAU).exp());
                 moving = true;
             }
         }
@@ -452,11 +460,7 @@ mod tests {
         let ws = with_client(&["work", "play"]);
         assert_eq!(
             shape(&ws),
-            [
-                (Some("work"), vec![]),
-                (Some("play"), vec![]),
-                (None, vec![])
-            ]
+            [(Some("work"), vec![]), (Some("play"), vec![]), (None, vec![])]
         );
         assert_eq!(ws.active_index(A), 0);
     }
@@ -569,7 +573,8 @@ mod tests {
         // so the lone column above is as narrow as those below.
         assert!((ws.zoom(A) - 1.0 / 3.0).abs() < 1e-9);
         // (Give or take rounding, at their different scroll positions.)
-        let (above, below) = (ws.column_span(A, 0, 0).1, ws.column_span(A, 1, 0).1);
+        let (above, below) =
+            (ws.column_span(A, 0, 0).1, ws.column_span(A, 1, 0).1);
         assert!(above.abs_diff(below) <= 1, "{above} vs {below}");
     }
 
@@ -680,17 +685,16 @@ mod tests {
         assert_eq!(idx, 1);
         assert_eq!(
             shape(&ws),
-            [
-                (Some("work"), vec![]),
-                (Some("play"), vec![]),
-                (None, vec![])
-            ]
+            [(Some("work"), vec![]), (Some("play"), vec![]), (None, vec![])]
         );
         // A was on the empty workspace, which moved down a place.
         assert_eq!(ws.active_index(A), 2);
         assert_eq!(ws.find("play"), Some(1));
         ws.set_active(A, 1);
-        assert_eq!((ws.active_index(A), ws.y(A), ws.clients_on(1)), (1, 1.0, 1));
+        assert_eq!(
+            (ws.active_index(A), ws.y(A), ws.clients_on(1)),
+            (1, 1.0, 1)
+        );
     }
 
     #[test]

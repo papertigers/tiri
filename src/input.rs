@@ -7,7 +7,9 @@
 
 use std::io::Write as _;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+};
 
 pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
@@ -92,7 +94,12 @@ fn modifier_param(mods: KeyModifiers) -> u8 {
         + 4 * u8::from(mods.contains(KeyModifiers::CONTROL))
 }
 
-fn cursor_key(out: &mut Vec<u8>, final_byte: u8, mods: KeyModifiers, application: bool) {
+fn cursor_key(
+    out: &mut Vec<u8>,
+    final_byte: u8,
+    mods: KeyModifiers,
+    application: bool,
+) {
     match modifier_param(mods) {
         1 if application => out.extend_from_slice(b"\x1bO"),
         1 => out.extend_from_slice(b"\x1b["),
@@ -151,7 +158,9 @@ pub fn encode_mouse(
     let (mut code, release) = match kind {
         MouseEventKind::Down(b) => (button(b), false),
         MouseEventKind::Up(b) => (button(b), true),
-        MouseEventKind::Drag(b) if modes.drag || modes.motion => (button(b) + 32, false),
+        MouseEventKind::Drag(b) if modes.drag || modes.motion => {
+            (button(b) + 32, false)
+        }
         MouseEventKind::Moved if modes.motion => (3 + 32, false),
         MouseEventKind::ScrollUp => (64, false),
         MouseEventKind::ScrollDown => (65, false),
@@ -177,7 +186,9 @@ pub fn encode_mouse(
         let value = value + 32;
         if modes.utf8 {
             let mut buf = [0u8; 4];
-            out.extend_from_slice(char::from_u32(value)?.encode_utf8(&mut buf).as_bytes());
+            out.extend_from_slice(
+                char::from_u32(value)?.encode_utf8(&mut buf).as_bytes(),
+            );
         } else {
             out.push(u8::try_from(value).ok()?);
         }
@@ -201,8 +212,10 @@ mod tests {
     fn mouse_sgr_encoding() {
         let none = KeyModifiers::NONE;
         let left = MouseButton::Left;
-        let enc =
-            |kind, mods| encode_mouse(kind, 4, 9, mods, SGR).map(|b| String::from_utf8(b).unwrap());
+        let enc = |kind, mods| {
+            encode_mouse(kind, 4, 9, mods, SGR)
+                .map(|b| String::from_utf8(b).unwrap())
+        };
         assert_eq!(
             enc(MouseEventKind::Down(left), none).unwrap(),
             "\x1b[<0;5;10M"
@@ -225,10 +238,7 @@ mod tests {
 
     #[test]
     fn mouse_legacy_encodings() {
-        let modes = MouseModes {
-            click: true,
-            ..MouseModes::default()
-        };
+        let modes = MouseModes { click: true, ..MouseModes::default() };
         let down = encode_mouse(
             MouseEventKind::Down(MouseButton::Right),
             0,
@@ -265,10 +275,7 @@ mod tests {
             ),
             None
         );
-        let utf8 = MouseModes {
-            utf8: true,
-            ..modes
-        };
+        let utf8 = MouseModes { utf8: true, ..modes };
         let wide = encode_mouse(
             MouseEventKind::Down(MouseButton::Left),
             300,

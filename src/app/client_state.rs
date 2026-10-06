@@ -151,7 +151,8 @@ impl Client {
     pub fn copy(&mut self, text: &str) {
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-        write!(self.escapes, "\x1b]52;c;{encoded}\x07").expect("writing to memory can't fail");
+        write!(self.escapes, "\x1b]52;c;{encoded}\x07")
+            .expect("writing to memory can't fail");
     }
 
     /// How many lines back this client is scrolled in `pane`. Output since
@@ -177,10 +178,7 @@ impl Client {
             let top = -(pane.history_size() as i64);
             let shift = |p: Point| {
                 let line = i64::from(p.line) - scrolled;
-                (line >= top).then_some(Point {
-                    line: line as i32,
-                    ..p
-                })
+                (line >= top).then_some(Point { line: line as i32, ..p })
             };
             Some((shift(selection.anchor)?, shift(selection.head)?))
         });
@@ -208,10 +206,7 @@ impl Client {
         } else {
             self.scrollback.insert(
                 id,
-                Scrollback {
-                    lines: target,
-                    at: pane.scroll_mark(),
-                },
+                Scrollback { lines: target, at: pane.scroll_mark() },
             );
         }
     }

@@ -73,11 +73,7 @@ pub struct Image {
 
 impl Image {
     pub fn new(width: usize, height: usize) -> Self {
-        Self {
-            width,
-            height,
-            rgba: vec![0; width * height * 4],
-        }
+        Self { width, height, rgba: vec![0; width * height * 4] }
     }
 
     /// The same image at `opacity` (0 to 1) of its own opacity. Thumbnails
@@ -92,11 +88,20 @@ impl Image {
         faded
     }
 
-    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: [u8; 3], alpha: u8) {
+    fn fill(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        rgb: [u8; 3],
+        alpha: u8,
+    ) {
         for py in y..(y + h).min(self.height) {
             for px in x..(x + w).min(self.width) {
                 let i = (py * self.width + px) * 4;
-                self.rgba[i..i + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+                self.rgba[i..i + 4]
+                    .copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
             }
         }
     }
@@ -113,7 +118,8 @@ fn fit_cell(cell_size: CellSize, cols: usize, rows: usize) -> Option<CellSize> {
     let (w, h) = cell_size;
     let rounded = (8, ((8 * h + w / 2) / w).max(1));
     [cell_size, rounded].into_iter().find(|&(w, h)| {
-        let pixels = (cols.checked_mul(w)).and_then(|x| x.checked_mul(rows.checked_mul(h)?));
+        let pixels = (cols.checked_mul(w))
+            .and_then(|x| x.checked_mul(rows.checked_mul(h)?));
         pixels.is_some_and(|p| p <= MAX_PIXELS)
     })
 }
@@ -123,7 +129,11 @@ fn fit_cell(cell_size: CellSize, cols: usize, rows: usize) -> Option<CellSize> {
 /// [`fit_cell`]). The default background is left transparent so that
 /// terminal's own background shows through. None if the screen is too big
 /// for a thumbnail.
-pub fn rasterize<T>(term: &Term<T>, palette: &Palette, cell_size: CellSize) -> Option<Image> {
+pub fn rasterize<T>(
+    term: &Term<T>,
+    palette: &Palette,
+    cell_size: CellSize,
+) -> Option<Image> {
     let (rows, cols) = (term.screen_lines(), term.columns());
     let cell_size = fit_cell(cell_size, cols, rows)?;
     let (cell_width, cell_height) = cell_size;
@@ -164,7 +174,8 @@ fn draw_cell(
         cell_width
     };
 
-    let mut fg = resolve(cell.fg, colors, palette).unwrap_or(palette.foreground);
+    let mut fg =
+        resolve(cell.fg, colors, palette).unwrap_or(palette.foreground);
     let mut bg = resolve(cell.bg, colors, palette);
     if cell.flags.contains(Flags::INVERSE) {
         (fg, bg) = (bg.unwrap_or(palette.background), Some(fg));
@@ -175,13 +186,17 @@ fn draw_cell(
     if let Some(bg) = bg {
         image.fill(x, y, width, cell_height, bg, 0xff);
     }
-    if cell.flags.contains(Flags::HIDDEN) || cell.c.is_whitespace() || cell.c.is_control() {
+    if cell.flags.contains(Flags::HIDDEN)
+        || cell.c.is_whitespace()
+        || cell.c.is_control()
+    {
         return;
     }
 
     if let Some(dots) = braille(cell.c) {
         // Braille is a 2x4 grid of dots; btop draws its graphs with it.
-        let (dot_w, dot_h) = ((cell_width / 4).max(1), (cell_height / 8).max(1));
+        let (dot_w, dot_h) =
+            ((cell_width / 4).max(1), (cell_height / 8).max(1));
         for (bit, (dx, dy)) in BRAILLE_DOTS.iter().enumerate() {
             if dots & (1 << bit) != 0 {
                 let dot_x = x + cell_width / 8 + dx * cell_width / 2;
@@ -226,16 +241,8 @@ fn draw_cell(
 }
 
 /// Offsets (in 4px steps) of braille dots 1-8, indexed by bit.
-const BRAILLE_DOTS: [(usize, usize); 8] = [
-    (0, 0),
-    (0, 1),
-    (0, 2),
-    (1, 0),
-    (1, 1),
-    (1, 2),
-    (0, 3),
-    (1, 3),
-];
+const BRAILLE_DOTS: [(usize, usize); 8] =
+    [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
 
 fn braille(c: char) -> Option<u8> {
     let offset = u32::from(c).checked_sub(0x2800)?;
@@ -255,7 +262,11 @@ fn glyph(c: char) -> Option<[u8; 8]> {
 
 /// The RGB for a cell color, or None for the default background. Colors
 /// the program set itself (OSC 4/10/11) win over the palette.
-fn resolve(color: TermColor, colors: &Colors, palette: &Palette) -> Option<Rgb> {
+fn resolve(
+    color: TermColor,
+    colors: &Colors,
+    palette: &Palette,
+) -> Option<Rgb> {
     // Where the program's own setting for it would be, and the palette's.
     let (idx, from_palette) = match color {
         TermColor::Spec(c) => return Some([c.r, c.g, c.b]),
@@ -264,8 +275,11 @@ fn resolve(color: TermColor, colors: &Colors, palette: &Palette) -> Option<Rgb> 
             let from_palette = match n {
                 NamedColor::Background => None,
                 n if (n as usize) < 16 => Some(palette.indexed(n as u8)),
-                n if (NamedColor::DimBlack..=NamedColor::DimWhite).contains(&n) => {
-                    let base = (n as usize - NamedColor::DimBlack as usize) as u8;
+                n if (NamedColor::DimBlack..=NamedColor::DimWhite)
+                    .contains(&n) =>
+                {
+                    let base =
+                        (n as usize - NamedColor::DimBlack as usize) as u8;
                     Some(palette.indexed(base).map(|c| c / 2))
                 }
                 _ => Some(palette.foreground),
@@ -285,14 +299,19 @@ mod tests {
     use super::*;
 
     fn term_with(cols: usize, rows: usize, bytes: &[u8]) -> Term<VoidListener> {
-        let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            VoidListener,
+        );
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, bytes);
         term
     }
 
     fn rasterize_default<T>(term: &Term<T>) -> Image {
-        rasterize(term, &Palette::default(), DEFAULT_CELL).expect("small enough")
+        rasterize(term, &Palette::default(), DEFAULT_CELL)
+            .expect("small enough")
     }
 
     #[test]
@@ -320,7 +339,9 @@ mod tests {
         assert_eq!(cell_size_for(Some((250, 509))), (8, 16));
         assert_eq!(cell_size_for(Some((255, 1))), (8, 16));
         assert_eq!(cell_size_for(Some((1000, 2000))), (8, 16));
-        let image = rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20)).unwrap();
+        let image =
+            rasterize(&term_with(3, 2, b""), &Palette::default(), (9, 20))
+                .unwrap();
         assert_eq!((image.width, image.height), (27, 40));
     }
 
@@ -389,7 +410,8 @@ mod tests {
 
     #[test]
     fn backgrounds_fill_the_cell_and_default_stays_clear() {
-        let image = rasterize_default(&term_with(2, 1, b"\x1b[48;2;1;2;3m \x1b[0m "));
+        let image =
+            rasterize_default(&term_with(2, 1, b"\x1b[48;2;1;2;3m \x1b[0m "));
         assert_eq!(pixel(&image, 3, 8), [1, 2, 3, 0xff]);
         assert_eq!(pixel(&image, 11, 8)[3], 0);
     }
@@ -397,7 +419,8 @@ mod tests {
     #[test]
     fn braille_dots_land_in_the_right_corners() {
         // U+2801 is dot 1 (top left); U+2880 is dot 8 (bottom right).
-        let image = rasterize_default(&term_with(2, 1, "\u{2801}\u{2880}".as_bytes()));
+        let image =
+            rasterize_default(&term_with(2, 1, "\u{2801}\u{2880}".as_bytes()));
         assert_eq!(pixel(&image, 1, 1)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 5, 13)[3], 0xff);
         assert_eq!(pixel(&image, 8 + 1, 1)[3], 0);
@@ -405,7 +428,8 @@ mod tests {
 
     #[test]
     fn fading_scales_only_opacity() {
-        let image = rasterize_default(&term_with(1, 1, b"\x1b[48;2;10;20;30m "));
+        let image =
+            rasterize_default(&term_with(1, 1, b"\x1b[48;2;10;20;30m "));
         let half = image.with_opacity(0.5);
         assert_eq!(pixel(&half, 3, 8), [10, 20, 30, 128]);
         assert_eq!(pixel(&image.with_opacity(0.0), 3, 8)[3], 0);

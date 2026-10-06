@@ -189,7 +189,8 @@ fn listen(socket: &Path) -> Result<()> {
         None => log::warn!("no $HOME or $XDG_CONFIG_HOME, so no config file"),
     }
     let result = serve(&listener, config_path);
-    let current = std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
+    let current =
+        std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
     if let (Ok(bound), Ok(current)) = (bound, current)
         && bound == current
     {
@@ -202,18 +203,20 @@ fn listen(socket: &Path) -> Result<()> {
 /// the server's pid, since the file outlives many servers. `TIRI_LOG` sets
 /// the level, as `RUST_LOG` would (default `info`).
 fn init_logging() {
-    env_logger::Builder::from_env(env_logger::Env::new().filter_or("TIRI_LOG", "info"))
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} {:<5} tiri[{}] {}",
-                buf.timestamp_seconds(),
-                record.level(),
-                std::process::id(),
-                record.args()
-            )
-        })
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::new().filter_or("TIRI_LOG", "info"),
+    )
+    .format(|buf, record| {
+        writeln!(
+            buf,
+            "{} {:<5} tiri[{}] {}",
+            buf.timestamp_seconds(),
+            record.level(),
+            std::process::id(),
+            record.args()
+        )
+    })
+    .init();
 }
 
 fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
@@ -224,19 +227,22 @@ fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
 
     // A pane's shell exiting is a SIGCHLD; the handler writes to this pipe,
     // which the poller watches along with everything else.
-    let (sigchld, sigchld_writer) = UnixStream::pair().context("couldn't make a signal pipe")?;
+    let (sigchld, sigchld_writer) =
+        UnixStream::pair().context("couldn't make a signal pipe")?;
     sigchld
         .set_nonblocking(true)
         .context("couldn't make the signal pipe non-blocking")?;
-    let handler = signal_hook::low_level::pipe::register(SIGCHLD, sigchld_writer)
-        .context("couldn't watch for exiting shells")?;
+    let handler =
+        signal_hook::low_level::pipe::register(SIGCHLD, sigchld_writer)
+            .context("couldn't watch for exiting shells")?;
     // SAFETY: deleted from the poller before `serve` returns.
     unsafe { poller.add(&sigchld, PollEvent::readable(SIGCHLD_KEY)) }
         .context("couldn't watch the signal pipe")?;
 
     let mut app = App::new(Arc::clone(&poller), config_path);
     let mut connections = HashMap::new();
-    let result = event_loop(listener, &sigchld, &poller, &mut app, &mut connections);
+    let result =
+        event_loop(listener, &sigchld, &poller, &mut app, &mut connections);
     // However the loop ended, panes are killed and clients told.
     shut_down(&mut app, &poller, std::mem::take(&mut connections));
     let _ = poller.delete(&sigchld);
@@ -311,7 +317,9 @@ struct Server<'a> {
 impl Server<'_> {
     /// Waits for I/O, or until the next thing that's due without any.
     fn wait(&mut self) -> Result<()> {
-        if (self.accept_paused_until).is_some_and(|until| Instant::now() >= until) {
+        if (self.accept_paused_until)
+            .is_some_and(|until| Instant::now() >= until)
+        {
             self.accept_paused_until = None;
         }
 
@@ -344,14 +352,19 @@ impl Server<'_> {
             .context("couldn't watch the signal pipe")?;
         for (&key, connection) in self.connections.iter_mut() {
             // After end of input a socket stays readable, to no purpose.
-            let interest = PollEvent::new(key, !connection.eof, !connection.outgoing.is_empty());
+            let interest = PollEvent::new(
+                key,
+                !connection.eof,
+                !connection.outgoing.is_empty(),
+            );
             if let Err(e) = self.poller.modify(&connection.stream, interest) {
                 log::warn!("{}: couldn't watch it: {e}", connection.name());
                 connection.dead = true;
             }
         }
         self.events.clear();
-        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let timeout =
+            deadline.map(|d| d.saturating_duration_since(Instant::now()));
         match self.poller.wait(&mut self.events, timeout) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
@@ -372,14 +385,17 @@ impl Server<'_> {
                     );
                     if let Err(e) = accepted {
                         log::warn!("couldn't accept a connection: {e}");
-                        self.accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                        self.accept_paused_until =
+                            Some(Instant::now() + ACCEPT_BACKOFF);
                     }
                 }
                 SIGCHLD_KEY => {
                     // Several signals may be pending as one wakeup; one look
                     // at every child covers them all.
                     let mut buf = [0u8; 64];
-                    while matches!((&*self.sigchld).read(&mut buf), Ok(n) if n > 0) {}
+                    while matches!((&*self.sigchld).read(&mut buf), Ok(n) if n > 0)
+                    {
+                    }
                     self.app.children_exited();
                 }
                 key if key >= CONNECTION_KEY_BASE => {
@@ -404,7 +420,9 @@ impl Server<'_> {
             // say; anything more is dropped with it.
             while !connection.dead && !connection.closing {
                 match connection.decoder.next::<ClientMsg>() {
-                    Ok(Some(msg)) => handle(self.app, connection, msg, &mut self.kill),
+                    Ok(Some(msg)) => {
+                        handle(self.app, connection, msg, &mut self.kill)
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         log::warn!("{}: dropping it: {e:#}", connection.name());
@@ -427,7 +445,9 @@ impl Server<'_> {
 
         // Programs copying with OSC 52 reach every attached clipboard.
         for text in self.app.take_copied() {
-            for client in (self.connections.values_mut()).filter_map(|c| c.client.as_mut()) {
+            for client in (self.connections.values_mut())
+                .filter_map(|c| c.client.as_mut())
+            {
                 client.copy(&text);
             }
         }
@@ -439,8 +459,12 @@ impl Server<'_> {
         self.had_panes |= !self.app.is_empty();
         // Connections that never said hello don't keep the server alive;
         // shutting down tells them it's gone.
-        let abandoned = !self.had_panes && self.started.elapsed() >= STARTUP_GRACE;
-        self.kill || self.app.quit || (self.had_panes && self.app.is_empty()) || abandoned
+        let abandoned =
+            !self.had_panes && self.started.elapsed() >= STARTUP_GRACE;
+        self.kill
+            || self.app.quit
+            || (self.had_panes && self.app.is_empty())
+            || abandoned
     }
 
     /// Moves animations on to now.
@@ -448,11 +472,8 @@ impl Server<'_> {
         let now = Instant::now();
         self.app.expire_syncs(now);
         // Don't let a long idle wait turn into one giant animation step.
-        let dt = if self.animating {
-            now - self.last_tick
-        } else {
-            Duration::ZERO
-        };
+        let dt =
+            if self.animating { now - self.last_tick } else { Duration::ZERO };
         self.last_tick = now;
         self.animating = self.app.tick(dt.max(Duration::from_millis(1)));
     }
@@ -473,8 +494,10 @@ impl Server<'_> {
                 key if key >= CONNECTION_KEY_BASE => event.readable,
                 _ => true,
             });
-        let frame_due = self.animating && now.duration_since(self.last_draw) >= FRAME;
-        let caught_up = (self.connections.values()).any(|c| c.owed_frame && c.wants_frames());
+        let frame_due =
+            self.animating && now.duration_since(self.last_draw) >= FRAME;
+        let caught_up = (self.connections.values())
+            .any(|c| c.owed_frame && c.wants_frames());
         let drawing = changed || frame_due || caught_up;
         if drawing {
             self.last_draw = now;
@@ -488,7 +511,8 @@ impl Server<'_> {
                 connection.owed_frame |= drawing;
                 // Effects still running need their next frame in time.
                 self.animating |= connection.wants_frames()
-                    && (connection.client.as_ref()).is_some_and(Client::effects_running);
+                    && (connection.client.as_ref())
+                        .is_some_and(Client::effects_running);
                 continue;
             }
             connection.owed_frame = false;
@@ -539,13 +563,17 @@ fn accept(
                 *next_connection += 1;
                 let connection = Connection::new(key, stream);
                 if let Err(e) = connection.stream.set_nonblocking(true) {
-                    log::warn!("{}: couldn't make it non-blocking: {e}", connection.name());
+                    log::warn!(
+                        "{}: couldn't make it non-blocking: {e}",
+                        connection.name()
+                    );
                     continue;
                 }
                 // SAFETY: deleted from the poller when the connection is
                 // dropped from `connections`, or at shutdown.
-                if let Err(e) = unsafe { poller.add(&connection.stream, PollEvent::readable(key)) }
-                {
+                if let Err(e) = unsafe {
+                    poller.add(&connection.stream, PollEvent::readable(key))
+                } {
                     log::warn!("{}: couldn't watch it: {e}", connection.name());
                     continue;
                 }
@@ -558,7 +586,12 @@ fn accept(
     }
 }
 
-fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut bool) {
+fn handle(
+    app: &mut App,
+    connection: &mut Connection,
+    msg: ClientMsg,
+    kill: &mut bool,
+) {
     match msg {
         ClientMsg::Hello(hello) if connection.client.is_none() => {
             log::info!(
@@ -636,7 +669,11 @@ fn handle(app: &mut App, connection: &mut Connection, msg: ClientMsg, kill: &mut
 
 /// Kills every pane and tells every client the server is gone, giving them
 /// a moment, between them, to receive it.
-fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connection>) {
+fn shut_down(
+    app: &mut App,
+    poller: &Poller,
+    connections: HashMap<usize, Connection>,
+) {
     app.shutdown();
     let deadline = Instant::now() + SHUTDOWN_GRACE;
     for (_, mut connection) in connections {
@@ -649,7 +686,8 @@ fn shut_down(app: &mut App, poller: &Poller, connections: HashMap<usize, Connect
         let _ = connection.stream.set_nonblocking(false);
         // A client that isn't reading doesn't hold up the rest for long.
         let left = deadline.saturating_duration_since(Instant::now());
-        let _ = (connection.stream).set_write_timeout(Some(left.max(Duration::from_millis(10))));
+        let _ = (connection.stream)
+            .set_write_timeout(Some(left.max(Duration::from_millis(10))));
         let _ = connection.stream.write_all(&connection.outgoing);
     }
 }

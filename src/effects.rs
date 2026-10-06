@@ -51,7 +51,11 @@ impl Effects {
     /// the background.
     pub fn pane_opened(&mut self, pane: PaneId, palette: &Palette) {
         let background = background(palette);
-        let effect = fx::fade_from(background, background, (OPEN_FADE, Interpolation::QuadOut));
+        let effect = fx::fade_from(
+            background,
+            background,
+            (OPEN_FADE, Interpolation::QuadOut),
+        );
         self.running.push(Running { pane, effect });
     }
 
@@ -178,12 +182,19 @@ impl Transition {
 
     /// Draws the transition at `now` into `frame`, which holds the new
     /// view. The status bar's row is left alone. Returns false once done.
-    pub fn apply(&mut self, frame: &mut Frame, palette: &Palette, now: Instant) -> bool {
+    pub fn apply(
+        &mut self,
+        frame: &mut Frame,
+        palette: &Palette,
+        now: Instant,
+    ) -> bool {
         let elapsed = self.last.map_or(Duration::ZERO, |last| now - last);
         self.last = Some(now);
-        let area = Rect::new(0, 0, frame.width(), frame.height().saturating_sub(1));
+        let area =
+            Rect::new(0, 0, frame.width(), frame.height().saturating_sub(1));
         if !self.coming_in
-            && (self.from.width(), self.from.height()) != (frame.width(), frame.height())
+            && (self.from.width(), self.from.height())
+                != (frame.width(), frame.height())
         {
             // The terminal changed size, so the old view no longer fits it.
             // Skip to bringing the new one in.
@@ -230,7 +241,11 @@ fn background(palette: &Palette) -> RColor {
 
 /// Runs `f` over `frame` as a ratatui buffer, then copies back the cells
 /// it changed.
-fn on_buffer(frame: &mut Frame, palette: &Palette, f: impl FnOnce(&mut Buffer)) {
+fn on_buffer(
+    frame: &mut Frame,
+    palette: &Palette,
+    f: impl FnOnce(&mut Buffer),
+) {
     let original = to_buffer(frame, palette);
     let mut buffer = original.clone();
     f(&mut buffer);
@@ -239,7 +254,8 @@ fn on_buffer(frame: &mut Frame, palette: &Palette, f: impl FnOnce(&mut Buffer)) 
 
 /// `frame` as a ratatui buffer, colors resolved to RGB.
 fn to_buffer(frame: &Frame, palette: &Palette) -> Buffer {
-    let mut buffer = Buffer::empty(Rect::new(0, 0, frame.width(), frame.height()));
+    let mut buffer =
+        Buffer::empty(Rect::new(0, 0, frame.width(), frame.height()));
     for y in 0..frame.height() {
         for x in 0..frame.width() {
             let (sym, _, style) = frame.content(x, y);
@@ -271,7 +287,8 @@ fn copy_changes(frame: &mut Frame, original: &Buffer, changed: &Buffer) {
             let (_, wide, mut style) = frame.content(x, y);
             style.fg = color(after.fg);
             style.bg = color(after.bg);
-            let (x, y, sym) = (i32::from(x), i32::from(y), after.symbol().to_owned());
+            let (x, y, sym) =
+                (i32::from(x), i32::from(y), after.symbol().to_owned());
             if sym.is_empty() {
                 // The covered half of a wide character: only its colors change.
                 continue;
@@ -410,7 +427,12 @@ mod tests {
         // A second pane opens much later; its fade still starts at the start.
         effects.pane_opened(PaneId(0), &palette);
         let mut frame = frame_with_text();
-        effects.apply(&mut frame, &palette, start + Duration::from_secs(5), &areas);
+        effects.apply(
+            &mut frame,
+            &palette,
+            start + Duration::from_secs(5),
+            &areas,
+        );
         let [r, g, b] = palette.background;
         assert_eq!(frame.content(2, 1).2.fg, Color::Rgb(r, g, b));
         assert!(effects.is_active());
@@ -439,7 +461,8 @@ mod tests {
 
     #[test]
     fn opening_fades_the_overview_in() {
-        let mut transition = Transition::new(filled("o"), true, &Palette::default());
+        let mut transition =
+            Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         assert_eq!(transition.image_opacity(), 0.0);
         // Through the fade-out, then part way into the fade-in.
@@ -457,7 +480,8 @@ mod tests {
 
     #[test]
     fn closing_fades_the_overview_out() {
-        let mut transition = Transition::new(filled("o"), false, &Palette::default());
+        let mut transition =
+            Transition::new(filled("o"), false, &Palette::default());
         let ms = Duration::from_millis;
         assert_eq!(transition.image_opacity(), 1.0);
         let frame = run(&mut transition, &filled("n"), &[ms(0), ms(80)]);
@@ -476,7 +500,8 @@ mod tests {
         let mut new = filled("n");
         let id = Style::fg(Color::Rgb(0, 0, 7));
         new.put(5, 5, &kitty::placeholder(0, 0), id);
-        let mut transition = Transition::new(filled("o"), true, &Palette::default());
+        let mut transition =
+            Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         let frame = run(
             &mut transition,
@@ -488,7 +513,8 @@ mod tests {
 
     #[test]
     fn a_transition_ends_showing_the_new_view_untouched() {
-        let mut transition = Transition::new(filled("o"), true, &Palette::default());
+        let mut transition =
+            Transition::new(filled("o"), true, &Palette::default());
         let ms = Duration::from_millis;
         let start = Instant::now();
         let new = filled("n");
@@ -496,7 +522,8 @@ mod tests {
         let mut frame = new.clone();
         for t in (0..60).map(|i| ms(i * 16)) {
             frame = new.clone();
-            running = transition.apply(&mut frame, &Palette::default(), start + t);
+            running =
+                transition.apply(&mut frame, &Palette::default(), start + t);
             if !running {
                 break;
             }
@@ -508,7 +535,8 @@ mod tests {
 
     #[test]
     fn the_status_bar_is_never_part_of_it() {
-        let mut transition = Transition::new(filled("o"), false, &Palette::default());
+        let mut transition =
+            Transition::new(filled("o"), false, &Palette::default());
         let mut new = filled("n");
         new.put_str(0, 10, "status", Style::default());
         let frame = run(

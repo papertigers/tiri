@@ -67,24 +67,17 @@ pub fn word_at<T>(term: &Term<T>, point: Point) -> (Point, Point) {
     };
     // Neighbouring cells in reading order, stepping across wrapped rows.
     let before = |p: Point| match p.col {
-        0 if p.line > top && wraps(p.line - 1) => Some(Point {
-            line: p.line - 1,
-            col: last_col,
-        }),
+        0 if p.line > top && wraps(p.line - 1) => {
+            Some(Point { line: p.line - 1, col: last_col })
+        }
         0 => None,
         col => Some(Point { col: col - 1, ..p }),
     };
     let after = |p: Point| {
         if p.col < last_col {
-            Some(Point {
-                col: p.col + 1,
-                ..p
-            })
+            Some(Point { col: p.col + 1, ..p })
         } else if p.line < bottom && wraps(p.line) {
-            Some(Point {
-                line: p.line + 1,
-                col: 0,
-            })
+            Some(Point { line: p.line + 1, col: 0 })
         } else {
             None
         }
@@ -95,7 +88,9 @@ pub fn word_at<T>(term: &Term<T>, point: Point) -> (Point, Point) {
         let mut cell = &row[Column(usize::from(p.col))];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && p.col > 0 {
             cell = &row[Column(usize::from(p.col) - 1)];
-        } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && p.line < bottom {
+        } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            && p.line < bottom
+        {
             // The gap left where a wide character didn't fit and wrapped
             // belongs with that character, at the start of the next row.
             cell = &term.grid()[Line(p.line + 1)][Column(0)];
@@ -107,10 +102,7 @@ pub fn word_at<T>(term: &Term<T>, point: Point) -> (Point, Point) {
         }
     };
 
-    let point = Point {
-        col: point.col.min(last_col),
-        ..point
-    };
+    let point = Point { col: point.col.min(last_col), ..point };
     let target = class(point);
     let (mut start, mut end) = (point, point);
     if target != Class::Separator {
@@ -143,16 +135,7 @@ pub fn line_at<T>(term: &Term<T>, point: Point) -> (Point, Point) {
     while end < bottom && wraps(end) {
         end += 1;
     }
-    (
-        Point {
-            line: start,
-            col: 0,
-        },
-        Point {
-            line: end,
-            col: last_col as u16,
-        },
-    )
+    (Point { line: start, col: 0 }, Point { line: end, col: last_col as u16 })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,13 +157,15 @@ pub fn text<T>(term: &Term<T>, start: Point, end: Point) -> String {
     for line in first_line..=last_line {
         let row = &term.grid()[Line(line)];
         let from = if line == start.line { start.col } else { 0 };
-        let to = if line == end.line { end.col } else { last_col }.min(last_col);
+        let to =
+            if line == end.line { end.col } else { last_col }.min(last_col);
         let mut text = String::new();
         for col in from..=to {
             let cell = &row[Column(usize::from(col))];
             // Neither the right half of a wide character nor the gap one
             // left by wrapping is text.
-            let spacers = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+            let spacers =
+                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
             if cell.flags.intersects(spacers) {
                 continue;
             }
@@ -214,7 +199,11 @@ mod tests {
     use super::*;
 
     fn term_with(cols: usize, rows: usize, bytes: &[u8]) -> Term<VoidListener> {
-        let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            VoidListener,
+        );
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, bytes);
         term
@@ -312,7 +301,11 @@ mod tests {
         let term = term_with(5, 4, b"abcdefghijkl\r\nnext");
         for line in 0..3 {
             let (start, end) = line_at(&term, at(line, 1));
-            assert_eq!(text(&term, start, end), "abcdefghijkl", "from row {line}");
+            assert_eq!(
+                text(&term, start, end),
+                "abcdefghijkl",
+                "from row {line}"
+            );
         }
         let (start, end) = line_at(&term, at(3, 0));
         assert_eq!(text(&term, start, end), "next");

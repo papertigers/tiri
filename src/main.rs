@@ -82,7 +82,9 @@ fn main() -> Result<()> {
             &socket_path(cli.socket)?,
             name.map_or(Target::Default, Target::Existing),
         ),
-        Command::New { name } => client::attach(&socket_path(cli.socket)?, Target::New(name)),
+        Command::New { name } => {
+            client::attach(&socket_path(cli.socket)?, Target::New(name))
+        }
         Command::Ls => client::list(&socket_path(cli.socket)?),
         Command::KillServer => client::kill_server(&socket_path(cli.socket)?),
         Command::Server => {
@@ -92,9 +94,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Config {
-            command: ConfigCommand::Default,
-        } => {
+        Command::Config { command: ConfigCommand::Default } => {
             print!("{}", config::DEFAULT);
             Ok(())
         }
@@ -104,7 +104,8 @@ fn main() -> Result<()> {
 /// The server's socket: `--socket`, then `$TIRI_SOCKET`, then the default,
 /// with its directory made ready.
 fn socket_path(arg: Option<PathBuf>) -> Result<PathBuf> {
-    let (socket, default) = match arg.or_else(|| std::env::var_os("TIRI_SOCKET").map(PathBuf::from))
+    let (socket, default) = match arg
+        .or_else(|| std::env::var_os("TIRI_SOCKET").map(PathBuf::from))
     {
         Some(path) => (path, false),
         None => (socket::default_path(), true),

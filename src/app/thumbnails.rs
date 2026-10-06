@@ -47,14 +47,22 @@ impl Thumbnail {
     /// Shows this as image `image_id`: uploads it if it's not already there
     /// at `opacity` (rounded to a few steps), and places it at `size` cells
     /// if it isn't already.
-    fn show(&mut self, escapes: &mut Vec<u8>, image_id: u32, size: (u16, u16), opacity: f32) {
-        let step = (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
+    fn show(
+        &mut self,
+        escapes: &mut Vec<u8>,
+        image_id: u32,
+        size: (u16, u16),
+        opacity: f32,
+    ) {
+        let step =
+            (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
         let uploading = self.opacity != Some(step);
         if uploading {
             if step == OPACITY_STEPS {
                 kitty::transmit(escapes, image_id, &self.image);
             } else {
-                let faded = (self.image).with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
+                let faded = (self.image)
+                    .with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
                 kitty::transmit(escapes, image_id, &faded);
             }
             self.opacity = Some(step);
@@ -109,12 +117,15 @@ impl Client {
         };
         let image_id = image_id(id);
         let generation = pane.generation();
-        let stale = self
-            .thumbnails
-            .get(&id)
-            .is_none_or(|t| t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL);
+        let stale = self.thumbnails.get(&id).is_none_or(|t| {
+            t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL
+        });
         if stale {
-            let image = thumbnail::rasterize(pane.term(), &self.palette, self.thumbnail_cell);
+            let image = thumbnail::rasterize(
+                pane.term(),
+                &self.palette,
+                self.thumbnail_cell,
+            );
             let Some(image) = image else {
                 // Too big for a thumbnail; the overview shows its text.
                 if self.thumbnails.remove(&id).is_some() {
@@ -148,8 +159,10 @@ impl Client {
 
     /// The inner size of a pane's box in cells, as a thumbnail placement.
     pub(super) fn thumbnail_size(w: i32, h: i32) -> (u16, u16) {
-        let clamp =
-            |n: i32| u16::try_from(n.max(1)).map_or(kitty::MAX_CELLS, |n| n.min(kitty::MAX_CELLS));
+        let clamp = |n: i32| {
+            u16::try_from(n.max(1))
+                .map_or(kitty::MAX_CELLS, |n| n.min(kitty::MAX_CELLS))
+        };
         (clamp(w - 2), clamp(h - 2))
     }
 }

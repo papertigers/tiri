@@ -333,13 +333,9 @@ pub const MAX_CELLS: u16 = DIACRITICS.len() as u16;
 
 /// The text for the placeholder cell showing `(row, col)` of a placement.
 pub fn placeholder(row: u16, col: u16) -> String {
-    [
-        PLACEHOLDER,
-        DIACRITICS[usize::from(row)],
-        DIACRITICS[usize::from(col)],
-    ]
-    .into_iter()
-    .collect()
+    [PLACEHOLDER, DIACRITICS[usize::from(row)], DIACRITICS[usize::from(col)]]
+        .into_iter()
+        .collect()
 }
 
 /// The foreground color that makes a placeholder cell refer to image `id`.
@@ -389,7 +385,8 @@ pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
 
 /// Frees image `id` and its placements.
 pub fn delete(out: &mut Vec<u8>, id: u32) {
-    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\").expect("writing to memory can't fail");
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+        .expect("writing to memory can't fail");
 }
 
 #[cfg(test)]
@@ -419,7 +416,8 @@ mod tests {
         let mut out = Vec::new();
         transmit(&mut out, 7, &image);
         let text = String::from_utf8(out).unwrap();
-        let chunks: Vec<&str> = text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
+        let chunks: Vec<&str> =
+            text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(chunks.len() > 2);
         assert!(chunks.iter().all(|c| c.contains("q=2,m=")));
         assert!(chunks[1].starts_with("\x1b_Gq=2,m=1;"));
@@ -433,8 +431,11 @@ mod tests {
         transmit(&mut out, 7, &image);
         place(&mut out, 7, 10, 5);
         let text = String::from_utf8(out).unwrap();
-        let commands: Vec<&str> = text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
-        assert!(commands[0].starts_with("\x1b_Ga=t,f=32,o=z,s=64,v=64,i=7,q=2,m="));
+        let commands: Vec<&str> =
+            text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
+        assert!(
+            commands[0].starts_with("\x1b_Ga=t,f=32,o=z,s=64,v=64,i=7,q=2,m=")
+        );
         assert!(commands[commands.len() - 2].contains("m=0;"));
         // Every chunk of the upload asks for no reply.
         let upload = &commands[..commands.len() - 1];

@@ -21,14 +21,17 @@ impl App {
     /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
         client.follow_selection(&self.panes);
-        if (client.notice.as_ref()).is_some_and(|notice| notice.until <= Instant::now()) {
+        if (client.notice.as_ref())
+            .is_some_and(|notice| notice.until <= Instant::now())
+        {
             client.notice = None;
         }
         let visible = self.visible_panes(client);
 
         let thumbnails = self.showing_thumbnails(client);
         // Thumbnails are fully opaque unless the overview is fading.
-        let opacity = (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
+        let opacity =
+            (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
         if thumbnails {
             let now = Instant::now();
             for b in &visible {
@@ -92,16 +95,7 @@ impl App {
             self.draw_offscreen_indicators(client, &mut frame);
         }
         let active_ws = self.workspaces.active_index(client.id);
-        for &PaneBox {
-            id,
-            ws,
-            column: idx,
-            x,
-            y,
-            w,
-            h,
-        } in visible
-        {
+        for &PaneBox { id, ws, column: idx, x, y, w, h } in visible {
             let strip = self.workspaces.list()[ws].strip();
             let column = &strip.columns()[idx];
             let stacked = column.panes().len() > 1;
@@ -111,8 +105,9 @@ impl App {
             // Its place in the stack, even when it's alone on screen
             // because it's fullscreen.
             let row = column.panes().iter().position(|&p| p == id).unwrap_or(0);
-            let focused =
-                ws == active_ws && idx == strip.focus_index() && row == column.focus_index();
+            let focused = ws == active_ws
+                && idx == strip.focus_index()
+                && row == column.focus_index();
             let border = if focused {
                 Style {
                     bold: true,
@@ -150,7 +145,12 @@ impl App {
                     for r in 0..rows {
                         for c in 0..cols {
                             let cell = kitty::placeholder(r, c);
-                            frame.put(x + 1 + i32::from(c), y + 1 + i32::from(r), &cell, style);
+                            frame.put(
+                                x + 1 + i32::from(c),
+                                y + 1 + i32::from(r),
+                                &cell,
+                                style,
+                            );
                         }
                     }
                 }
@@ -168,9 +168,11 @@ impl App {
                 ),
             }
 
-            if focused && show_cursor && scrolled == 0 && pane.cursor_visible() {
+            if focused && show_cursor && scrolled == 0 && pane.cursor_visible()
+            {
                 let (r, c) = pane.cursor();
-                let (cx, cy) = (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
+                let (cx, cy) =
+                    (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
                 if (0..i32::from(client.width)).contains(&cx)
                     && (0..client.area_height()).contains(&cy)
                     && cy < y + h - 1
@@ -203,16 +205,18 @@ impl App {
     /// Zoomed out, labels each workspace row on the line above it. An empty
     /// workspace gets a hint, or in the overview a placeholder box, so
     /// there's something to see and select.
-    fn draw_workspace_label(&self, client: &Client, frame: &mut Frame, ws: usize) {
+    fn draw_workspace_label(
+        &self,
+        client: &Client,
+        frame: &mut Frame,
+        ws: usize,
+    ) {
         let top = self.row_top(client, ws);
         let row_height = self.row_height(client);
         let overview = self.workspaces.in_overview(client.id);
         let active = ws == self.workspaces.active_index(client.id);
         let style = if active {
-            Style {
-                bold: true,
-                ..Style::fg(self.config.theme.focused_border)
-            }
+            Style { bold: true, ..Style::fg(self.config.theme.focused_border) }
         } else {
             Style::fg(self.config.theme.dim)
         };
@@ -238,7 +242,8 @@ impl App {
         if overview {
             // A box the size of a default column, where one would open.
             let zoom = self.workspaces.zoom(client.id);
-            let w = ((f64::from(client.width) * 0.5 * zoom).round() as i32).max(hint_width + 4);
+            let w = ((f64::from(client.width) * 0.5 * zoom).round() as i32)
+                .max(hint_width + 4);
             let x = (i32::from(client.width) - w) / 2;
             draw_box(frame, x, top, w, row_height, style);
             frame.put_str(x + (w - hint_width) / 2, middle, hint, style);
@@ -256,9 +261,8 @@ impl App {
         let above = (0..count)
             .filter(|&ws| self.row_top(client, ws) + row <= 0)
             .count();
-        let below: Vec<usize> = (0..count)
-            .filter(|&ws| self.row_top(client, ws) >= area)
-            .collect();
+        let below: Vec<usize> =
+            (0..count).filter(|&ws| self.row_top(client, ws) >= area).collect();
         let style = Style {
             bg: self.config.theme.status_bg,
             ..Style::fg(self.config.theme.status_fg)
@@ -271,11 +275,8 @@ impl App {
             note(0, format!(" ▲ {above} above "));
         }
         if let Some(&last) = below.last() {
-            let extra = if self.is_new_workspace(last) {
-                " (incl. new)"
-            } else {
-                ""
-            };
+            let extra =
+                if self.is_new_workspace(last) { " (incl. new)" } else { "" };
             note(area - 1, format!(" ▼ {} below{extra} ", below.len()));
         }
     }

@@ -33,10 +33,7 @@ impl App {
     /// by working out what a click on the bar hit.
     pub(super) fn status_segments(&self, client: &Client) -> Vec<Segment> {
         let theme = &self.config.theme;
-        let base = Style {
-            bg: theme.status_bg,
-            ..Style::fg(theme.status_fg)
-        };
+        let base = Style { bg: theme.status_bg, ..Style::fg(theme.status_fg) };
         let mut segments = vec![Segment {
             text: " tiri ".to_owned(),
             style: Style { bold: true, ..base },
@@ -54,10 +51,7 @@ impl App {
                     ..base
                 }
             } else if self.is_new_workspace(ws) {
-                Style {
-                    fg: theme.dim,
-                    ..base
-                }
+                Style { fg: theme.dim, ..base }
             } else {
                 base
             };
@@ -79,19 +73,12 @@ impl App {
         for idx in 0..strip.columns().len() {
             let focused = idx == strip.focus_index();
             let style = if focused {
-                Style {
-                    fg: theme.focused_border,
-                    bold: true,
-                    ..base
-                }
+                Style { fg: theme.focused_border, bold: true, ..base }
             } else {
                 match strip.visibility(idx) {
                     Visibility::Full => Style { bold: true, ..base },
                     Visibility::Partial => base,
-                    Visibility::Hidden => Style {
-                        fg: theme.dim,
-                        ..base
-                    },
+                    Visibility::Hidden => Style { fg: theme.dim, ..base },
                 }
             };
             segments.push(Segment {
@@ -106,10 +93,7 @@ impl App {
     pub(super) fn draw_status(&self, client: &Client, frame: &mut Frame) {
         let y = i32::from(client.height) - 1;
         let theme = &self.config.theme;
-        let base = Style {
-            bg: theme.status_bg,
-            ..Style::fg(theme.status_fg)
-        };
+        let base = Style { bg: theme.status_bg, ..Style::fg(theme.status_fg) };
         frame.put_str(0, y, &" ".repeat(usize::from(client.width)), base);
         let mut x = 0;
         for segment in self.status_segments(client) {
@@ -126,7 +110,10 @@ impl App {
                 bold: true,
                 ..base
             };
-            let text = format!(" {} ", fit_width(&notice.text, room.saturating_sub(2)));
+            let text = format!(
+                " {} ",
+                fit_width(&notice.text, room.saturating_sub(2))
+            );
             let notice_x = i32::from(client.width) - text_width(&text) as i32;
             frame.put_str(notice_x, y, &text, style);
             return;
@@ -264,19 +251,19 @@ fn normal_hints(bindings: &Bindings) -> Vec<String> {
 /// "keys label" for each of `items` whose actions all have keys in `table`.
 fn labelled(table: &Table, items: &[(&str, &[Action])]) -> Vec<String> {
     (items.iter())
-        .filter_map(|(label, actions)| Some(format!("{} {label}", table.hint_keys(actions)?)))
+        .filter_map(|(label, actions)| {
+            Some(format!("{} {label}", table.hint_keys(actions)?))
+        })
         .collect()
 }
 
 /// Left, down, up, right: hjkl.
-const FOCUS: &[Action] = &[
-    FocusColumnLeft,
-    FocusPaneDown,
-    FocusPaneUp,
-    FocusColumnRight,
-];
-const MOVE: &[Action] = &[MoveColumnLeft, MovePaneDown, MovePaneUp, MoveColumnRight];
-const MOVE_TO_WORKSPACE: &[Action] = &[MoveColumnToWorkspaceDown, MoveColumnToWorkspaceUp];
+const FOCUS: &[Action] =
+    &[FocusColumnLeft, FocusPaneDown, FocusPaneUp, FocusColumnRight];
+const MOVE: &[Action] =
+    &[MoveColumnLeft, MovePaneDown, MovePaneUp, MoveColumnRight];
+const MOVE_TO_WORKSPACE: &[Action] =
+    &[MoveColumnToWorkspaceDown, MoveColumnToWorkspaceUp];
 
 #[cfg(test)]
 mod tests {

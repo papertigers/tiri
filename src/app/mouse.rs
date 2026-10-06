@@ -54,15 +54,15 @@ impl App {
             }
             return Hit::Nothing;
         }
-        if let Some(b) = (self.visible_panes(client).into_iter()).find(|b| b.contains(x, y)) {
+        if let Some(b) =
+            (self.visible_panes(client).into_iter()).find(|b| b.contains(x, y))
+        {
             let (id, (cx, cy)) = (b.id, (x - b.x - 1, y - b.y - 1));
-            let inside = (0..b.w - 2).contains(&cx) && (0..b.h - 2).contains(&cy);
+            let inside =
+                (0..b.w - 2).contains(&cx) && (0..b.h - 2).contains(&cy);
             let inner = self.panes.get(&id).filter(|_| inside).map(|pane| {
                 let top = content_top(pane, b.h - 2, client.scrolled(id, pane));
-                let point = Point {
-                    line: top + cy,
-                    col: cx as u16,
-                };
+                let point = Point { line: top + cy, col: cx as u16 };
                 (cx as u16, cy as u16, point)
             });
             return Hit::Pane { id, inner };
@@ -95,10 +95,7 @@ impl App {
         let raw_y = y - b.y - 1;
         let cy = raw_y.clamp(0, b.h - 3);
         let top = content_top(pane, b.h - 2, client.scrolled(id, pane));
-        let point = Point {
-            line: top + cy,
-            col: cx as u16,
-        };
+        let point = Point { line: top + cy, col: cx as u16 };
         Some((cx as u16, cy as u16, point, (raw_y - cy).signum()))
     }
 
@@ -113,7 +110,8 @@ impl App {
         mods: KeyModifiers,
     ) {
         if let Some(pane) = self.panes.get_mut(&id)
-            && let Some(bytes) = encode_mouse(kind, col, row, mods, pane.mouse_modes())
+            && let Some(bytes) =
+                encode_mouse(kind, col, row, mods, pane.mouse_modes())
         {
             pane.write(&bytes);
         }
@@ -136,25 +134,35 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft if shift => {
                 self.workspaces.active_mut(client.id).focus_left();
             }
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight if shift => {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight
+                if shift =>
+            {
                 self.workspaces.active_mut(client.id).focus_right();
             }
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {}
-            MouseEventKind::ScrollUp if overview => self.workspaces.focus_up(client.id),
-            MouseEventKind::ScrollDown if overview => self.workspaces.focus_down(client.id),
+            MouseEventKind::ScrollUp if overview => {
+                self.workspaces.focus_up(client.id)
+            }
+            MouseEventKind::ScrollDown if overview => {
+                self.workspaces.focus_down(client.id)
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.wheel(client, event, x, y);
             }
-            MouseEventKind::Down(MouseButton::Left) => self.press(client, event, x, y),
-            MouseEventKind::Drag(MouseButton::Left) => self.drag(client, event, x, y),
-            MouseEventKind::Up(MouseButton::Left) => self.release(client, event, x, y),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.press(client, event, x, y)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.drag(client, event, x, y)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.release(client, event, x, y)
+            }
             // Other buttons, and movement, only matter to programs that
             // asked for them, in the focused pane.
             kind => {
-                if let Hit::Pane {
-                    id,
-                    inner: Some((col, row, _)),
-                } = self.hit(client, x, y)
+                if let Hit::Pane { id, inner: Some((col, row, _)) } =
+                    self.hit(client, x, y)
                     && Some(id) == self.workspaces.focused(client.id)
                     && !overview
                 {
@@ -167,7 +175,13 @@ impl App {
     /// The vertical wheel over a pane: to its program if it takes the
     /// mouse, as arrow keys in a full-screen program that doesn't, and
     /// otherwise through the client's view of its scrollback.
-    fn wheel(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+    fn wheel(
+        &mut self,
+        client: &mut Client,
+        event: MouseEvent,
+        x: i32,
+        y: i32,
+    ) {
         let Hit::Pane { id, inner } = self.hit(client, x, y) else {
             return;
         };
@@ -190,11 +204,21 @@ impl App {
                 pane.write(arrow);
             }
         } else {
-            client.scroll(id, pane, if up { WHEEL_LINES } else { -WHEEL_LINES });
+            client.scroll(
+                id,
+                pane,
+                if up { WHEEL_LINES } else { -WHEEL_LINES },
+            );
         }
     }
 
-    fn press(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+    fn press(
+        &mut self,
+        client: &mut Client,
+        event: MouseEvent,
+        x: i32,
+        y: i32,
+    ) {
         client.selection = None;
         client.drag = Drag::Ignored;
         let overview = self.workspaces.in_overview(client.id);
@@ -220,16 +244,17 @@ impl App {
                 // that wasn't focused still selects a word. A fourth click
                 // in a row starts over.
                 let now = Instant::now();
-                let clicks = inner.map_or(1, |(_, _, point)| match client.last_click {
-                    Some(last)
-                        if last.pane == id
-                            && last.point == point
-                            && now - last.at < MULTI_CLICK =>
-                    {
-                        last.count % 3 + 1
-                    }
-                    _ => 1,
-                });
+                let clicks =
+                    inner.map_or(1, |(_, _, point)| match client.last_click {
+                        Some(last)
+                            if last.pane == id
+                                && last.point == point
+                                && now - last.at < MULTI_CLICK =>
+                        {
+                            last.count % 3 + 1
+                        }
+                        _ => 1,
+                    });
                 client.last_click = inner.map(|(_, _, point)| Click {
                     at: now,
                     pane: id,
@@ -238,14 +263,22 @@ impl App {
                 });
 
                 // A click that focuses a pane isn't passed to its program.
-                let Some((col, row, point)) = inner.filter(|_| focused || clicks > 1) else {
+                let Some((col, row, point)) =
+                    inner.filter(|_| focused || clicks > 1)
+                else {
                     return;
                 };
                 let Some(pane) = self.panes.get(&id) else {
                     return;
                 };
                 if pane.mouse_modes().any() {
-                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                    self.forward_mouse(
+                        id,
+                        event.kind,
+                        col,
+                        row,
+                        event.modifiers,
+                    );
                     client.drag = Drag::Forwarded(id);
                 } else {
                     let (anchor, head) = match clicks {
@@ -253,10 +286,8 @@ impl App {
                         3 => selection::line_at(pane.term(), point),
                         _ => (point, point),
                     };
-                    client.drag = Drag::Selecting {
-                        pane: id,
-                        snapped: clicks > 1,
-                    };
+                    client.drag =
+                        Drag::Selecting { pane: id, snapped: clicks > 1 };
                     client.selection = Some(Selection {
                         pane: id,
                         anchor,
@@ -272,12 +303,22 @@ impl App {
     fn drag(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
         match client.drag {
             Drag::Forwarded(id) => {
-                if let Some((col, row, _, _)) = self.clamped_point(client, id, x, y) {
-                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                if let Some((col, row, _, _)) =
+                    self.clamped_point(client, id, x, y)
+                {
+                    self.forward_mouse(
+                        id,
+                        event.kind,
+                        col,
+                        row,
+                        event.modifiers,
+                    );
                 }
             }
             Drag::Selecting { pane: id, .. } => {
-                let Some((_, _, mut point, past)) = self.clamped_point(client, id, x, y) else {
+                let Some((_, _, mut point, past)) =
+                    self.clamped_point(client, id, x, y)
+                else {
                     return;
                 };
                 // Dragging above or below the pane scrolls it along, which
@@ -286,7 +327,9 @@ impl App {
                     && let Some(pane) = self.panes.get(&id)
                 {
                     client.scroll(id, pane, -past);
-                    if let Some((_, _, scrolled_to, _)) = self.clamped_point(client, id, x, y) {
+                    if let Some((_, _, scrolled_to, _)) =
+                        self.clamped_point(client, id, x, y)
+                    {
                         point = scrolled_to;
                     }
                 }
@@ -298,15 +341,31 @@ impl App {
         }
     }
 
-    fn release(&mut self, client: &mut Client, event: MouseEvent, x: i32, y: i32) {
+    fn release(
+        &mut self,
+        client: &mut Client,
+        event: MouseEvent,
+        x: i32,
+        y: i32,
+    ) {
         match std::mem::take(&mut client.drag) {
             Drag::Forwarded(id) => {
-                if let Some((col, row, _, _)) = self.clamped_point(client, id, x, y) {
-                    self.forward_mouse(id, event.kind, col, row, event.modifiers);
+                if let Some((col, row, _, _)) =
+                    self.clamped_point(client, id, x, y)
+                {
+                    self.forward_mouse(
+                        id,
+                        event.kind,
+                        col,
+                        row,
+                        event.modifiers,
+                    );
                 }
             }
             Drag::Selecting { pane: id, snapped } => {
-                let Some(selection) = client.selection.filter(|s| snapped || !s.is_empty()) else {
+                let Some(selection) =
+                    client.selection.filter(|s| snapped || !s.is_empty())
+                else {
                     // A plain click selects nothing.
                     client.selection = None;
                     return;

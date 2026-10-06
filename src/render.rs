@@ -34,10 +34,7 @@ pub struct Style {
 
 impl Style {
     pub fn fg(color: Color) -> Self {
-        Self {
-            fg: color,
-            ..Self::default()
-        }
+        Self { fg: color, ..Self::default() }
     }
 }
 
@@ -73,7 +70,10 @@ impl Frame {
         Self {
             width,
             height,
-            cells: vec![Cell::default(); usize::from(width) * usize::from(height)],
+            cells: vec![
+                Cell::default();
+                usize::from(width) * usize::from(height)
+            ],
         }
     }
 
@@ -95,11 +95,8 @@ impl Frame {
     pub fn put(&mut self, x: i32, y: i32, sym: &str, style: Style) {
         if let Some(i) = self.index(x, y) {
             self.split_wide(i);
-            self.cells[i] = Cell {
-                sym: printable(sym).into(),
-                wide: false,
-                style,
-            };
+            self.cells[i] =
+                Cell { sym: printable(sym).into(), wide: false, style };
         }
     }
 
@@ -109,15 +106,11 @@ impl Frame {
     fn split_wide(&mut self, i: usize) {
         let row_start = i - i % usize::from(self.width);
         if self.cells[i].wide {
-            self.cells[i + 1] = Cell {
-                style: self.cells[i + 1].style,
-                ..Cell::default()
-            };
+            self.cells[i + 1] =
+                Cell { style: self.cells[i + 1].style, ..Cell::default() };
         } else if self.cells[i].sym.is_empty() && i > row_start {
-            self.cells[i - 1] = Cell {
-                style: self.cells[i - 1].style,
-                ..Cell::default()
-            };
+            self.cells[i - 1] =
+                Cell { style: self.cells[i - 1].style, ..Cell::default() };
         }
     }
 
@@ -131,23 +124,18 @@ impl Frame {
         if let Some(i) = self.index(x, y) {
             self.split_wide(i);
             self.split_wide(i + 1);
-            self.cells[i] = Cell {
-                sym: printable(sym).into(),
-                wide: true,
-                style,
-            };
-            self.cells[i + 1] = Cell {
-                sym: CompactString::default(),
-                wide: false,
-                style,
-            };
+            self.cells[i] =
+                Cell { sym: printable(sym).into(), wide: true, style };
+            self.cells[i + 1] =
+                Cell { sym: CompactString::default(), wide: false, style };
         }
     }
 
     /// The text at (`x`, `y`), whether it's a wide character, and its style.
     /// Text is empty for the cell a wide character covers.
     pub fn content(&self, x: u16, y: u16) -> (&str, bool, Style) {
-        let cell = &self.cells[usize::from(y) * usize::from(self.width) + usize::from(x)];
+        let cell = &self.cells
+            [usize::from(y) * usize::from(self.width) + usize::from(x)];
         (&cell.sym, cell.wide, cell.style)
     }
 
@@ -191,7 +179,9 @@ impl Frame {
 fn advances_one(cell: &Cell) -> bool {
     let mut chars = cell.sym.chars();
     match (chars.next(), chars.next()) {
-        (Some(ch), None) => !cell.wide && ch < '\u{2600}' && ch.width() == Some(1),
+        (Some(ch), None) => {
+            !cell.wide && ch < '\u{2600}' && ch.width() == Some(1)
+        }
         _ => false,
     }
 }
@@ -224,11 +214,7 @@ pub fn fit_width(s: &str, max: usize) -> &str {
 /// a tab started with a literal `\t`.
 fn printable(sym: &str) -> &str {
     // Nor may a cell be empty: that marks the covered half of a wide one.
-    if sym.is_empty() || sym.chars().any(char::is_control) {
-        " "
-    } else {
-        sym
-    }
+    if sym.is_empty() || sym.chars().any(char::is_control) { " " } else { sym }
 }
 
 #[derive(Default)]
@@ -274,9 +260,12 @@ impl Renderer {
         let mut current: Option<Style> = None;
         for y in 0..frame.height {
             for x in 0..frame.width {
-                let i = usize::from(y) * usize::from(frame.width) + usize::from(x);
+                let i =
+                    usize::from(y) * usize::from(frame.width) + usize::from(x);
                 let cell = &frame.cells[i];
-                if cell.sym.is_empty() || prev.as_ref().is_some_and(|p| p.cells[i] == *cell) {
+                if cell.sym.is_empty()
+                    || prev.as_ref().is_some_and(|p| p.cells[i] == *cell)
+                {
                     continue;
                 }
                 if pos != Some((x, y)) {
@@ -307,7 +296,9 @@ impl Renderer {
 }
 
 fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
-    use style::{Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor};
+    use style::{
+        Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    };
     out.queue(SetAttribute(Attribute::Reset))?;
     out.queue(SetForegroundColor(color(s.fg)))?;
     out.queue(SetBackgroundColor(color(s.bg)))?;
@@ -411,7 +402,8 @@ mod tests {
 
         const W: u16 = 30;
         const H: u16 = 6;
-        const GLYPHS: [&str; 9] = ["a", "b", "─", "│", "字", "界", " ", "é", "\t"];
+        const GLYPHS: [&str; 9] =
+            ["a", "b", "─", "│", "字", "界", " ", "é", "\t"];
 
         let mut term = Term::new(
             Config::default(),
@@ -432,7 +424,8 @@ mod tests {
 
         // A base pattern that shifts sideways each frame, like the strip
         // scrolling, with random overwrites on top.
-        let base: Vec<&str> = (0..200).map(|_| GLYPHS[rand(GLYPHS.len())]).collect();
+        let base: Vec<&str> =
+            (0..200).map(|_| GLYPHS[rand(GLYPHS.len())]).collect();
         for step in 0..300 {
             let mut frame = Frame::new(W, H);
             let shift = (step * 3) % 100;
@@ -461,20 +454,25 @@ mod tests {
                 }
             }
 
-            let expected: Vec<String> = (frame.cells.iter()).map(|c| c.sym.to_string()).collect();
+            let expected: Vec<String> =
+                (frame.cells.iter()).map(|c| c.sym.to_string()).collect();
             let mut out = Vec::new();
             renderer.draw(&mut out, &[], frame, None).unwrap();
             parser.advance(&mut term, &out);
 
             for y in 0..H {
                 for x in 0..W {
-                    let cell = &term.grid()[Point::new(Line(i32::from(y)), Column(usize::from(x)))];
+                    let cell = &term.grid()[Point::new(
+                        Line(i32::from(y)),
+                        Column(usize::from(x)),
+                    )];
                     let got = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                         String::new()
                     } else {
                         cell.c.to_string()
                     };
-                    let want = &expected[usize::from(y) * usize::from(W) + usize::from(x)];
+                    let want = &expected
+                        [usize::from(y) * usize::from(W) + usize::from(x)];
                     assert_eq!(&got, want, "frame {step}, cell ({x}, {y})");
                 }
             }

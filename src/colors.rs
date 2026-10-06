@@ -59,7 +59,9 @@ impl Palette {
         Self {
             foreground: reported.foreground.unwrap_or([0xd8, 0xd8, 0xd8]),
             background: reported.background.unwrap_or([0x00, 0x00, 0x00]),
-            ansi: std::array::from_fn(|i| reported.ansi[i].unwrap_or(XTERM_ANSI[i])),
+            ansi: std::array::from_fn(|i| {
+                reported.ansi[i].unwrap_or(XTERM_ANSI[i])
+            }),
         }
     }
 

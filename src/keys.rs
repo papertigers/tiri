@@ -26,7 +26,8 @@ pub struct Key {
 
 impl Key {
     fn new(code: KeyCode, mods: KeyModifiers) -> Self {
-        let mut mods = mods & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let mut mods = mods
+            & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
         let code = match code {
             KeyCode::Char(c) => {
                 // A character says whether Shift was down by its case.
@@ -57,7 +58,10 @@ impl Key {
     /// Ctrl+[ as Tab, Enter and Escape, so those count as i, m and [.
     pub fn without_ctrl(self) -> Option<Key> {
         if self.mods.contains(KeyModifiers::CONTROL) {
-            return Some(Key::new(self.code, self.mods - KeyModifiers::CONTROL));
+            return Some(Key::new(
+                self.code,
+                self.mods - KeyModifiers::CONTROL,
+            ));
         }
         let c = match self.code {
             KeyCode::Tab => 'i',
@@ -65,9 +69,7 @@ impl Key {
             KeyCode::Esc => '[',
             _ => return None,
         };
-        self.mods
-            .is_empty()
-            .then(|| Key::new(KeyCode::Char(c), self.mods))
+        self.mods.is_empty().then(|| Key::new(KeyCode::Char(c), self.mods))
     }
 
     /// A single character typed with no modifiers but Shift, if that's
@@ -199,7 +201,11 @@ impl FromStr for Key {
                     let mut upper = c.to_uppercase();
                     match (upper.next(), upper.next()) {
                         (Some(upper), None) => upper,
-                        _ => return Err(format!("Shift+{c} isn't a single character")),
+                        _ => {
+                            return Err(format!(
+                                "Shift+{c} isn't a single character"
+                            ));
+                        }
                     }
                 } else {
                     c
@@ -230,7 +236,11 @@ impl FromStr for Key {
                     .filter(|n| (1..=12).contains(n))
                     .map(KeyCode::F);
                 match named.or(function) {
-                    Some(KeyCode::Tab) if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+                    Some(KeyCode::Tab)
+                        if mods.contains(KeyModifiers::SHIFT) =>
+                    {
+                        KeyCode::BackTab
+                    }
                     Some(code) => code,
                     None => return Err(format!("{key:?} isn't a key name")),
                 }
@@ -340,7 +350,8 @@ impl Table {
 
     /// The keys bound to `action`, in the order they were bound.
     pub fn keys_for(&self, action: Action) -> impl Iterator<Item = Key> + '_ {
-        (self.order.iter().copied()).filter(move |k| self.map.get(k) == Some(&action))
+        (self.order.iter().copied())
+            .filter(move |k| self.map.get(k) == Some(&action))
     }
 
     /// The first key bound to each of `actions`, written together: run
@@ -368,7 +379,8 @@ pub fn hint_keys(keys: &[Key]) -> String {
             first.short_mods() + &chars.into_iter().collect::<String>()
         }
         _ if shared_mods => {
-            let names: Vec<String> = keys.iter().map(|k| k.short_name()).collect();
+            let names: Vec<String> =
+                keys.iter().map(|k| k.short_name()).collect();
             first.short_mods() + &names.join("/")
         }
         _ => keys.iter().map(|k| k.short()).collect::<Vec<_>>().join("/"),

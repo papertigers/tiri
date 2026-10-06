@@ -91,9 +91,7 @@ impl Column {
 /// any leftover rows to the topmost panes.
 pub fn split_heights(total: i32, n: usize) -> Vec<i32> {
     let n = n.max(1) as i32;
-    (0..n)
-        .map(|i| total / n + i32::from(i < total % n))
-        .collect()
+    (0..n).map(|i| total / n + i32::from(i < total % n)).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +134,8 @@ impl Strip {
     /// The overview zoom that would fit this whole strip on screen.
     pub fn fit_zoom(&self) -> f64 {
         let total = f64::from(self.total_width());
-        (f64::from(self.view_width) / total.max(1.0)).clamp(OVERVIEW_MIN_ZOOM, OVERVIEW_MAX_ZOOM)
+        (f64::from(self.view_width) / total.max(1.0))
+            .clamp(OVERVIEW_MIN_ZOOM, OVERVIEW_MAX_ZOOM)
     }
 
     pub fn contains(&self, pane: PaneId) -> bool {
@@ -151,11 +150,7 @@ impl Strip {
     /// Adds a column taken from another strip to the right of the focused
     /// one, and focuses it.
     pub fn insert_column(&mut self, column: Column) {
-        let idx = if self.columns.is_empty() {
-            0
-        } else {
-            self.focus + 1
-        };
+        let idx = if self.columns.is_empty() { 0 } else { self.focus + 1 };
         self.columns.insert(idx, column);
         self.focus = idx;
         self.scroll_to_focus();
@@ -188,7 +183,8 @@ impl Strip {
         } else {
             WIDTH_PRESETS[column.preset]
         };
-        ((f64::from(self.view_width) * fraction).floor() as u16).max(MIN_COLUMN_WIDTH)
+        ((f64::from(self.view_width) * fraction).floor() as u16)
+            .max(MIN_COLUMN_WIDTH)
     }
 
     /// Left edge of column `idx` in strip coordinates.
@@ -245,7 +241,8 @@ impl Strip {
             self.focus = self.focus.saturating_sub(1);
         }
         // Don't leave empty space on the right where columns used to be.
-        let max_offset = (self.total_width() - i32::from(self.view_width)).max(0);
+        let max_offset =
+            (self.total_width() - i32::from(self.view_width)).max(0);
         self.target_offset = self.target_offset.min(max_offset);
         self.scroll_to_focus();
         column
@@ -303,7 +300,9 @@ impl Strip {
         }
         let neighbor = match side {
             Side::Left => self.focus.checked_sub(1),
-            Side::Right => Some(self.focus + 1).filter(|&i| i < self.columns.len()),
+            Side::Right => {
+                Some(self.focus + 1).filter(|&i| i < self.columns.len())
+            }
         };
         let Some(neighbor) = neighbor.filter(|&i| self.has_room(i)) else {
             return;
@@ -314,11 +313,8 @@ impl Strip {
         target.panes.push(pane);
         target.focus = target.panes.len() - 1;
         // Removing our column shifts the neighbor left if it was to the right.
-        let neighbor = if neighbor > self.focus {
-            neighbor - 1
-        } else {
-            neighbor
-        };
+        let neighbor =
+            if neighbor > self.focus { neighbor - 1 } else { neighbor };
         let current = self.focus;
         self.remove_column(current);
         self.focus = neighbor;
@@ -347,11 +343,7 @@ impl Strip {
     /// niri's `expel-window-from-column`: the focused pane leaves its column
     /// for a new column on the right, if it shares its column.
     pub fn expel_from_column(&mut self) {
-        if self
-            .columns
-            .get(self.focus)
-            .is_some_and(|c| c.panes.len() > 1)
-        {
+        if self.columns.get(self.focus).is_some_and(|c| c.panes.len() > 1) {
             self.expel(Side::Right);
         }
     }
@@ -458,11 +450,8 @@ impl Strip {
     pub fn toggle_fullscreen(&mut self) {
         if let Some(col) = self.columns.get_mut(self.focus) {
             let pane = col.focused();
-            col.fullscreen = if col.fullscreen == Some(pane) {
-                None
-            } else {
-                Some(pane)
-            };
+            col.fullscreen =
+                if col.fullscreen == Some(pane) { None } else { Some(pane) };
             self.scroll_to_focus();
         }
     }
@@ -530,36 +519,47 @@ pub struct StripView {
 impl StripView {
     /// A view already at its target, without animating there.
     pub fn settled(strip: &Strip, overview_zoom: Option<f64>) -> Self {
-        Self {
-            offset: strip.view_target(overview_zoom),
-        }
+        Self { offset: strip.view_target(overview_zoom) }
     }
 
-    pub fn is_animating(self, strip: &Strip, overview_zoom: Option<f64>) -> bool {
+    pub fn is_animating(
+        self,
+        strip: &Strip,
+        overview_zoom: Option<f64>,
+    ) -> bool {
         strip.view_target(overview_zoom) != self.offset
     }
 
     /// Advances the scroll animation. Returns true while still moving.
-    pub fn tick(&mut self, strip: &Strip, overview_zoom: Option<f64>, dt: Duration) -> bool {
+    pub fn tick(
+        &mut self,
+        strip: &Strip,
+        overview_zoom: Option<f64>,
+        dt: Duration,
+    ) -> bool {
         let offset = strip.view_target(overview_zoom);
         if (offset - self.offset).abs() < 0.5 {
             self.offset = offset;
             return false;
         }
-        self.offset += (offset - self.offset) * (1.0 - (-dt.as_secs_f64() / SCROLL_TAU).exp());
+        self.offset += (offset - self.offset)
+            * (1.0 - (-dt.as_secs_f64() / SCROLL_TAU).exp());
         true
     }
 
     /// Column `idx`'s left edge and width on screen, at this view's scroll
     /// position and `zoom`.
-    pub fn column_span(self, strip: &Strip, idx: usize, zoom: f64) -> (i32, i32) {
-        let to_screen = |x: i32| ((f64::from(x) - self.offset) * zoom).round() as i32;
+    pub fn column_span(
+        self,
+        strip: &Strip,
+        idx: usize,
+        zoom: f64,
+    ) -> (i32, i32) {
+        let to_screen =
+            |x: i32| ((f64::from(x) - self.offset) * zoom).round() as i32;
         let x = strip.column_x(idx);
         let left = to_screen(x);
-        (
-            left,
-            to_screen(x + i32::from(strip.column_width(idx))) - left,
-        )
+        (left, to_screen(x + i32::from(strip.column_width(idx))) - left)
     }
 }
 
@@ -622,7 +622,8 @@ mod tests {
         let mut strip = strip_with(3, 100);
         strip.focus_first();
         strip.insert(PaneId(9));
-        let order: Vec<_> = strip.columns().iter().map(|c| c.focused().0).collect();
+        let order: Vec<_> =
+            strip.columns().iter().map(|c| c.focused().0).collect();
         assert_eq!(order, [0, 9, 1, 2]);
         assert_eq!(strip.focused(), Some(PaneId(9)));
     }
@@ -736,7 +737,10 @@ mod tests {
         let mut strip = strip_with(3, 100);
         strip.consume_or_expel_left();
         assert_eq!(layout(&strip), [vec![0], vec![1, 2]]);
-        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(2))));
+        assert_eq!(
+            (strip.focus_index(), strip.focused()),
+            (1, Some(PaneId(2)))
+        );
 
         strip.focus_first();
         strip.consume_or_expel_right();
@@ -753,7 +757,10 @@ mod tests {
         // Pane 1 is focused and shares its column, so it's expelled.
         strip.consume_or_expel_left();
         assert_eq!(layout(&strip), [vec![1], vec![0]]);
-        assert_eq!((strip.focus_index(), strip.focused()), (0, Some(PaneId(1))));
+        assert_eq!(
+            (strip.focus_index(), strip.focused()),
+            (0, Some(PaneId(1)))
+        );
 
         strip.consume_or_expel_right();
         assert_eq!(layout(&strip), [vec![0, 1]]);
@@ -796,7 +803,10 @@ mod tests {
         strip.focus_up();
         strip.expel_from_column();
         assert_eq!(layout(&strip), [vec![1], vec![0]]);
-        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(0))));
+        assert_eq!(
+            (strip.focus_index(), strip.focused()),
+            (1, Some(PaneId(0)))
+        );
     }
 
     #[test]
@@ -891,7 +901,10 @@ mod tests {
         let mut strip = strip_with(3, 100);
         strip.consume_or_expel_left(); // [0] [1 2]
         assert!(strip.focus_pane(PaneId(1)));
-        assert_eq!((strip.focus_index(), strip.focused()), (1, Some(PaneId(1))));
+        assert_eq!(
+            (strip.focus_index(), strip.focused()),
+            (1, Some(PaneId(1)))
+        );
         assert!(strip.focus_pane(PaneId(0)));
         assert_eq!(strip.focus_index(), 0);
         assert!(!strip.focus_pane(PaneId(9)));

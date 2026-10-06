@@ -15,7 +15,10 @@ use anyhow::{Context, Result, bail};
 pub fn default_path() -> PathBuf {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(runtime) => PathBuf::from(runtime).join("tiri"),
-        None => PathBuf::from(format!("/tmp/tiri-{}", rustix::process::getuid().as_raw())),
+        None => PathBuf::from(format!(
+            "/tmp/tiri-{}",
+            rustix::process::getuid().as_raw()
+        )),
     };
     dir.join("default")
 }
@@ -38,7 +41,8 @@ pub fn prepare_dir(socket: &Path, private: bool) -> Result<()> {
     if !private {
         return Ok(());
     }
-    let meta = fs::metadata(dir).with_context(|| format!("couldn't inspect {}", dir.display()))?;
+    let meta = fs::metadata(dir)
+        .with_context(|| format!("couldn't inspect {}", dir.display()))?;
     if meta.uid() != rustix::process::getuid().as_raw() {
         bail!("{} belongs to another user", dir.display());
     }

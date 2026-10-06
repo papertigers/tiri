@@ -24,7 +24,8 @@ pub(super) struct PaneBox {
 
 impl PaneBox {
     pub(super) fn contains(&self, x: i32, y: i32) -> bool {
-        (self.x..self.x + self.w).contains(&x) && (self.y..self.y + self.h).contains(&y)
+        (self.x..self.x + self.w).contains(&x)
+            && (self.y..self.y + self.h).contains(&y)
     }
 }
 
@@ -82,7 +83,12 @@ impl App {
     }
 
     /// Where column `idx` of workspace `ws` is drawn: x, y, width, height.
-    fn column_box(&self, client: &Client, ws: usize, idx: usize) -> (i32, i32, i32, i32) {
+    fn column_box(
+        &self,
+        client: &Client,
+        ws: usize,
+        idx: usize,
+    ) -> (i32, i32, i32, i32) {
         let (x, w) = self.workspaces.column_span(client.id, ws, idx);
         (x, self.row_top(client, ws), w, self.row_height(client))
     }
@@ -99,18 +105,15 @@ impl App {
 
     /// Where each pane in column `idx` of workspace `ws` is drawn, top to
     /// bottom: the column's box split among its panes.
-    fn pane_boxes(&self, client: &Client, ws: usize, idx: usize) -> Vec<PaneBox> {
+    fn pane_boxes(
+        &self,
+        client: &Client,
+        ws: usize,
+        idx: usize,
+    ) -> Vec<PaneBox> {
         let (x, mut y, w, h) = self.column_box(client, ws, idx);
         let column = &self.workspaces.list()[ws].strip().columns()[idx];
-        let pane_box = |id, y, h| PaneBox {
-            id,
-            ws,
-            column: idx,
-            x,
-            y,
-            w,
-            h,
-        };
+        let pane_box = |id, y, h| PaneBox { id, ws, column: idx, x, y, w, h };
         // A fullscreen pane has its column to itself; the rest are hidden.
         if let Some(id) = column.fullscreen() {
             return vec![pane_box(id, y, h)];

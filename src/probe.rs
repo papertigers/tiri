@@ -105,16 +105,16 @@ pub fn parse(answers: &[u8]) -> TerminalInfo {
     // Size reports: CSI 6 ; height ; width t for a cell, CSI 4 ; … t for
     // the text area.
     for report in text.split("\x1b[").skip(1) {
-        let Some(end) = report.find(|c: char| !(c.is_ascii_digit() || c == ';')) else {
+        let Some(end) =
+            report.find(|c: char| !(c.is_ascii_digit() || c == ';'))
+        else {
             continue;
         };
         if !report[end..].starts_with('t') {
             continue;
         }
-        let numbers: Vec<u16> = report[..end]
-            .split(';')
-            .filter_map(|n| n.parse().ok())
-            .collect();
+        let numbers: Vec<u16> =
+            report[..end].split(';').filter_map(|n| n.parse().ok()).collect();
         match numbers.as_slice() {
             [6, h, w] if *h > 0 && *w > 0 => info.cell_pixels = Some((*w, *h)),
             [4, h, w] if *h > 0 && *w > 0 => info.area_pixels = Some((*w, *h)),

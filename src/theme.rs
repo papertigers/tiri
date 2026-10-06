@@ -27,7 +27,8 @@ pub struct Theme {
 
 impl Theme {
     /// The themes built in, by name.
-    pub const ALL: [(&str, Theme); 2] = [("default", DEFAULT), ("oxide", OXIDE)];
+    pub const ALL: [(&str, Theme); 2] =
+        [("default", DEFAULT), ("oxide", OXIDE)];
 
     pub fn named(name: &str) -> Option<Theme> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
