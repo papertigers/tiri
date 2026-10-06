@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  illumos:
+    name: Test (illumos, OmniOS r151058)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/omnios-vm@v1
+        with:
+          # Comes with build-essential, for the linker and C compiler.
+          release: r151058-build
+          envs: CARGO_TERM_COLOR
+          copyback: false
+          # Keeps the VM with Rust installed, so later runs skip installing it.
+          cache-after-prepare: true
+          prepare: |
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          run: |
+            . "$HOME/.cargo/env"
+            cargo test
