@@ -392,7 +392,11 @@ impl TerminalGuard {
         let mut out = io::stdout();
         out.execute(terminal::EnterAlternateScreen)?;
         out.execute(event::EnableBracketedPaste)?;
-        out.execute(event::EnableMouseCapture)?;
+        // Clicks, and movement while a button is held, in SGR's encoding.
+        // Every movement (1003) is the server's to turn on, while a
+        // program wants it: it costs bytes on each move.
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+        out.flush()?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // So the message lands on a usable screen. Not once the guard

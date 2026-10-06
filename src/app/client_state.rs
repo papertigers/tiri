@@ -64,6 +64,9 @@ pub struct Client {
     pub(super) notice: Option<Notice>,
     /// A paste partway through arriving.
     pub(super) paste: Option<Paste>,
+    /// Whether its terminal reports every mouse movement (mode 1003), not
+    /// only those with a button held.
+    pub(super) all_motion: bool,
 }
 
 /// Where a paste is going, while it arrives in parts.

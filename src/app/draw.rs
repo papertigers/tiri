@@ -21,6 +21,7 @@ impl App {
     /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
         client.follow_selection(&self.panes);
+        self.report_motion_if_wanted(client);
         if (client.notice.as_ref())
             .is_some_and(|notice| notice.until <= Instant::now())
         {
@@ -189,6 +190,22 @@ impl App {
 
         self.draw_status(client, &mut frame);
         (frame, cursor)
+    }
+
+    /// Has `client`'s terminal report every mouse movement only while the
+    /// focused pane's program asks for it, since that's the only place
+    /// they go. Otherwise each move would cross the network for nothing.
+    fn report_motion_if_wanted(&self, client: &mut Client) {
+        let wanted = !self.workspaces.in_overview(client.id)
+            && (self.workspaces.focused(client.id))
+                .and_then(|id| self.panes.get(&id))
+                .is_some_and(|pane| pane.mouse_modes().motion);
+        if wanted != client.all_motion {
+            client.all_motion = wanted;
+            let mode: &[u8] =
+                if wanted { b"\x1b[?1003h" } else { b"\x1b[?1003l" };
+            client.escapes.extend_from_slice(mode);
+        }
     }
 
     /// Whether `ws` is the empty workspace that's always kept at the bottom.

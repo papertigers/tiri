@@ -156,6 +156,7 @@ impl App {
             kitty_overview,
             thumbnails: HashMap::new(),
             escapes: Vec::new(),
+            all_motion: false,
             renderer: Renderer::default(),
             scrollback: HashMap::new(),
             selection: None,
