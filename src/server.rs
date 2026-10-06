@@ -32,10 +32,6 @@ const SIGCHLD_KEY: usize = usize::MAX - 2;
 const CONNECTION_KEY_BASE: usize = 1 << 32;
 
 const FRAME: Duration = Duration::from_millis(16);
-/// A client with more than this waiting to be sent gets no new frames until
-/// it catches up. Its next frame is then diffed against the last one it was
-/// sent, so it skips the states in between but never sees a broken screen.
-const BACKLOG_LIMIT: usize = 1 << 20;
 /// The most read from one connection per wakeup, so a client flooding the
 /// socket can't keep the server from everything else.
 const READ_BUDGET: usize = 256 * 1024;
@@ -152,10 +148,20 @@ impl Connection {
         self.dead = true;
     }
 
-    /// Whether to wait on this client's deadlines. One that's closing or
-    /// behind won't be drawn for, so they'd only wake the server for nothing.
+    /// Whether this client is ready for a frame: not closing, and with
+    /// everything sent to it so far taken by its socket.
+    ///
+    /// A client that's behind gets no new frames until it catches up. Its
+    /// next frame is then diffed against the last one it was sent, so it
+    /// skips the states in between but never sees a broken screen. Over a
+    /// slow link, an animation's frames would otherwise queue up faster than
+    /// they can be sent, and anything typed meanwhile would wait its turn
+    /// behind all of them.
+    ///
+    /// Nor is it worth waiting on its deadlines: they'd only wake the
+    /// server for nothing.
     fn wants_frames(&self) -> bool {
-        !self.closing && self.outgoing.len() <= BACKLOG_LIMIT
+        !self.closing && self.outgoing.is_empty()
     }
 
     fn finished(&self) -> bool {
