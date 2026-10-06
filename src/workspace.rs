@@ -206,6 +206,11 @@ impl Workspaces {
         &mut self.list[active].strip
     }
 
+    /// Workspace `ws`'s strip, for resizing in it with the mouse.
+    pub fn strip_mut(&mut self, ws: usize) -> &mut Strip {
+        &mut self.list[ws].strip
+    }
+
     pub fn focused(&self, client: ClientId) -> Option<PaneId> {
         self.active(client).focused()
     }

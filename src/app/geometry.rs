@@ -22,6 +22,17 @@ pub(super) struct PaneBox {
     pub(super) h: i32,
 }
 
+/// A line between boxes that can be dragged to resize them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seam {
+    /// The right edge of column `column` of workspace `ws`: dragging it
+    /// sizes that column.
+    Column { ws: usize, column: usize },
+    /// The line between pane `row` of a column and the pane below it:
+    /// dragging it sizes pane `row`.
+    Pane { ws: usize, column: usize, row: usize },
+}
+
 impl PaneBox {
     pub(super) fn contains(&self, x: i32, y: i32) -> bool {
         (self.x..self.x + self.w).contains(&x)
@@ -49,6 +60,65 @@ impl App {
                 (bottom - top) as u16,
             )
         })
+    }
+
+    /// The seam at (`x`, `y`) on `client`'s screen, if there is one: the
+    /// borders on either side of where two columns, or two stacked panes,
+    /// meet. None in the overview, which shrinks everything too much to drag.
+    pub(super) fn seam_at(
+        &self,
+        client: &Client,
+        x: i32,
+        y: i32,
+    ) -> Option<Seam> {
+        if self.workspaces.in_overview(client.id) {
+            return None;
+        }
+        for ws in self.visible_workspaces(client) {
+            let strip = self.workspaces.list()[ws].strip();
+            for column in self.visible_columns(client, ws) {
+                let (cx, cy, cw, ch) = self.column_box(client, ws, column);
+                if !(cy..cy + ch).contains(&y) {
+                    continue;
+                }
+                if x == cx + cw - 1 {
+                    return Some(Seam::Column { ws, column });
+                }
+                if x == cx && column > 0 {
+                    return Some(Seam::Column { ws, column: column - 1 });
+                }
+                let col = &strip.columns()[column];
+                if !(cx..cx + cw).contains(&x) || col.fullscreen().is_some() {
+                    continue;
+                }
+                let boxes = self.pane_boxes(client, ws, column);
+                for (row, pair) in boxes.windows(2).enumerate() {
+                    let (above, below) = (pair[0], pair[1]);
+                    if y == above.y + above.h - 1 || y == below.y {
+                        return Some(Seam::Pane { ws, column, row });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn seam_anchor(
+        &self,
+        client: &Client,
+        seam: Seam,
+    ) -> Option<i32> {
+        match seam {
+            Seam::Column { ws, column } => {
+                Some(self.column_box(client, ws, column).0)
+            }
+            Seam::Pane { ws, column, row } => {
+                let col = &self.workspaces.list()[ws].strip().columns()[column];
+                let pane = *col.panes().get(row)?;
+                let boxes = self.pane_boxes(client, ws, column);
+                boxes.iter().find(|b| b.id == pane).map(|b| b.y)
+            }
+        }
     }
 
     /// The height of a workspace row on `client`'s screen: its whole pane
@@ -83,7 +153,7 @@ impl App {
     }
 
     /// Where column `idx` of workspace `ws` is drawn: x, y, width, height.
-    fn column_box(
+    pub(super) fn column_box(
         &self,
         client: &Client,
         ws: usize,
@@ -94,7 +164,11 @@ impl App {
     }
 
     /// The columns of workspace `ws` at least partly on `client`'s screen.
-    fn visible_columns(&self, client: &Client, ws: usize) -> Vec<usize> {
+    pub(super) fn visible_columns(
+        &self,
+        client: &Client,
+        ws: usize,
+    ) -> Vec<usize> {
         (0..self.workspaces.list()[ws].strip().columns().len())
             .filter(|&idx| {
                 let (x, _, w, _) = self.column_box(client, ws, idx);
@@ -105,7 +179,7 @@ impl App {
 
     /// Where each pane in column `idx` of workspace `ws` is drawn, top to
     /// bottom: the column's box split among its panes.
-    fn pane_boxes(
+    pub(super) fn pane_boxes(
         &self,
         client: &Client,
         ws: usize,

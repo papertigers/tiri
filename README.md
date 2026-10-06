@@ -106,6 +106,8 @@ There are three sets of keys:
 - **Drag** to select text, **double-click** for a word, **triple-click**
   for a line. The selection is copied to your terminal's clipboard.
 - **Click** a workspace or a column marker in the status bar to go there.
+- **Drag a border** to resize: where two columns meet sizes the column
+  on the left, and where two stacked panes meet sizes the pane above.
 
 There's no keyboard copy mode yet: scrolling back and selecting need the
 mouse.

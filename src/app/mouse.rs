@@ -15,6 +15,7 @@ use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
 
 use super::client_state::{Click, Drag};
+use super::geometry::Seam;
 use super::screen::content_top;
 use super::status::StatusTarget;
 use super::{App, Client};
@@ -221,6 +222,12 @@ impl App {
     ) {
         client.selection = None;
         client.drag = Drag::Ignored;
+        if let Some(seam) = self.seam_at(client, x, y)
+            && let Some(anchor) = self.seam_anchor(client, seam)
+        {
+            client.drag = Drag::Resizing { seam, anchor };
+            return;
+        }
         let overview = self.workspaces.in_overview(client.id);
         match self.hit(client, x, y) {
             Hit::Status(StatusTarget::Workspace(ws)) => {
@@ -337,6 +344,21 @@ impl App {
                     selection.head = point;
                 }
             }
+            Drag::Resizing { seam, anchor } => {
+                let (Seam::Column { ws, .. } | Seam::Pane { ws, .. }) = seam;
+                let strip = self.workspaces.strip_mut(ws);
+                // The mouse is on the box's border: the box ends there.
+                let size_to = |at: i32| at - anchor + 1;
+                match seam {
+                    Seam::Column { column, .. } => {
+                        strip.resize_column(column, size_to(x));
+                    }
+                    Seam::Pane { column, row, .. } => {
+                        strip.resize_pane(column, row, size_to(y));
+                    }
+                }
+                self.resize_panes();
+            }
             Drag::None | Drag::Ignored => {}
         }
     }
@@ -377,6 +399,15 @@ impl App {
                         client.copy(&text);
                     }
                 }
+            }
+            // The view held still while the edge moved; now it can scroll
+            // to keep the focused column in sight.
+            Drag::Resizing {
+                seam: Seam::Column { ws, .. } | Seam::Pane { ws, .. },
+                ..
+            } => {
+                self.workspaces.strip_mut(ws).show_focus();
+                self.resize_panes();
             }
             Drag::None | Drag::Ignored => {}
         }

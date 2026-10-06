@@ -357,6 +357,56 @@ impl Strip {
         self.columns[self.focus].heights.insert(pane, next);
     }
 
+    /// Makes column `idx` `cells` wide, as dragging its right edge does.
+    /// The view doesn't scroll to follow, so the edge stays under the
+    /// mouse; [`Self::show_focus`] catches up once the drag ends.
+    pub fn resize_column(&mut self, idx: usize, cells: i32) {
+        let view = i32::from(self.view_width).max(1);
+        let cells = cells.clamp(i32::from(MIN_COLUMN_WIDTH).min(view), view);
+        if let Some(col) = self.columns.get_mut(idx) {
+            col.width =
+                PresetSize::Proportion(f64::from(cells) / f64::from(view));
+            col.unmaximized = None;
+        }
+    }
+
+    /// Makes pane `row` of column `idx` `rows` tall, as dragging the line
+    /// below it does. The panes above keep the heights they have, so the
+    /// line stays under the mouse, and the pane just below gives or takes
+    /// the difference.
+    pub fn resize_pane(&mut self, idx: usize, row: usize, rows: i32) {
+        let view = i32::from(self.view_height).max(1);
+        let Some(col) = self.columns.get(idx) else {
+            return;
+        };
+        if row + 1 >= col.panes.len() {
+            return;
+        }
+        let now = self.pane_heights(idx, view);
+        // What's left once the panes above have theirs and those below
+        // their minimum: any more, and squeezing to fit would move the
+        // panes above.
+        let above: i32 = now[..row].iter().sum();
+        let below = i32::try_from(col.panes.len() - row - 1).unwrap_or(0);
+        let most = view - above - below * MIN_PANE_HEIGHT;
+        let rows = rows.clamp(MIN_PANE_HEIGHT, most.max(MIN_PANE_HEIGHT));
+        let share = |rows: i32| {
+            PresetSize::Proportion(f64::from(rows) / f64::from(view))
+        };
+        let col = &mut self.columns[idx];
+        for (pane, &height) in col.panes[..row].iter().zip(&now) {
+            col.heights.entry(*pane).or_insert(share(height));
+        }
+        col.heights.insert(col.panes[row], share(rows));
+        let below = col.panes[row + 1];
+        col.heights.remove(&below);
+    }
+
+    /// Scrolls to bring the focused column into view, as after a resize.
+    pub fn show_focus(&mut self) {
+        self.scroll_to_focus();
+    }
+
     /// niri's `reset-window-height`: the focused pane goes back to sharing
     /// its column's height equally.
     pub fn reset_pane_height(&mut self) {
@@ -1204,6 +1254,43 @@ mod tests {
         alone.set_view_height(30);
         alone.switch_preset_height();
         assert_eq!(alone.pane_heights(0, 30), [30]);
+    }
+
+    #[test]
+    fn dragging_an_edge_sets_the_width_exactly() {
+        let mut strip = strip_with(2, 120);
+        strip.resize_column(0, 80);
+        assert_eq!(strip.column_width(0), 80);
+        // Not past the minimum or the view.
+        strip.resize_column(0, 2);
+        assert_eq!(strip.column_width(0), MIN_COLUMN_WIDTH);
+        strip.resize_column(0, 500);
+        assert_eq!(strip.column_width(0), 120);
+        // The view stays put while dragging, and catches up after.
+        let offset = strip.target_offset;
+        strip.resize_column(1, 100);
+        assert_eq!(strip.target_offset, offset);
+        strip.show_focus();
+        assert_eq!(strip.target_offset, 120 + 100 - 120);
+    }
+
+    #[test]
+    fn dragging_between_stacked_panes_keeps_those_above_still() {
+        let mut strip = strip_with(3, 100);
+        strip.set_view_height(30);
+        strip.consume_or_expel_left();
+        strip.focus_left();
+        strip.consume_or_expel_right(); // one column of all three
+        assert_eq!(strip.columns().len(), 1);
+        assert_eq!(strip.columns()[0].panes().len(), 3);
+        assert_eq!(strip.pane_heights(0, 30), [10, 10, 10]);
+        // The line under pane 1, dragged down to make it 14 tall: pane 0
+        // keeps its 10, so the line is where the mouse is.
+        strip.resize_pane(0, 1, 14);
+        assert_eq!(strip.pane_heights(0, 30), [10, 14, 6]);
+        // Not so far that the pane below gets too short.
+        strip.resize_pane(0, 1, 30);
+        assert_eq!(strip.pane_heights(0, 30), [10, 15, MIN_PANE_HEIGHT]);
     }
 
     #[test]

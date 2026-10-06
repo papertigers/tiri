@@ -20,6 +20,7 @@ use crate::thumbnail;
 use crate::workspace::ClientId;
 
 use super::STATUS_HEIGHT;
+use super::geometry::Seam;
 use super::thumbnails::Thumbnail;
 
 /// One attached terminal: its size, its prefix-key and overview settings,
@@ -113,6 +114,9 @@ pub(super) enum Drag {
     /// Selecting text in this pane; `snapped` if a double or triple click
     /// picked a word or line, which copies even a single character.
     Selecting { pane: PaneId, snapped: bool },
+    /// Dragging `seam` to resize, measuring from `anchor`: the x of its
+    /// column's left edge, or the y of the top of the pane above it.
+    Resizing { seam: Seam, anchor: i32 },
 }
 
 impl Client {
