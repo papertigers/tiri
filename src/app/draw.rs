@@ -35,17 +35,27 @@ impl App {
             (client.transition.as_ref()).map_or(1.0, Transition::image_opacity);
         if thumbnails {
             let now = Instant::now();
-            for b in &visible {
-                let size = Client::thumbnail_size(b.w, b.h);
-                client.refresh_thumbnail(&self.panes, b.id, size, opacity, now);
-            }
+            let uploads = (visible.iter())
+                .filter_map(|b| {
+                    let size = Client::thumbnail_size(b.w, b.h);
+                    client.refresh_thumbnail(
+                        &self.panes,
+                        b.id,
+                        size,
+                        opacity,
+                        now,
+                    )
+                })
+                .collect();
             // Panes scrolled out of view would otherwise keep asking for
             // redraws they never get.
             client.retain_thumbnails(|id| visible.iter().any(|b| b.id == *id));
+            client.upload(uploads);
         } else if client.transition.is_some() {
             // The overview fading out: its thumbnails fade with it.
             client.retain_thumbnails(|id| self.panes.contains_key(id));
-            client.fade_thumbnails(opacity);
+            let uploads = client.fade_thumbnails(opacity);
+            client.upload(uploads);
         } else {
             client.park_thumbnails(&self.panes);
         }
