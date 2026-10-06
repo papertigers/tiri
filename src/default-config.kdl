@@ -65,7 +65,12 @@ layout {
 // quotes: "[" or "Alt+,".
 //
 // Your config's bindings add to these: a key you bind replaces the one
-// here, and `key { unbind; }` removes it. Every action:
+// here, and `key { unbind; }` removes it. A key can run several actions,
+// one after another, as in two shells stacked in one column:
+//
+//   Alt+t { new-column; new-column; consume-or-expel-pane-left; }
+//
+// Every action:
 //
 //   new-column                       a new column with a shell, right of this one
 //   focus-column-left/right          focus-column-first/last

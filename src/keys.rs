@@ -329,31 +329,32 @@ pub struct Bindings {
 /// Keys and their actions, in the order they were bound.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
-    map: HashMap<Key, Action>,
+    /// Each key's actions, run in order; never empty.
+    map: HashMap<Key, Vec<Action>>,
     order: Vec<Key>,
 }
 
 impl Table {
-    pub fn get(&self, key: Key) -> Option<Action> {
-        self.map.get(&key).copied()
+    /// The actions bound to `key`, to run in order.
+    pub fn get(&self, key: Key) -> Option<&[Action]> {
+        self.map.get(&key).map(Vec::as_slice)
     }
 
-    /// Binds `key`, or with None unbinds it.
-    pub fn set(&mut self, key: Key, action: Option<Action>) {
-        if let Some(action) = action {
-            if self.map.insert(key, action).is_none() {
-                self.order.push(key);
-            }
-        } else {
+    /// Binds `key` to `actions`, or with none unbinds it.
+    pub fn set(&mut self, key: Key, actions: Vec<Action>) {
+        if actions.is_empty() {
             self.map.remove(&key);
             self.order.retain(|k| *k != key);
+        } else if self.map.insert(key, actions).is_none() {
+            self.order.push(key);
         }
     }
 
-    /// The keys bound to `action`, in the order they were bound.
+    /// The keys bound to `action` alone, in the order they were bound. A
+    /// key that does more besides isn't one to advertise for it.
     pub fn keys_for(&self, action: Action) -> impl Iterator<Item = Key> + '_ {
         (self.order.iter().copied())
-            .filter(move |k| self.map.get(k) == Some(&action))
+            .filter(move |k| self.get(*k) == Some(&[action][..]))
     }
 
     /// The first key bound to each of `actions`, written together: run
@@ -524,16 +525,19 @@ mod tests {
     #[test]
     fn tables_keep_binding_order_and_unbind() {
         let mut table = Table::default();
-        table.set(key("n"), Some(Action::NewColumn));
-        table.set(key("Enter"), Some(Action::NewColumn));
-        table.set(key("x"), Some(Action::ClosePane));
+        table.set(key("n"), vec![Action::NewColumn]);
+        table.set(key("Enter"), vec![Action::NewColumn]);
+        table.set(key("x"), vec![Action::ClosePane]);
         assert_eq!(
             table.keys_for(Action::NewColumn).collect::<Vec<_>>(),
             [key("n"), key("Enter")]
         );
-        table.set(key("n"), None);
+        table.set(key("n"), Vec::new());
         assert_eq!(table.get(key("n")), None);
         assert_eq!(table.hint_keys(&[Action::NewColumn]).as_deref(), Some("⏎"));
+        assert_eq!(table.hint_keys(&[Action::Detach]), None);
+        // A key that does more than detach isn't advertised for it.
+        table.set(key("d"), vec![Action::Detach, Action::KillServer]);
         assert_eq!(table.hint_keys(&[Action::Detach]), None);
     }
 }

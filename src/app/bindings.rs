@@ -26,15 +26,16 @@ impl App {
 
         let after_prefix = std::mem::take(&mut client.prefix_pending);
         let overview = self.workspaces.in_overview(client.id);
-        let action = match (after_prefix, is_prefix) {
+        let actions = match (after_prefix, is_prefix) {
             // Prefix twice types it, like any key not bound; see below.
             (true, true) => None,
             // Holding Ctrl through, as in C-a C-n, works too.
             (true, false) => {
-                let action = (bindings.prefix_binds.get(key))
+                let actions = (bindings.prefix_binds.get(key))
                     .or_else(|| bindings.prefix_binds.get(key.without_ctrl()?));
-                return action
-                    .map_or(Ok(()), |action| self.run(client, action));
+                let actions =
+                    actions.map(<[Action]>::to_vec).unwrap_or_default();
+                return self.run_all(client, &actions);
             }
             (false, true) => {
                 client.prefix_pending = true;
@@ -44,8 +45,9 @@ impl App {
                 .or_else(|| bindings.binds.get(key)),
             (false, false) => bindings.binds.get(key),
         };
-        if let Some(action) = action {
-            return self.run(client, action);
+        if let Some(actions) = actions {
+            let actions = actions.to_vec();
+            return self.run_all(client, &actions);
         }
         if overview {
             // The overview takes the keyboard; nothing reaches the panes.
@@ -61,6 +63,16 @@ impl App {
             pane.write(&bytes);
         }
         Ok(())
+    }
+
+    /// Runs a binding's actions in order, each seeing what the one before
+    /// did. A failure stops the rest.
+    fn run_all(
+        &mut self,
+        client: &mut Client,
+        actions: &[Action],
+    ) -> Result<()> {
+        actions.iter().try_for_each(|&action| self.run(client, action))
     }
 
     fn run(&mut self, client: &mut Client, action: Action) -> Result<()> {

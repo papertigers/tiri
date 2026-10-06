@@ -366,13 +366,14 @@ struct RawBinds {
     binds: Vec<RawBind>,
 }
 
-/// One binding: a key, and its action, or None for `unbind`.
+/// One binding: a key, and the actions it runs in order, or none for
+/// `unbind`.
 #[derive(Debug)]
 struct RawBind {
     key: Key,
     /// Where the key is written.
     at: Span,
-    action: Option<Action>,
+    actions: Vec<Action>,
 }
 
 impl knus::Decode<Span> for RawBind {
@@ -385,15 +386,24 @@ impl knus::Decode<Span> for RawBind {
             .node_name
             .parse::<Key>()
             .map_err(|e| DecodeError::unexpected(&node.node_name, "key", e))?;
-        only_a_name(node, ctx, "a binding is a key and, in braces, its action");
+        only_a_name(
+            node,
+            ctx,
+            "a binding is a key and, in braces, its actions",
+        );
         let children = node.children.as_ref().map_or(&[][..], |c| &c[..]);
-        let [child] = children else {
+        if children.is_empty() {
             return Err(DecodeError::missing(
                 node,
-                "a binding needs one action, as in `h { focus-column-left; }`",
+                "a binding needs an action, as in `h { focus-column-left; }`",
             ));
-        };
-        if &**child.node_name == "unbind" {
+        }
+        let mut actions = Vec::new();
+        for child in children {
+            if &**child.node_name != "unbind" {
+                actions.push(Action::decode_node(child, ctx)?);
+                continue;
+            }
             only_a_name(child, ctx, "unbind takes nothing");
             if let Some(children) = &child.children {
                 ctx.emit_error(DecodeError::unexpected(
@@ -402,10 +412,15 @@ impl knus::Decode<Span> for RawBind {
                     "unbind takes nothing",
                 ));
             }
-            return Ok(RawBind { key, at, action: None });
+            if children.len() > 1 {
+                ctx.emit_error(DecodeError::unexpected(
+                    &child.node_name,
+                    "unbind",
+                    "unbind goes on its own, without actions",
+                ));
+            }
         }
-        let action = Action::decode_node(child, ctx)?;
-        Ok(RawBind { key, at, action: Some(action) })
+        Ok(RawBind { key, at, actions })
     }
 }
 
@@ -450,7 +465,7 @@ impl RawBinds {
                     format!("{section} has {} more than once", bind.key),
                 ));
             }
-            if bind.key == prefix && bind.action.is_some() {
+            if bind.key == prefix && !bind.actions.is_empty() {
                 return Err(Problem::at(
                     bind.at,
                     "the prefix key",
@@ -459,9 +474,9 @@ impl RawBinds {
                     ),
                 ));
             }
-            table.set(bind.key, bind.action);
+            table.set(bind.key, bind.actions);
         }
-        table.set(prefix, None);
+        table.set(prefix, Vec::new());
         Ok(())
     }
 }
@@ -749,20 +764,23 @@ mod tests {
         assert_eq!(b.prefix, key("Ctrl+a"));
         assert_eq!(
             b.prefix_binds.get(key("Shift+h")),
-            Some(Action::MoveColumnLeft)
+            Some(&[Action::MoveColumnLeft][..])
         );
-        assert_eq!(b.prefix_binds.get(key("$")), Some(Action::FocusColumnLast));
+        assert_eq!(
+            b.prefix_binds.get(key("$")),
+            Some(&[Action::FocusColumnLast][..])
+        );
         assert_eq!(
             b.binds.get(key("Alt+{")),
-            Some(Action::ConsumeOrExpelPaneLeft)
+            Some(&[Action::ConsumeOrExpelPaneLeft][..])
         );
         assert_eq!(
             b.binds.get(key("Alt+Shift+u")),
-            Some(Action::MoveColumnToWorkspaceDown)
+            Some(&[Action::MoveColumnToWorkspaceDown][..])
         );
         assert_eq!(
             b.overview_binds.get(key("Escape")),
-            Some(Action::CloseOverview)
+            Some(&[Action::CloseOverview][..])
         );
         assert_eq!(b.binds.get(key("Alt+n")), None);
     }
@@ -783,13 +801,22 @@ mod tests {
         .unwrap()
         .bindings;
         assert_eq!(b.prefix, key("Ctrl+b"));
-        assert_eq!(b.prefix_binds.get(key("v")), Some(Action::NewColumn));
+        assert_eq!(
+            b.prefix_binds.get(key("v")),
+            Some(&[Action::NewColumn][..])
+        );
         assert_eq!(b.prefix_binds.get(key("n")), None);
-        assert_eq!(b.prefix_binds.get(key("x")), Some(Action::Detach));
+        assert_eq!(b.prefix_binds.get(key("x")), Some(&[Action::Detach][..]));
         // Untouched ones stay.
-        assert_eq!(b.prefix_binds.get(key("h")), Some(Action::FocusColumnLeft));
-        assert_eq!(b.binds.get(key("Alt+n")), Some(Action::NewColumn));
-        assert_eq!(b.binds.get(key("Alt+Enter")), Some(Action::NewColumn));
+        assert_eq!(
+            b.prefix_binds.get(key("h")),
+            Some(&[Action::FocusColumnLeft][..])
+        );
+        assert_eq!(b.binds.get(key("Alt+n")), Some(&[Action::NewColumn][..]));
+        assert_eq!(
+            b.binds.get(key("Alt+Enter")),
+            Some(&[Action::NewColumn][..])
+        );
     }
 
     #[test]
@@ -807,7 +834,7 @@ mod tests {
         let bad_action = err("binds { Alt+h { focus-left; }; }");
         assert!(bad_action.contains("focus-left"), "{bad_action}");
         let no_action = err("binds { Alt+h; }");
-        assert!(no_action.contains("needs one action"), "{no_action}");
+        assert!(no_action.contains("needs an action"), "{no_action}");
         let bad_prefix = err(r#"prefix "Ctrl+""#);
         assert!(bad_prefix.contains("no key given"), "{bad_prefix}");
         // Nothing but a key and an action.
@@ -820,6 +847,33 @@ mod tests {
         ] {
             assert!(parse(extra).is_err(), "{extra}");
         }
+    }
+
+    #[test]
+    fn a_binding_can_run_several_actions() {
+        let b = parse(
+            "binds {
+                Alt+t { new-column; new-column; consume-or-expel-pane-left; }
+            }",
+        )
+        .unwrap()
+        .bindings;
+        assert_eq!(
+            b.binds.get(key("Alt+t")),
+            Some(
+                &[
+                    Action::NewColumn,
+                    Action::NewColumn,
+                    Action::ConsumeOrExpelPaneLeft
+                ][..]
+            )
+        );
+        let err =
+            parse("binds { Alt+h { unbind; detach; }; }").unwrap_err().summary;
+        assert_eq!(
+            err,
+            "config.kdl:1: unbind goes on its own, without actions"
+        );
     }
 
     #[test]

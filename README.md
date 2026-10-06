@@ -168,6 +168,15 @@ Keys are written like niri's: `Alt+Enter`, `Ctrl+b`, `Shift+h` (or just
 `H`), `PageUp`, `F5`. Characters KDL keeps for itself go in quotes, such
 as `"["` and `"Alt+,"`.
 
+Unlike niri, a key can run several actions, one after another. This opens
+two shells stacked in one column:
+
+```kdl
+binds {
+    Alt+t { new-column; new-column; consume-or-expel-pane-left; }
+}
+```
+
 ### Sizes
 
 `Ctrl+a r` steps the focused column through preset widths, and new
