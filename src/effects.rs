@@ -17,12 +17,17 @@ use std::time::{Duration, Instant};
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;
 use ratatui_core::style::{Color as RColor, Modifier};
-use tachyonfx::{Effect, Interpolation, fx};
+use tachyonfx::{ColorSpace, Effect, Interpolation, fx};
 
 use crate::colors::Palette;
 use crate::kitty;
 use crate::layout::PaneId;
 use crate::render::{Color, Frame, Style};
+
+/// How fades blend colors: straight toward the background, so red text
+/// fades through darker reds. tachyonfx's default, HSL, turns the hue on
+/// the way, and red text passes through purple to reach a dark blue.
+const FADE_COLORS: ColorSpace = ColorSpace::Rgb;
 
 /// How long a new pane takes to fade in.
 const OPEN_FADE: Duration = Duration::from_millis(200);
@@ -55,7 +60,8 @@ impl Effects {
             background,
             background,
             (OPEN_FADE, Interpolation::QuadOut),
-        );
+        )
+        .with_color_space(FADE_COLORS);
         self.running.push(Running { pane, effect });
     }
 
@@ -145,12 +151,14 @@ impl Transition {
                 background,
                 background,
                 (OVERVIEW_OUT, Interpolation::QuadIn),
-            ),
+            )
+            .with_color_space(FADE_COLORS),
             into: fx::fade_from(
                 background,
                 background,
                 (OVERVIEW_IN, Interpolation::QuadOut),
-            ),
+            )
+            .with_color_space(FADE_COLORS),
             opening,
             coming_in: false,
             last: None,
