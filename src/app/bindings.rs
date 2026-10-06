@@ -103,6 +103,12 @@ impl App {
             Action::ExpelPaneFromColumn => {
                 self.workspaces.active_mut(id).expel_from_column()
             }
+            Action::SwitchPresetPaneHeight => {
+                self.workspaces.active_mut(id).switch_preset_height();
+            }
+            Action::ResetPaneHeight => {
+                self.workspaces.active_mut(id).reset_pane_height();
+            }
             Action::SwitchPresetColumnWidth => {
                 self.workspaces.active_mut(id).cycle_width()
             }

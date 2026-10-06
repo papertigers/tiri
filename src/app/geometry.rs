@@ -5,7 +5,7 @@
 //! Where things are on a client's screen: workspace rows, columns, and
 //! each pane's box.
 
-use crate::layout::{PaneId, split_heights};
+use crate::layout::PaneId;
 
 use super::{App, Client};
 
@@ -118,10 +118,9 @@ impl App {
         if let Some(id) = column.fullscreen() {
             return vec![pane_box(id, y, h)];
         }
-        let panes = column.panes();
-        panes
-            .iter()
-            .zip(split_heights(h, panes.len()))
+        let strip = self.workspaces.list()[ws].strip();
+        (column.panes().iter())
+            .zip(strip.pane_heights(idx, h))
             .map(|(&id, h)| {
                 let b = pane_box(id, y, h);
                 y += h;

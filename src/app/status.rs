@@ -168,6 +168,7 @@ fn prefix_hints(bindings: &Bindings) -> Vec<String> {
             ("close", &[ClosePane]),
             ("detach", &[Detach]),
             ("width", &[SwitchPresetColumnWidth]),
+            ("height", &[SwitchPresetPaneHeight]),
             ("max", &[MaximizeColumn]),
             ("full", &[FullscreenPane]),
             ("center", &[CenterColumn]),
@@ -280,7 +281,7 @@ mod tests {
         assert_eq!(
             prefix_hints(&bindings).join("  "),
             "C-a:  n new  hjkl focus  HJKL move  u/i workspace  o overview  x close  \
-             d detach  r width  f max  F full  c center  U/I to workspace  \
+             d detach  r width  R height  f max  F full  c center  U/I to workspace  \
              [/] consume/expel  ,/. into/out of column  0/$ first/last  q kill server"
         );
         assert_eq!(

@@ -14,9 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::layout::{
-    ColumnWidths, OVERVIEW_MAX_ZOOM, PaneId, Strip, StripView,
-};
+use crate::layout::{OVERVIEW_MAX_ZOOM, PaneId, SizePresets, Strip, StripView};
 
 /// Time constant for the vertical slide between workspaces; matches the
 /// strip's horizontal scrolling.
@@ -62,8 +60,9 @@ struct View {
 pub struct Workspaces {
     list: Vec<Workspace>,
     view_width: u16,
+    view_height: u16,
     max_stack: usize,
-    column_widths: ColumnWidths,
+    size_presets: SizePresets,
     views: HashMap<ClientId, View>,
 }
 
@@ -74,8 +73,9 @@ impl Workspaces {
         let mut workspaces = Self {
             list: Vec::new(),
             view_width,
+            view_height: 24,
             max_stack: usize::MAX,
-            column_widths: ColumnWidths::default(),
+            size_presets: SizePresets::default(),
             views: HashMap::new(),
         };
         for name in names {
@@ -89,7 +89,8 @@ impl Workspaces {
     fn new_workspace(&self, name: Option<String>) -> Workspace {
         let mut strip = Strip::new(self.view_width);
         strip.set_max_stack(self.max_stack);
-        strip.set_column_widths(&self.column_widths);
+        strip.set_view_height(self.view_height);
+        strip.set_size_presets(&self.size_presets);
         Workspace { name, strip }
     }
 
@@ -318,11 +319,19 @@ impl Workspaces {
         }
     }
 
-    /// Sets the widths columns cycle through and open at, everywhere.
-    pub fn set_column_widths(&mut self, widths: &ColumnWidths) {
-        self.column_widths.clone_from(widths);
+    /// The rows a column gets: the view's height less the status bar.
+    pub fn set_view_height(&mut self, rows: u16) {
+        self.view_height = rows;
         for workspace in &mut self.list {
-            workspace.strip.set_column_widths(widths);
+            workspace.strip.set_view_height(rows);
+        }
+    }
+
+    /// Sets the widths columns cycle through and open at, everywhere.
+    pub fn set_size_presets(&mut self, widths: &SizePresets) {
+        self.size_presets.clone_from(widths);
+        for workspace in &mut self.list {
+            workspace.strip.set_size_presets(widths);
         }
     }
 

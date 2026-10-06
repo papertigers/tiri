@@ -28,7 +28,7 @@ use portable_pty::Child;
 use crate::colors::Palette;
 use crate::config::Config;
 use crate::effects::Effects;
-use crate::layout::{PaneId, split_heights};
+use crate::layout::{MIN_PANE_HEIGHT, PaneId};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
 use crate::render::Renderer;
@@ -43,9 +43,6 @@ const STATUS_HEIGHT: u16 = 1;
 /// The largest terminal a client may claim to have, in cells.
 const MAX_WIDTH: u16 = 1000;
 const MAX_HEIGHT: u16 = 500;
-/// The shortest a stacked pane's box may get, borders included. Columns
-/// refuse to consume more panes than fit at this height.
-const MIN_PANE_HEIGHT: i32 = 5;
 
 /// Bounds a client's claimed terminal size, so a bogus one can't make the
 /// server allocate enormous frames and terminals.
@@ -121,7 +118,7 @@ impl App {
                     (Config::default(), Some(e.summary))
                 }
             };
-            self.workspaces.set_column_widths(&config.column_widths);
+            self.workspaces.set_size_presets(&config.size_presets);
             self.config = config;
             error
         });
@@ -264,6 +261,7 @@ impl App {
         self.size_owner = Some(client.id);
         self.layout_size = size;
         self.workspaces.set_view_width(size.0);
+        self.workspaces.set_view_height(size.1.saturating_sub(STATUS_HEIGHT));
         self.resize_panes();
     }
 
@@ -275,7 +273,7 @@ impl App {
             let strip = workspace.strip();
             for (idx, col) in strip.columns().iter().enumerate() {
                 let cols = strip.column_width(idx).saturating_sub(2).max(1);
-                let heights = split_heights(area, col.panes().len());
+                let heights = strip.pane_heights(idx, area);
                 for (id, h) in col.panes().iter().zip(heights) {
                     // A fullscreen pane has its column to itself.
                     let h =

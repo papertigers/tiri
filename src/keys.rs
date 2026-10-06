@@ -295,6 +295,8 @@ pub enum Action {
     ConsumePaneIntoColumn,
     ExpelPaneFromColumn,
     SwitchPresetColumnWidth,
+    SwitchPresetPaneHeight,
+    ResetPaneHeight,
     MaximizeColumn,
     FullscreenPane,
     CenterColumn,

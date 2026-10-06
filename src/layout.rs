@@ -7,44 +7,57 @@
 //! viewport scrolls instead. Each column is a stack of one or more panes
 //! sharing its height.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 const MIN_COLUMN_WIDTH: u16 = 8;
+/// The shortest a stacked pane's box may get, borders included. Columns
+/// refuse to consume more panes than fit at this height.
+pub const MIN_PANE_HEIGHT: i32 = 5;
 
-/// How wide a column is.
+/// How wide a column is, or how tall a pane in a stack.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ColumnWidth {
-    /// A share of the view's width, from just above 0 to 1.
+pub enum PresetSize {
+    /// A share of the view's width or height, from just above 0 to 1.
     Proportion(f64),
-    /// So many cells, borders included.
+    /// So many cells across, or rows down, borders included.
     Fixed(u16),
 }
 
 /// The full view width, as maximizing makes a column.
-const FULL_WIDTH: ColumnWidth = ColumnWidth::Proportion(1.0);
+const FULL_WIDTH: PresetSize = PresetSize::Proportion(1.0);
 
-/// The widths `switch-preset-column-width` steps through, and the width
-/// new columns start at. The config sets these.
+/// The sizes the config gives: what `switch-preset-column-width` and
+/// `switch-preset-pane-height` step through, and the width new columns
+/// start at.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ColumnWidths {
+pub struct SizePresets {
     /// Never empty.
-    pub presets: Vec<ColumnWidth>,
-    pub default: ColumnWidth,
+    pub column_widths: Vec<PresetSize>,
+    pub default_column_width: PresetSize,
+    /// Never empty.
+    pub pane_heights: Vec<PresetSize>,
 }
 
-impl Default for ColumnWidths {
-    /// As the default config has them: a third, a half, two thirds and
-    /// the whole width, starting at a half.
+impl Default for SizePresets {
+    /// As the default config has them: columns a third, a half, two thirds
+    /// or the whole width, starting at a half; panes a third, a half or two
+    /// thirds of the height.
     fn default() -> Self {
-        use ColumnWidth::Proportion;
+        use PresetSize::Proportion;
         Self {
-            presets: vec![
+            column_widths: vec![
                 Proportion(0.33333),
                 Proportion(0.5),
                 Proportion(0.66667),
                 Proportion(1.0),
             ],
-            default: Proportion(0.5),
+            default_column_width: Proportion(0.5),
+            pane_heights: vec![
+                Proportion(0.33333),
+                Proportion(0.5),
+                Proportion(0.66667),
+            ],
         }
     }
 }
@@ -65,21 +78,24 @@ pub struct Column {
     panes: Vec<PaneId>,
     /// Index of the focused pane in `panes`.
     focus: usize,
-    width: ColumnWidth,
+    width: PresetSize,
     /// The width to go back to when un-maximizing.
-    unmaximized: Option<ColumnWidth>,
+    unmaximized: Option<PresetSize>,
+    /// The heights of panes that have one. The rest share what's left.
+    heights: HashMap<PaneId, PresetSize>,
     /// A pane shown fullscreen: the column takes the whole view width and
     /// this pane its whole height, hiding the rest of the stack.
     fullscreen: Option<PaneId>,
 }
 
 impl Column {
-    fn new(pane: PaneId, width: ColumnWidth) -> Self {
+    fn new(pane: PaneId, width: PresetSize) -> Self {
         Self {
             panes: vec![pane],
             focus: 0,
             width,
             unmaximized: None,
+            heights: HashMap::new(),
             fullscreen: None,
         }
     }
@@ -115,6 +131,8 @@ impl Column {
         // Changing the stack under a fullscreen pane ends it.
         self.fullscreen = None;
         let pane = self.panes.remove(idx);
+        // Its height was for this stack: it goes into another one sharing.
+        self.heights.remove(&pane);
         if idx < self.focus || self.focus >= self.panes.len() {
             self.focus = self.focus.saturating_sub(1);
         }
@@ -122,9 +140,29 @@ impl Column {
     }
 }
 
+/// `parts` scaled to add up to `total`, rounding where the boundaries
+/// between them fall rather than each part, so nothing is lost or gained.
+fn scale(parts: &[i32], total: i32) -> Vec<i32> {
+    let sum: i64 = parts.iter().map(|&p| i64::from(p)).sum();
+    if sum <= 0 {
+        return split_heights(total, parts.len());
+    }
+    let (mut done, mut before) = (0i64, 0i32);
+    (parts.iter())
+        .map(|&part| {
+            done += i64::from(part);
+            let boundary = (done * i64::from(total) + sum / 2) / sum;
+            let boundary = i32::try_from(boundary).unwrap_or(total);
+            let height = boundary - before;
+            before = boundary;
+            height
+        })
+        .collect()
+}
+
 /// Splits `total` rows among `n` stacked panes as evenly as possible, giving
 /// any leftover rows to the topmost panes.
-pub fn split_heights(total: i32, n: usize) -> Vec<i32> {
+fn split_heights(total: i32, n: usize) -> Vec<i32> {
     let n = n.max(1) as i32;
     (0..n).map(|i| total / n + i32::from(i < total % n)).collect()
 }
@@ -153,7 +191,9 @@ pub struct Strip {
     target_offset: i32,
     /// The most panes a column may hold before consuming is refused.
     max_stack: usize,
-    widths: ColumnWidths,
+    /// The rows a column gets: the view's height less the status bar.
+    view_height: u16,
+    presets: SizePresets,
 }
 
 impl Strip {
@@ -164,14 +204,19 @@ impl Strip {
             view_width,
             target_offset: 0,
             max_stack: usize::MAX,
-            widths: ColumnWidths::default(),
+            view_height: 24,
+            presets: SizePresets::default(),
         }
     }
 
     /// Sets the widths to cycle through and to open columns at. Columns
     /// already open keep their widths.
-    pub fn set_column_widths(&mut self, widths: &ColumnWidths) {
-        self.widths.clone_from(widths);
+    pub fn set_size_presets(&mut self, presets: &SizePresets) {
+        self.presets.clone_from(presets);
+    }
+
+    pub fn set_view_height(&mut self, rows: u16) {
+        self.view_height = rows;
     }
 
     /// The overview zoom that would fit this whole strip on screen.
@@ -229,16 +274,96 @@ impl Strip {
     }
 
     /// `width` in cells, in this strip's view.
-    fn cells(&self, width: ColumnWidth) -> u16 {
+    fn cells(&self, width: PresetSize) -> u16 {
         let cells = match width {
             // A share written with a few decimals, like 0.33333, should
             // still come to a whole third of 99, not just under it.
-            ColumnWidth::Proportion(share) => {
+            PresetSize::Proportion(share) => {
                 (f64::from(self.view_width) * share + 1e-3).floor() as u16
             }
-            ColumnWidth::Fixed(cells) => cells.min(self.view_width),
+            PresetSize::Fixed(cells) => cells.min(self.view_width),
         };
         cells.max(MIN_COLUMN_WIDTH)
+    }
+
+    /// `height` in rows, in this strip's view.
+    fn rows(&self, height: PresetSize) -> i32 {
+        let view = i32::from(self.view_height);
+        let rows = match height {
+            PresetSize::Proportion(share) => {
+                (f64::from(view) * share + 1e-3).floor() as i32
+            }
+            PresetSize::Fixed(rows) => i32::from(rows),
+        };
+        rows.clamp(MIN_PANE_HEIGHT.min(view), view.max(1))
+    }
+
+    /// How tall each pane in column `idx` is, top to bottom, when the
+    /// column is `total` rows tall: the view's height, or less in the
+    /// overview, which scales everything down alike.
+    ///
+    /// Panes with a set height get it, and the rest share what's left
+    /// equally, none shorter than [`MIN_PANE_HEIGHT`]. Set heights give way
+    /// as needed for that, and if every pane has one, they're stretched or
+    /// squeezed to fill the column.
+    pub fn pane_heights(&self, idx: usize, total: i32) -> Vec<i32> {
+        let column = &self.columns[idx];
+        let view = i32::from(self.view_height).max(1);
+        let set: Vec<Option<i32>> = (column.panes.iter())
+            .map(|pane| column.heights.get(pane).map(|h| self.rows(*h)))
+            .collect();
+        let sharing = set.iter().filter(|h| h.is_none()).count();
+        let set_rows: Vec<i32> = set.iter().flatten().copied().collect();
+        let wanted: i32 = set_rows.iter().sum();
+        // The rows the set heights end up with between them.
+        let room = view - i32::try_from(sharing).unwrap_or(0) * MIN_PANE_HEIGHT;
+        let given = if sharing == 0 { view } else { wanted.min(room.max(0)) };
+        let mut set_rows = scale(&set_rows, given).into_iter();
+        let mut shared = split_heights(view - given, sharing).into_iter();
+        let heights: Vec<i32> = (set.iter())
+            .map(|h| match h {
+                Some(_) => set_rows.next().unwrap_or(0),
+                None => shared.next().unwrap_or(0),
+            })
+            .collect();
+        scale(&heights, total)
+    }
+
+    /// niri's `switch-preset-window-height`: the focused pane in a stack
+    /// takes the next preset height. One without a set height goes to the
+    /// next preset taller than it is now.
+    pub fn switch_preset_height(&mut self) {
+        let Some(col) = self.columns.get(self.focus) else {
+            return;
+        };
+        if col.panes.len() < 2 {
+            // A pane alone has the column's whole height.
+            return;
+        }
+        let pane = col.focused();
+        let presets = &self.presets.pane_heights;
+        let current = col.heights.get(&pane).copied();
+        let position =
+            current.and_then(|h| presets.iter().position(|p| *p == h));
+        let next = match position {
+            Some(i) => presets[(i + 1) % presets.len()],
+            None => {
+                let view = i32::from(self.view_height);
+                let now = self.pane_heights(self.focus, view)[col.focus];
+                let taller = presets.iter().find(|p| self.rows(**p) > now);
+                *taller.unwrap_or(&presets[0])
+            }
+        };
+        self.columns[self.focus].heights.insert(pane, next);
+    }
+
+    /// niri's `reset-window-height`: the focused pane goes back to sharing
+    /// its column's height equally.
+    pub fn reset_pane_height(&mut self) {
+        if let Some(col) = self.columns.get_mut(self.focus) {
+            let pane = col.focused();
+            col.heights.remove(&pane);
+        }
     }
 
     /// Left edge of column `idx` in strip coordinates.
@@ -265,7 +390,10 @@ impl Strip {
 
     /// Opens a new column to the right of the focused one and focuses it.
     pub fn insert(&mut self, pane: PaneId) {
-        self.insert_column(Column::new(pane, self.widths.default));
+        self.insert_column(Column::new(
+            pane,
+            self.presets.default_column_width,
+        ));
     }
 
     /// Removes `pane`, and its column if it was the last pane there.
@@ -411,7 +539,7 @@ impl Strip {
             Side::Left => self.focus,
             Side::Right => self.focus + 1,
         };
-        let column = Column::new(pane, self.widths.default);
+        let column = Column::new(pane, self.presets.default_column_width);
         self.columns.insert(idx, column);
         self.focus = idx;
         self.scroll_to_focus();
@@ -482,7 +610,7 @@ impl Strip {
         let Some(col) = self.columns.get(self.focus) else {
             return;
         };
-        let presets = &self.widths.presets;
+        let presets = &self.presets.column_widths;
         let next = match presets.iter().position(|w| *w == col.width) {
             Some(i) => presets[(i + 1) % presets.len()],
             None => {
@@ -980,11 +1108,12 @@ mod tests {
 
     #[test]
     fn presets_come_from_the_config() {
-        use ColumnWidth::{Fixed, Proportion};
+        use PresetSize::{Fixed, Proportion};
         let mut strip = Strip::new(100);
-        strip.set_column_widths(&ColumnWidths {
-            presets: vec![Fixed(40), Proportion(0.75)],
-            default: Fixed(30),
+        strip.set_size_presets(&SizePresets {
+            column_widths: vec![Fixed(40), Proportion(0.75)],
+            default_column_width: Fixed(30),
+            ..SizePresets::default()
         });
         strip.insert(PaneId(0));
         assert_eq!(strip.column_width(0), 30, "the default width");
@@ -996,7 +1125,7 @@ mod tests {
         assert_eq!(strip.column_width(0), 40);
 
         // New presets leave open columns as they are.
-        strip.set_column_widths(&ColumnWidths::default());
+        strip.set_size_presets(&SizePresets::default());
         assert_eq!(strip.column_width(0), 40);
         strip.cycle_width(); // the next wider: a half
         assert_eq!(strip.column_width(0), 50);
@@ -1005,19 +1134,76 @@ mod tests {
     #[test]
     fn shares_written_as_decimals_divide_exactly() {
         let mut strip = Strip::new(99);
-        strip.set_column_widths(&ColumnWidths {
-            default: ColumnWidth::Proportion(0.33333),
-            ..ColumnWidths::default()
+        strip.set_size_presets(&SizePresets {
+            default_column_width: PresetSize::Proportion(0.33333),
+            ..SizePresets::default()
         });
         strip.insert(PaneId(0));
         assert_eq!(strip.column_width(0), 33);
         // A fixed width wider than the view is the view.
-        strip.set_column_widths(&ColumnWidths {
-            default: ColumnWidth::Fixed(500),
-            ..ColumnWidths::default()
+        strip.set_size_presets(&SizePresets {
+            default_column_width: PresetSize::Fixed(500),
+            ..SizePresets::default()
         });
         strip.insert(PaneId(1));
         assert_eq!(strip.column_width(1), 99);
+    }
+
+    /// Panes 0 and 1 stacked in one column, focus on 1, in a view 30 rows
+    /// tall.
+    fn stack_of_two() -> Strip {
+        let mut strip = strip_with(2, 100);
+        strip.set_view_height(30);
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![0, 1]]);
+        strip
+    }
+
+    #[test]
+    fn stacked_panes_share_until_one_gets_a_height() {
+        let mut strip = stack_of_two();
+        assert_eq!(strip.pane_heights(0, 30), [15, 15]);
+        // From an even half, the next preset up is two thirds.
+        strip.switch_preset_height();
+        assert_eq!(strip.pane_heights(0, 30), [10, 20]);
+        strip.switch_preset_height(); // round to a third
+        assert_eq!(strip.pane_heights(0, 30), [20, 10]);
+        strip.reset_pane_height();
+        assert_eq!(strip.pane_heights(0, 30), [15, 15]);
+    }
+
+    #[test]
+    fn set_heights_leave_others_room_and_scale_in_the_overview() {
+        use PresetSize::{Fixed, Proportion};
+        let mut strip = stack_of_two();
+        strip.set_size_presets(&SizePresets {
+            pane_heights: vec![Fixed(29), Proportion(0.5)],
+            ..SizePresets::default()
+        });
+        strip.switch_preset_height(); // 29 rows wanted, but pane 0 needs 5
+        assert_eq!(strip.pane_heights(0, 30), [MIN_PANE_HEIGHT, 25]);
+        // Zoomed out to a third, everything shrinks alike.
+        assert_eq!(strip.pane_heights(0, 10), [2, 8]);
+        // Both set: they fill the column between them.
+        strip.focus_up();
+        strip.switch_preset_height(); // 29 again
+        assert_eq!(strip.pane_heights(0, 30), [15, 15]);
+    }
+
+    #[test]
+    fn heights_belong_to_their_stack() {
+        let mut strip = stack_of_two();
+        strip.switch_preset_height();
+        // Expelled and consumed back, pane 1 shares again.
+        strip.expel_from_column();
+        strip.consume_or_expel_left();
+        assert_eq!(layout(&strip), [vec![0, 1]]);
+        assert_eq!(strip.pane_heights(0, 30), [15, 15]);
+        // A pane alone fills its column; there's nothing to switch.
+        let mut alone = strip_with(1, 100);
+        alone.set_view_height(30);
+        alone.switch_preset_height();
+        assert_eq!(alone.pane_heights(0, 30), [30]);
     }
 
     #[test]

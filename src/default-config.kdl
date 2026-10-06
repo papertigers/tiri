@@ -35,11 +35,15 @@ theme "default"
     selection-bg "reverse"
 }
 
-// Column widths, as niri gives them. switch-preset-column-width (Ctrl+a r)
-// steps the focused column through preset-column-widths; new columns open
-// at default-column-width. A proportion is a share of the screen's width,
-// above 0 and at most 1; fixed is a number of characters, borders included,
-// as in `fixed 80`.
+// Sizes, as niri gives them. switch-preset-column-width (Ctrl+a r) steps
+// the focused column through preset-column-widths, and new columns open at
+// default-column-width. In a stack, switch-preset-pane-height (Ctrl+a R)
+// steps the focused pane through preset-pane-heights; the panes without one
+// share what's left, and reset-pane-height puts a pane back to sharing.
+//
+// A proportion is a share of the screen's width or height, above 0 and at
+// most 1. fixed is a number of characters across or lines down, borders
+// included, as in `fixed 80`.
 layout {
     preset-column-widths {
         proportion 0.33333
@@ -48,6 +52,11 @@ layout {
         proportion 1.0
     }
     default-column-width { proportion 0.5; }
+    preset-pane-heights {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+    }
 }
 
 // Key bindings. Keys are written like niri's: a key, after any of Ctrl+,
@@ -67,6 +76,8 @@ layout {
 //   consume-pane-into-column         pull the next column's pane into this one
 //   expel-pane-from-column           push the focused pane out to its own column
 //   switch-preset-column-width       cycle through the widths
+//   switch-preset-pane-height        cycle a pane in a stack through the heights
+//   reset-pane-height                back to sharing the column's height
 //   maximize-column                  full width, or back
 //   fullscreen-pane                  the whole column's height, or back
 //   center-column
@@ -118,6 +129,7 @@ prefix-binds {
     Shift+i { move-column-to-workspace-up; }
 
     r { switch-preset-column-width; }
+    Shift+r { switch-preset-pane-height; }
     f { maximize-column; }
     Shift+f { fullscreen-pane; }
     c { center-column; }
@@ -162,6 +174,7 @@ binds {
     Alt+Shift+i { move-column-to-workspace-up; }
 
     Alt+r { switch-preset-column-width; }
+    Alt+Shift+r { switch-preset-pane-height; }
     Alt+f { maximize-column; }
     Alt+Shift+f { fullscreen-pane; }
     Alt+c { center-column; }
@@ -209,6 +222,7 @@ overview-binds {
     Shift+i { move-column-to-workspace-up; }
 
     r { switch-preset-column-width; }
+    Shift+r { switch-preset-pane-height; }
     f { maximize-column; }
     Shift+f { fullscreen-pane; }
 
