@@ -57,6 +57,9 @@ impl App {
         }
 
         let (mut frame, cursor) = self.compose(client, &visible, thumbnails);
+        if thumbnails {
+            kitty::compact_placeholders(&mut frame);
+        }
         let areas: Vec<_> = (client.effects.panes().into_iter())
             .map(|id| (id, self.pane_area(client, id)))
             .collect();

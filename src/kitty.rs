@@ -13,7 +13,7 @@ use std::io::Write as _;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::render::Color;
+use crate::render::{Color, Frame};
 use crate::thumbnail::Image;
 
 /// A cell showing part of an image. The image id is carried in the cell's
@@ -335,6 +335,48 @@ pub fn placeholder(row: u16, col: u16) -> String {
         .collect()
 }
 
+/// The (row, col) a placeholder cell's marks name, if it is one with both.
+fn placeholder_position(sym: &str) -> Option<(usize, usize)> {
+    let mut chars = sym.chars();
+    if chars.next() != Some(PLACEHOLDER) {
+        return None;
+    }
+    let mut index = || {
+        let mark = chars.next()?;
+        DIACRITICS.iter().position(|&d| d == mark)
+    };
+    Some((index()?, index()?))
+}
+
+/// Leaves the marks off placeholders that carry on a run: the protocol
+/// lets a placeholder without them continue the one to its left, at the
+/// next column. That halves what an overview of thumbnails costs to send.
+///
+/// Only a cell whose left neighbor in the finished frame is the same
+/// placement's previous column goes bare, since that's what the terminal
+/// reads it from. One after a border, a label drawn over the image, or the
+/// screen's edge keeps its marks.
+pub fn compact_placeholders(frame: &mut Frame) {
+    let bare = PLACEHOLDER.to_string();
+    for y in 0..frame.height() {
+        // The placement and position of the cell just left, if it's one.
+        let mut left = None;
+        for x in 0..frame.width() {
+            let (sym, wide, style) = frame.content(x, y);
+            let here = (!wide)
+                .then(|| placeholder_position(sym))
+                .flatten()
+                .map(|(row, col)| (style, row, col));
+            if let Some((style, row, col)) = here
+                && left == Some((style, row, col.wrapping_sub(1)))
+            {
+                frame.put(i32::from(x), i32::from(y), &bare, style);
+            }
+            left = here;
+        }
+    }
+}
+
 /// The foreground color that makes a placeholder cell refer to image `id`.
 pub fn id_color(id: u32) -> Color {
     let [_, r, g, b] = id.to_be_bytes();
@@ -397,6 +439,40 @@ mod tests {
     fn placeholder_encodes_row_then_column() {
         assert_eq!(placeholder(0, 2), "\u{10EEEE}\u{0305}\u{030E}");
         assert_eq!(placeholder(296, 0).chars().nth(1), Some('\u{1D244}'));
+    }
+
+    #[test]
+    fn placeholders_after_the_first_in_a_run_go_bare() {
+        use crate::render::Style;
+        let image = Style { fg: id_color(7), ..Style::default() };
+        let other = Style { fg: id_color(8), ..Style::default() };
+        let mut frame = Frame::new(8, 2);
+        // A border, then columns 0 to 4 of row 0 of image 7.
+        frame.put(0, 0, "│", Style::default());
+        for col in 0..5 {
+            frame.put(i32::from(col) + 1, 0, &placeholder(0, col), image);
+        }
+        // Then a label over column 3, and image 8 right after.
+        frame.put(4, 0, "x", Style::default());
+        frame.put(6, 0, &placeholder(0, 1), other);
+        // Row 1 starts partway into the image, as if scrolled.
+        for col in 0..3 {
+            frame.put(i32::from(col), 1, &placeholder(1, col + 4), image);
+        }
+        compact_placeholders(&mut frame);
+
+        let bare = PLACEHOLDER.to_string();
+        let row = |y: u16| -> Vec<String> {
+            (0..8).map(|x| frame.content(x, y).0.to_owned()).collect()
+        };
+        let r0 = row(0);
+        assert_eq!(r0[1], placeholder(0, 0));
+        assert_eq!((&r0[2], &r0[3]), (&bare, &bare));
+        assert_eq!(r0[5], placeholder(0, 4), "after the label");
+        assert_eq!(r0[6], placeholder(0, 1), "another image");
+        let r1 = row(1);
+        assert_eq!(r1[0], placeholder(1, 4), "at the screen's edge");
+        assert_eq!((&r1[1], &r1[2]), (&bare, &bare));
     }
 
     #[test]
