@@ -368,13 +368,14 @@ pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
 /// creating or resizing its virtual placement. The terminal scales the
 /// image to fit.
 ///
-/// The placement uses the image id too. Each image has one placement, so this
-/// replaces its previous size without colliding with another image's placement.
-/// This was found on iTerm2 which treats placement ids as global rather
-/// than scoping them to an image. Re-uploading an image keeps its placements,
-/// and an unnumbered placement is added alongside them; placeholders then use
-/// whichever the terminal finds first, which after a resize is often one with
-/// the old size.
+/// The placement always gets the same id, so it replaces the previous one.
+/// Re-uploading an image keeps its placements, and an unnumbered placement
+/// is added alongside them; placeholders then use whichever the terminal
+/// finds first, which after a resize is often one with the old size.
+///
+/// That id is the image's own. Placement ids belong to their image, but
+/// iTerm2 treats them as global, so images sharing one would take each
+/// other's placement there. Placeholders name it in their underline color.
 pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
     write!(out, "\x1b_Ga=p,U=1,i={id},p={id},c={cols},r={rows},q=2\x1b\\")
         .expect("writing to memory can't fail");
@@ -455,8 +456,6 @@ mod tests {
     #[test]
     fn placements_are_unique_between_images() {
         let mut out = Vec::new();
-
-        // 6 7 lol
         place(&mut out, 6, 10, 5);
         place(&mut out, 7, 10, 5);
 

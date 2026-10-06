@@ -30,9 +30,10 @@ pub struct Style {
     pub underline: bool,
     pub inverse: bool,
     pub strikeout: bool,
-    /// The underline color - used by kitty graphics placeholders to
-    /// identify a placement even when the cell is not underlined.
-    /// https://sw.kovidgoyal.net/kitty/underlines/
+    /// The color of underlines, as a program in a pane sets it. In a kitty
+    /// placeholder cell, which isn't underlined, it names the image's
+    /// placement instead.
+    /// <https://sw.kovidgoyal.net/kitty/underlines/>
     pub underline_color: Color,
 }
 
@@ -300,13 +301,11 @@ impl Renderer {
 }
 
 fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
-    use style::{
-        Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    };
+    use style::{Attribute, SetAttribute};
     out.queue(SetAttribute(Attribute::Reset))?;
-    out.queue(SetForegroundColor(color(s.fg)))?;
-    out.queue(SetBackgroundColor(color(s.bg)))?;
-    set_underline_color(out, s.underline_color)?;
+    set_color(out, 38, s.fg)?;
+    set_color(out, 48, s.bg)?;
+    set_color(out, 58, s.underline_color)?;
     for (on, attr) in [
         (s.bold, Attribute::Bold),
         (s.dim, Attribute::Dim),
@@ -322,21 +321,18 @@ fn apply_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     Ok(())
 }
 
-/// Writes SGR's underline color directly - it can carry kitty graphics
-/// metadata even when ordinary colored output has been disabled.
-fn set_underline_color(out: &mut impl Write, color: Color) -> io::Result<()> {
+/// Sets the foreground (`base` 38), background (48) or underline (58)
+/// color, just after a reset. The default needs nothing, as the reset has
+/// set it already.
+///
+/// Written here rather than with crossterm, which leaves colors out when
+/// NO_COLOR is set: tiri passes on the colors programs in its panes chose,
+/// and kitty placeholders need theirs to name their image.
+fn set_color(out: &mut impl Write, base: u8, color: Color) -> io::Result<()> {
     match color {
-        Color::Default => out.write_all(b"\x1b[59m"),
-        Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
-        Color::Rgb(r, g, b) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
-    }
-}
-
-fn color(c: Color) -> style::Color {
-    match c {
-        Color::Default => style::Color::Reset,
-        Color::Idx(i) => style::Color::AnsiValue(i),
-        Color::Rgb(r, g, b) => style::Color::Rgb { r, g, b },
+        Color::Default => Ok(()),
+        Color::Idx(i) => write!(out, "\x1b[{base};5;{i}m"),
+        Color::Rgb(r, g, b) => write!(out, "\x1b[{base};2;{r};{g};{b}m"),
     }
 }
 
@@ -344,16 +340,26 @@ fn color(c: Color) -> style::Color {
 mod tests {
     use super::*;
 
-    #[test]
-    fn writes_underline_color() {
+    fn styled(style: Style) -> String {
         let mut out = Vec::new();
-        apply_style(
-            &mut out,
-            Style { underline_color: Color::Rgb(1, 2, 3), ..Style::default() },
-        )
-        .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("\x1b[58;2;1;2;3m"), "{out:?}");
+        apply_style(&mut out, style).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn writes_colors_after_the_reset() {
+        let out = styled(Style {
+            fg: Color::Idx(3),
+            bg: Color::Rgb(4, 5, 6),
+            underline_color: Color::Rgb(1, 2, 3),
+            ..Style::default()
+        });
+        assert_eq!(out, "\x1b[0m\x1b[38;5;3m\x1b[48;2;4;5;6m\x1b[58;2;1;2;3m");
+    }
+
+    #[test]
+    fn default_colors_need_only_the_reset() {
+        assert_eq!(styled(Style::default()), "\x1b[0m");
     }
 
     #[test]
