@@ -383,11 +383,30 @@ pub fn id_color(id: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// How hard [`transmit`] compresses an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// For an image that's soon replaced, as in a fade: an animation
+    /// can't wait for anything slower.
+    Fast,
+    /// For an image that stays: about a third the size [`Self::Fast`]
+    /// makes, for a few milliseconds more, which a slow link repays.
+    Small,
+}
+
 /// Uploads `image` as image `id`, replacing any earlier one.
-pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
-    // Level 6 makes a thumbnail about a third the size level 1 does, for a
-    // few milliseconds more: worth it when the link is slow.
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 6);
+pub fn transmit(
+    out: &mut Vec<u8>,
+    id: u32,
+    image: &Image,
+    compression: Compression,
+) {
+    let level = match compression {
+        Compression::Fast => 1,
+        Compression::Small => 6,
+    };
+    let compressed =
+        miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, level);
     let payload = BASE64.encode(compressed);
     let chunks = payload.as_bytes().chunks(CHUNK);
     let last = chunks.len().saturating_sub(1);
@@ -490,7 +509,7 @@ mod tests {
             *byte = (seed >> 24) as u8;
         }
         let mut out = Vec::new();
-        transmit(&mut out, 7, &image);
+        transmit(&mut out, 7, &image, Compression::Small);
         let text = String::from_utf8(out).unwrap();
         let chunks: Vec<&str> =
             text.split("\x1b\\").filter(|s| !s.is_empty()).collect();
@@ -504,7 +523,7 @@ mod tests {
     fn transmit_chunks_the_payload_then_place_shows_it() {
         let image = Image::new(64, 64);
         let mut out = Vec::new();
-        transmit(&mut out, 7, &image);
+        transmit(&mut out, 7, &image, Compression::Small);
         place(&mut out, 7, 10, 5);
         let text = String::from_utf8(out).unwrap();
         let commands: Vec<&str> =

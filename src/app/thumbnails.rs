@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::kitty;
+use crate::kitty::{self, Compression};
 use crate::layout::PaneId;
 use crate::pane::Pane;
 use crate::thumbnail;
@@ -54,6 +54,7 @@ impl Thumbnail {
         image_id: u32,
         size: (u16, u16),
         opacity: f32,
+        compression: Compression,
     ) {
         let step = opacity_step(opacity);
         let uploading = self.opacity != Some(step);
@@ -64,11 +65,11 @@ impl Thumbnail {
                 return;
             };
             if step == OPACITY_STEPS {
-                kitty::transmit(escapes, image_id, image);
+                kitty::transmit(escapes, image_id, image, compression);
             } else {
                 let faded = image
                     .with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
-                kitty::transmit(escapes, image_id, &faded);
+                kitty::transmit(escapes, image_id, &faded, Compression::Fast);
             }
             self.opacity = Some(step);
         }
@@ -166,8 +167,15 @@ impl Client {
                 },
             );
         }
+        // Mid-fade, the overview can't wait for small images; once it's
+        // still, they're worth the wait.
+        let compression = if self.transition.is_some() {
+            Compression::Fast
+        } else {
+            Compression::Small
+        };
         let thumb = self.thumbnails.get_mut(&id).expect("inserted if missing");
-        thumb.show(&mut self.escapes, image_id, size, opacity);
+        thumb.show(&mut self.escapes, image_id, size, opacity, compression);
     }
 
     /// Re-uploads the thumbnails already shown at `opacity`, as the overview
@@ -175,7 +183,8 @@ impl Client {
     pub(super) fn fade_thumbnails(&mut self, opacity: f32) {
         for (id, thumb) in &mut self.thumbnails {
             let size = thumb.size;
-            thumb.show(&mut self.escapes, image_id(*id), size, opacity);
+            let fast = Compression::Fast;
+            thumb.show(&mut self.escapes, image_id(*id), size, opacity, fast);
         }
     }
 
