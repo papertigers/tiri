@@ -14,6 +14,15 @@ a shell](docs/columns.png)
 tiri runs on macOS and illumos. It should work on Linux too, but hasn't
 been tested there yet.
 
+## Disclaimer
+
+> [!WARNING]
+> This project is almost entirely vibe-coded at the moment! It came from
+> my desire to have a niri-like experience on macOS and illumos, and
+> replacing my tmux workflow seemed like a good fit. If this project
+> becomes interesting to outside contributors, we should *NOT* continue
+> vibing our way to success.
+
 ## Getting started
 
 Building needs Rust 1.88 or newer.
