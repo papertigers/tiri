@@ -225,6 +225,8 @@ fn printable(sym: &str) -> &str {
 #[derive(Default)]
 pub struct Renderer {
     prev: Option<Frame>,
+    /// Where the last frame left the cursor, if it showed it.
+    prev_cursor: Option<(u16, u16)>,
 }
 
 impl Renderer {
@@ -248,6 +250,16 @@ impl Renderer {
         frame: Frame,
         cursor_at: Option<(u16, u16)>,
     ) -> io::Result<()> {
+        // Nothing to show, as after a key a pane hasn't echoed yet: over
+        // ssh even an empty update is a packet of its own.
+        let unchanged = self.prev.as_ref().is_some_and(|p| {
+            p.width == frame.width
+                && p.height == frame.height
+                && p.cells == frame.cells
+        });
+        if unchanged && escapes.is_empty() && cursor_at == self.prev_cursor {
+            return Ok(());
+        }
         out.queue(terminal::BeginSynchronizedUpdate)?;
         out.write_all(escapes)?;
         out.queue(cursor::Hide)?;
@@ -296,6 +308,7 @@ impl Renderer {
         out.flush()?;
 
         self.prev = Some(frame);
+        self.prev_cursor = cursor_at;
         Ok(())
     }
 }
@@ -360,6 +373,28 @@ mod tests {
     #[test]
     fn default_colors_need_only_the_reset() {
         assert_eq!(styled(Style::default()), "\x1b[0m");
+    }
+
+    #[test]
+    fn an_unchanged_frame_sends_nothing() {
+        let mut frame = Frame::new(4, 2);
+        frame.put_str(0, 0, "ab", Style::default());
+        let mut renderer = Renderer::default();
+        let mut out = Vec::new();
+        renderer.draw(&mut out, &[], frame.clone(), Some((2, 0))).unwrap();
+        assert!(!out.is_empty());
+
+        let mut out = Vec::new();
+        renderer.draw(&mut out, &[], frame.clone(), Some((2, 0))).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+        // The cursor moving, or escapes to send, still need an update.
+        renderer.draw(&mut out, &[], frame.clone(), Some((3, 0))).unwrap();
+        assert!(!out.is_empty());
+        let mut out = Vec::new();
+        renderer
+            .draw(&mut out, b"\x1b]52;c;\x07", frame, Some((3, 0)))
+            .unwrap();
+        assert!(!out.is_empty());
     }
 
     #[test]

@@ -21,7 +21,10 @@ use rustix::io::Errno;
 use rustix::termios::{QueueSelector, tcflush};
 
 /// Gives up on a terminal that doesn't answer even the attributes request.
-const TIMEOUT: Duration = Duration::from_secs(1);
+/// Generous, since answering terminals end the wait as soon as they have:
+/// over a slow ssh link the answers can take well over a second, and
+/// any that came after giving up would be typed into the first pane.
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a client's terminal said about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,7 +63,7 @@ pub fn probe() -> io::Result<TerminalInfo> {
         if left.is_zero() {
             break;
         }
-        // Under the one-second timeout, so it always fits.
+        // Under the few-second timeout, so it always fits.
         let timeout = Timespec::try_from(left).expect("a short timeout");
         let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
         match poll(&mut fds, Some(&timeout)) {
