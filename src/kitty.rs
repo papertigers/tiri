@@ -343,7 +343,9 @@ pub fn id_color(id: u32) -> Color {
 
 /// Uploads `image` as image `id`, replacing any earlier one.
 pub fn transmit(out: &mut Vec<u8>, id: u32, image: &Image) {
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 1);
+    // Level 6 makes a thumbnail about a third the size level 1 does, for a
+    // few milliseconds more: worth it when the link is slow.
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&image.rgba, 6);
     let payload = BASE64.encode(compressed);
     let chunks = payload.as_bytes().chunks(CHUNK);
     let last = chunks.len().saturating_sub(1);

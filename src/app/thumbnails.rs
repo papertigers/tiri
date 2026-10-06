@@ -36,8 +36,9 @@ pub(super) struct Thumbnail {
     /// The pane's generation when this was drawn.
     pub(super) generation: u64,
     pub(super) uploaded: Instant,
-    /// The image as drawn, kept for fading it in.
-    image: thumbnail::Image,
+    /// The image as drawn, kept for fading it in while the overview is
+    /// open. The terminal keeps its own copy after it closes.
+    image: Option<thumbnail::Image>,
     /// The opacity it was last uploaded at, in steps of [`OPACITY_STEPS`];
     /// None until it's been uploaded.
     opacity: Option<u8>,
@@ -54,14 +55,18 @@ impl Thumbnail {
         size: (u16, u16),
         opacity: f32,
     ) {
-        let step =
-            (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8;
+        let step = opacity_step(opacity);
         let uploading = self.opacity != Some(step);
         if uploading {
+            // Only a thumbnail parked with the overview closed has no image,
+            // and it's drawn again before it needs one.
+            let Some(image) = &self.image else {
+                return;
+            };
             if step == OPACITY_STEPS {
-                kitty::transmit(escapes, image_id, &self.image);
+                kitty::transmit(escapes, image_id, image);
             } else {
-                let faded = (self.image)
+                let faded = image
                     .with_opacity(f32::from(step) / f32::from(OPACITY_STEPS));
                 kitty::transmit(escapes, image_id, &faded);
             }
@@ -72,6 +77,11 @@ impl Thumbnail {
             self.size = size;
         }
     }
+}
+
+/// `opacity`, 0 to 1, as one of the few steps thumbnails are uploaded at.
+fn opacity_step(opacity: f32) -> u8 {
+    (opacity.clamp(0.0, 1.0) * f32::from(OPACITY_STEPS)).round() as u8
 }
 
 impl App {
@@ -85,6 +95,16 @@ impl Client {
     pub(super) fn clear_thumbnails(&mut self) {
         for (id, _) in self.thumbnails.drain() {
             kitty::delete(&mut self.escapes, image_id(id));
+        }
+    }
+
+    /// Keeps the thumbnails of panes that still exist in the terminal after
+    /// the overview closes, so opening it again only uploads those that
+    /// changed meanwhile. Their images can go: the terminal has them.
+    pub(super) fn park_thumbnails(&mut self, panes: &HashMap<PaneId, Pane>) {
+        self.retain_thumbnails(|id| panes.contains_key(id));
+        for thumb in self.thumbnails.values_mut() {
+            thumb.image = None;
         }
     }
 
@@ -118,7 +138,9 @@ impl Client {
         let image_id = image_id(id);
         let generation = pane.generation();
         let stale = self.thumbnails.get(&id).is_none_or(|t| {
-            t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL
+            (t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL)
+                // Parked, and wanted at another opacity than it was left at.
+                || (t.image.is_none() && t.opacity != Some(opacity_step(opacity)))
         });
         if stale {
             let image = thumbnail::rasterize(
@@ -139,7 +161,7 @@ impl Client {
                     size,
                     generation,
                     uploaded: now,
-                    image,
+                    image: Some(image),
                     opacity: None,
                 },
             );

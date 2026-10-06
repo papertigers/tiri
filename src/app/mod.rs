@@ -336,8 +336,11 @@ impl App {
     /// a pane's synchronized update timing out, a thumbnail due for a
     /// redraw, or a notice due to come down.
     pub fn next_deadline(&self, client: &Client) -> Option<Instant> {
-        let stale_thumbnails =
-            client.thumbnails.iter().filter_map(|(id, thumb)| {
+        // Parked thumbnails wait for the overview to open again.
+        let showing = self.showing_thumbnails(client);
+        let stale_thumbnails = (client.thumbnails.iter())
+            .filter(|_| showing)
+            .filter_map(|(id, thumb)| {
                 let pane = self.panes.get(id)?;
                 (pane.generation() != thumb.generation)
                     .then(|| thumb.uploaded + THUMBNAIL_INTERVAL)

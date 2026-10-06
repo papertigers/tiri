@@ -47,7 +47,7 @@ impl App {
             client.retain_thumbnails(|id| self.panes.contains_key(id));
             client.fade_thumbnails(opacity);
         } else {
-            client.clear_thumbnails();
+            client.park_thumbnails(&self.panes);
         }
 
         // Effects stay off while thumbnails show: they'd change the colors
@@ -68,10 +68,10 @@ impl App {
                 return (frame, None);
             }
             client.transition = None;
-            // Thumbnails kept for the overview going out can go now; no more
-            // frames may come to do it later.
+            // Thumbnails kept for the overview going out are parked now; no
+            // more frames may come to do it later.
             if !thumbnails {
-                client.clear_thumbnails();
+                client.park_thumbnails(&self.panes);
             }
         }
         (frame, cursor)

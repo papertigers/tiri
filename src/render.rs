@@ -11,6 +11,8 @@ use compact_str::CompactString;
 use crossterm::{QueueableCommand, cursor, style, terminal};
 use unicode_width::UnicodeWidthChar;
 
+use crate::kitty;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
     /// The outer terminal's own foreground or background.
@@ -181,9 +183,15 @@ impl Frame {
 /// Those blocks on (U+2600 up) hold emoji and wide scripts, which terminals
 /// size differently, as they do characters with marks or variation
 /// selectors attached. Letters, line drawing and block shapes are before.
+///
+/// So does a kitty graphics placeholder, marks and all: the protocol makes
+/// it one cell wide, and only terminals that speak it are sent any. An
+/// overview of thumbnails is thousands of them, and moving the cursor to
+/// each would double what they cost to send.
 fn advances_one(cell: &Cell) -> bool {
     let mut chars = cell.sym.chars();
     match (chars.next(), chars.next()) {
+        (Some(kitty::PLACEHOLDER), _) => !cell.wide,
         (Some(ch), None) => {
             !cell.wide && ch < '\u{2600}' && ch.width() == Some(1)
         }
@@ -398,6 +406,24 @@ mod tests {
         assert_eq!(change(colored, next), "\x1b[38;2;9;9;9m");
         assert_eq!(change(colored, plain), "\x1b[39;49;59m");
         assert_eq!(change(plain, plain), "");
+    }
+
+    #[test]
+    fn a_row_of_placeholders_needs_one_cursor_move() {
+        let mut frame = Frame::new(6, 1);
+        for col in 0..6 {
+            frame.put(
+                i32::from(col),
+                0,
+                &kitty::placeholder(0, col),
+                Style::default(),
+            );
+        }
+        let mut out = Vec::new();
+        Renderer::default().draw(&mut out, &[], frame, None).unwrap();
+        let moves = String::from_utf8(out).unwrap().matches("H").count();
+        // To the start of the row, and no more: before, one per cell.
+        assert_eq!(moves, 1);
     }
 
     #[test]
