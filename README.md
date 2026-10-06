@@ -8,7 +8,8 @@ endless strip that scrolls to keep the focused column on screen.
 Workspaces stack vertically above and below each other, and they keep
 running when you detach, like tmux sessions.
 
-![Three columns, the middle one with two panes stacked](docs/columns.png)
+![Two columns: Helix with two files side by side, and btop stacked above
+a shell](docs/columns.png)
 
 tiri runs on macOS and illumos. It should work on Linux too, but hasn't
 been tested there yet.
@@ -46,8 +47,8 @@ Run `tiri` again to attach. You can attach from several terminals at once.
 | **Named workspace** | A workspace you created with `tiri new <name>`. It stays even when empty, and `tiri attach <name>` takes you back to it. There's no way to rename or remove one yet; it lasts until the server stops. |
 | **Overview** | A zoomed-out view of every workspace and column, for finding and moving things. In terminals that can show images (kitty's graphics protocol, as in Ghostty and kitty), each pane is drawn as a picture of its screen. |
 
-![The overview: two workspaces, one above the other, each pane drawn as a
-picture of its screen](docs/overview.png)
+![The overview: a workspace of five columns, each pane drawn as a picture
+of its screen, with the empty workspace below](docs/overview.png)
 
 Unnamed workspaces come and go as needed: one disappears once it's empty
 and nobody is on it. There's always an empty workspace at the bottom,
