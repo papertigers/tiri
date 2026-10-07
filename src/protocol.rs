@@ -31,6 +31,9 @@ const LEN_PREFIX: usize = size_of::<u32>();
 pub const READ_CHUNK: usize = 64 * 1024;
 /// How much of a paste goes in one message.
 pub const PASTE_CHUNK: usize = 64 * 1024;
+/// The lines of history a pane's snapshot carries unless more are asked
+/// for.
+pub const SNAPSHOT_HISTORY: usize = 1000;
 
 /// Which workspace a client wants to land on when it attaches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +82,12 @@ pub enum ClientMsg {
     /// server, length prefixes included, since it connected. The server
     /// holds back panes' output from a client too far behind.
     Ack(u64),
+    /// Asks for pane `pane` again with up to `lines` lines of history, for
+    /// scrolling back past what the client's copy has.
+    History {
+        pane: PaneId,
+        lines: u32,
+    },
     /// The client is leaving; its panes keep running.
     Detach,
     /// Asks for the workspace list instead of attaching.
@@ -126,12 +135,20 @@ pub enum ServerMsg {
     Layout(Layout),
     /// Pane `pane`'s terminal, to start a copy from: output that rebuilds
     /// it in a fresh emulator `rows` by `cols`. Its output follows. Also
-    /// sent in place of output a client fell too far behind to be sent.
+    /// sent in place of output a client fell too far behind to be sent,
+    /// and in answer to [`ClientMsg::History`].
     PaneSnapshot {
         pane: PaneId,
         rows: u16,
         cols: u16,
         bytes: Vec<u8>,
+        /// Whether it has all the pane's history, or older lines are left
+        /// for [`ClientMsg::History`] to ask for.
+        complete: bool,
+        /// Whether it answers [`ClientMsg::History`]: the same terminal
+        /// as the client's copy, further back, so the client keeps its
+        /// place in it.
+        requested: bool,
     },
     /// What pane `pane`'s program wrote, in order.
     PaneOutput {

@@ -221,6 +221,38 @@ impl Client {
         }
     }
 
+    /// Moves this client's place in pane `id`, `lines` back, and its
+    /// selection there, to `pane`: a new copy of the same terminal, which
+    /// measures scrolling afresh. The selection must have followed the old
+    /// copy's output first.
+    pub(super) fn move_to_copy(
+        &mut self,
+        id: PaneId,
+        lines: usize,
+        pane: &PaneCopy,
+    ) {
+        let at = pane.emulator().scroll_mark();
+        if lines == 0 {
+            self.scrollback.remove(&id);
+        } else {
+            self.scrollback.insert(id, Scrollback { lines, at });
+        }
+        if let Some(selection) =
+            self.selection.as_mut().filter(|s| s.pane == id)
+        {
+            selection.at = at;
+        }
+    }
+
+    /// Forgets where this client was in pane `id`, and what it selected
+    /// there, for a copy that isn't the same terminal.
+    pub(super) fn forget_place(&mut self, id: PaneId) {
+        self.scrollback.remove(&id);
+        if self.selection.is_some_and(|s| s.pane == id) {
+            self.selection = None;
+        }
+    }
+
     /// Scrolls `pane` back by `lines` (forward if negative), returning to
     /// the live screen at the bottom.
     pub(super) fn scroll(&mut self, id: PaneId, pane: &PaneCopy, lines: i32) {
