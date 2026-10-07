@@ -57,12 +57,18 @@ pub struct Hello {
     pub cwd: Option<PathBuf>,
     /// The colors its terminal reported, for answering programs that ask.
     pub colors: ReportedColors,
+    /// Its ssh agent's socket, for programs in panes, if it has one there;
+    /// for a client on another machine, None, and the bridge says instead.
+    pub agent: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// The first message from an attaching client.
     Hello(Hello),
+    /// From `tiri bridge`, before it relays the client's hello: the ssh
+    /// agent ssh forwarded to it, if it did.
+    Agent(Option<PathBuf>),
     /// Bytes for pane `pane`'s program: typed, pasted, or a mouse report.
     /// None is whichever pane the client has focused when the server gets
     /// it, so keys typed just after a focus change follow it. Pastes come

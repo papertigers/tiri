@@ -170,6 +170,24 @@ Your terminal draws everything itself, animations included: the server
 sends only what programs in panes write and changes to the layout,
 compressed with zstd, so a slow link slows those and nothing else.
 
+### ssh agent
+
+Programs in panes use the ssh agent of the client you used last: the one
+that attached, typed or ran a command most recently. Every pane's
+`SSH_AUTH_SOCK` is a socket the server keeps beside its own, and it hands
+each connection on to that client's agent, so shells that were open long
+before you attached from somewhere new follow along, without re-reading
+anything. A shell startup file that sets `SSH_AUTH_SOCK` itself takes
+precedence; skip it inside tiri, where `$TIRI` is set.
+
+With `tiri connect`, the agent is the one ssh forwards, so turn forwarding
+on for that host in `~/.ssh/config`:
+
+```
+Host box
+    ForwardAgent yes
+```
+
 ## Config
 
 tiri reads `~/.config/tiri/config.kdl` (or

@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -91,6 +91,10 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
             target,
             cwd,
             colors: terminal_info.colors.clone(),
+            agent: match server {
+                Server::Local(_) => ssh_agent(),
+                Server::Remote { .. } => None,
+            },
         }),
     )
     .with_context(talking)?;
@@ -401,7 +405,9 @@ const NO_SERVER: &str = "no tiri server running";
 /// at `socket`, for a client on another machine connected through ssh,
 /// starting the server if none is running.
 pub fn bridge(socket: &Path) -> Result<()> {
-    let stream = connect_or_start(socket)?;
+    let mut stream = connect_or_start(socket)?;
+    // Before the client's hello, so it's known when the client attaches.
+    send(&mut stream, &ClientMsg::Agent(ssh_agent()))?;
     let mut to_server = stream.try_clone()?;
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut to_server);
@@ -428,6 +434,14 @@ pub fn bridge(socket: &Path) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// This process's ssh agent, as `$SSH_AUTH_SOCK` says: for a bridge, the
+/// one ssh forwarded, if it was asked to.
+fn ssh_agent() -> Option<PathBuf> {
+    std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Connects to a running server, or returns None if there isn't one.
