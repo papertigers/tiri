@@ -17,9 +17,9 @@ use crate::selection::{Point, Selection};
 /// top, or the rows around the cursor if the box is shorter (as in the
 /// overview), moved up by however far the client has scrolled back.
 pub(super) fn content_top(pane: &Pane, h: i32, scrolled: usize) -> i32 {
-    let (rows, _) = pane.size();
+    let (rows, _) = pane.emulator().size();
     let h = h.clamp(0, i32::from(rows)) as u16;
-    let (cursor_row, _) = pane.cursor();
+    let (cursor_row, _) = pane.emulator().cursor();
     let crop = (cursor_row + 1).saturating_sub(h).min(rows - h);
     i32::from(crop) - scrolled as i32
 }
@@ -40,7 +40,7 @@ pub(super) fn draw_screen(
     selection: Option<&Selection>,
     selection_bg: Option<Color>,
 ) {
-    let (rows, cols) = pane.size();
+    let (rows, cols) = pane.emulator().size();
     let w = w.clamp(0, i32::from(cols)) as u16;
     let h = h.clamp(0, i32::from(rows));
 
@@ -57,7 +57,7 @@ pub(super) fn draw_screen(
             {
                 continue;
             }
-            let cell = pane.cell(line, col);
+            let cell = pane.emulator().cell(line, col);
             let mut style = cell_style(pane, cell);
             if selection.is_some_and(|s| s.contains(id, Point { line, col })) {
                 match selection_bg {
@@ -127,10 +127,10 @@ fn term_color(pane: &Pane, color: TermColor) -> Color {
     match color {
         TermColor::Spec(c) => rgb(c),
         TermColor::Indexed(i) => {
-            pane.palette(usize::from(i)).map_or(Color::Idx(i), rgb)
+            pane.emulator().palette(usize::from(i)).map_or(Color::Idx(i), rgb)
         }
         TermColor::Named(n) => {
-            if let Some(c) = pane.palette(n as usize) {
+            if let Some(c) = pane.emulator().palette(n as usize) {
                 return rgb(c);
             }
             let idx = n as usize;

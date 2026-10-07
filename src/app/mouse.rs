@@ -118,8 +118,13 @@ impl App {
         mods: KeyModifiers,
     ) {
         if let Some(pane) = self.panes.get_mut(&id)
-            && let Some(bytes) =
-                encode_mouse(kind, col, row, mods, pane.mouse_modes())
+            && let Some(bytes) = encode_mouse(
+                kind,
+                col,
+                row,
+                mods,
+                pane.emulator().mouse_modes(),
+            )
         {
             pane.write(&bytes);
         }
@@ -197,16 +202,16 @@ impl App {
             return;
         };
         let up = event.kind == MouseEventKind::ScrollUp;
-        if pane.mouse_modes().any() {
+        if pane.emulator().mouse_modes().any() {
             if let Some((col, row, _)) = inner {
                 self.forward_mouse(id, event.kind, col, row, event.modifiers);
             }
-        } else if pane.alternate_scroll() {
+        } else if pane.emulator().alternate_scroll() {
             let arrow = KeyEvent::new(
                 if up { KeyCode::Up } else { KeyCode::Down },
                 KeyModifiers::NONE,
             );
-            let arrow = encode_key(arrow, pane.application_cursor());
+            let arrow = encode_key(arrow, pane.emulator().application_cursor());
             for _ in 0..WHEEL_LINES {
                 pane.write(&arrow);
             }
@@ -284,7 +289,7 @@ impl App {
                 let Some(pane) = self.panes.get(&id) else {
                     return;
                 };
-                if pane.mouse_modes().any() {
+                if pane.emulator().mouse_modes().any() {
                     self.forward_mouse(
                         id,
                         event.kind,
@@ -295,8 +300,12 @@ impl App {
                     client.drag = Drag::Forwarded(id);
                 } else {
                     let (anchor, head) = match clicks {
-                        DOUBLE_CLICK => selection::word_at(pane.term(), point),
-                        TRIPLE_CLICK => selection::line_at(pane.term(), point),
+                        DOUBLE_CLICK => {
+                            selection::word_at(pane.emulator().term(), point)
+                        }
+                        TRIPLE_CLICK => {
+                            selection::line_at(pane.emulator().term(), point)
+                        }
                         _ => (point, point),
                     };
                     client.drag =
@@ -305,7 +314,7 @@ impl App {
                         pane: id,
                         anchor,
                         head,
-                        at: pane.scroll_mark(),
+                        at: pane.emulator().scroll_mark(),
                     });
                 }
             }
@@ -400,7 +409,8 @@ impl App {
                 };
                 if let Some(pane) = self.panes.get(&id) {
                     let (start, end) = selection.bounds();
-                    let text = selection::text(pane.term(), start, end);
+                    let text =
+                        selection::text(pane.emulator().term(), start, end);
                     if !text.is_empty() {
                         client.copy(&text);
                     }

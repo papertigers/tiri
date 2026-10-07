@@ -9,8 +9,8 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 
+use crate::emulator::ScrollMark;
 use crate::layout::PaneId;
-use crate::pane::ScrollMark;
 
 /// A cell in a pane's content. Line 0 is the top of the live screen;
 /// negative lines are in its scrollback.

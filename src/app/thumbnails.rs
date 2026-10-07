@@ -178,7 +178,7 @@ impl Client {
     ) -> Option<Upload> {
         let pane = panes.get(&id)?;
         let image_id = image_id(id);
-        let generation = pane.generation();
+        let generation = pane.emulator().generation();
         let stale = self.thumbnails.get(&id).is_none_or(|t| {
             (t.generation != generation && now >= t.uploaded + THUMBNAIL_INTERVAL)
                 // Parked, and wanted at another opacity than it was left at.
@@ -186,7 +186,7 @@ impl Client {
         });
         if stale {
             let image = thumbnail::rasterize(
-                pane.term(),
+                pane.emulator().term(),
                 &self.palette,
                 self.thumbnail_cell,
             );
