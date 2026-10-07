@@ -19,7 +19,7 @@ use alacritty_terminal::term::{TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 
 use crate::escape;
-use crate::input::MouseModes;
+use crate::input::{KeyModes, MouseModes};
 use crate::snapshot::{self, Tracker};
 
 /// The most text a program may put on the clipboard with OSC 52.
@@ -119,9 +119,17 @@ impl Emulator {
     }
 
     /// The kitty keyboard protocol flags the program asked for, as the
-    /// protocol numbers them: how its keys are to be sent.
+    /// protocol numbers them.
     pub fn keyboard_flags(&self) -> u8 {
         snapshot::keyboard_flags(*self.term.mode())
+    }
+
+    /// How the program wants its keys sent.
+    pub fn key_modes(&self) -> KeyModes {
+        KeyModes {
+            application_cursor: self.application_cursor(),
+            keyboard: self.keyboard_flags(),
+        }
     }
 
     /// What the program asked to hear about the mouse.

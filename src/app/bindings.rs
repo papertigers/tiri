@@ -5,7 +5,7 @@
 //! What keys do: looking them up in the configured bindings, and running
 //! the actions they map to, here or on the server.
 
-use crossterm::event::{KeyEvent, KeyEventKind};
+use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::effects::Transition;
 use crate::input::encode_key;
@@ -20,14 +20,22 @@ impl App {
             return;
         }
         let key = Key::from_event(event);
+        // Bindings have Ctrl, Alt and Shift. Keys with Super and the like,
+        // which only terminals speaking the kitty keyboard protocol send,
+        // are the program's, not bindings missing those.
+        let bindable = !event.modifiers.intersects(
+            KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+        );
         let bindings = &self.config.bindings;
-        let is_prefix = key == bindings.prefix;
+        let is_prefix = bindable && key == bindings.prefix;
 
         let after_prefix = std::mem::take(&mut client.prefix_pending);
         let overview = self.workspaces.in_overview(client.id);
         let actions = match (after_prefix, is_prefix) {
             // Prefix twice types it, like any key not bound; see below.
             (true, true) => None,
+            // Unbound after the prefix, as any key that isn't a binding.
+            (true, false) if !bindable => return,
             // Holding Ctrl through, as in C-a C-n, works too.
             (true, false) => {
                 let actions = (bindings.prefix_binds.get(key))
@@ -40,6 +48,7 @@ impl App {
                 client.prefix_pending = true;
                 return;
             }
+            (false, false) if !bindable => None,
             (false, false) if overview => (bindings.overview_binds.get(key))
                 .or_else(|| bindings.binds.get(key)),
             (false, false) => bindings.binds.get(key),
@@ -59,9 +68,10 @@ impl App {
         }
         // The server sends it to whichever pane is focused when it arrives,
         // which a focus change on its way there may have moved.
-        let application_cursor = (self.focused_pane(client))
-            .is_some_and(|pane| pane.emulator().application_cursor());
-        let bytes = encode_key(event, application_cursor);
+        let modes = (self.focused_pane(client))
+            .map(|pane| pane.emulator().key_modes())
+            .unwrap_or_default();
+        let bytes = encode_key(event, modes);
         self.outbox.push(ClientMsg::Input { pane: None, bytes });
     }
 

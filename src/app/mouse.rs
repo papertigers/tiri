@@ -212,7 +212,7 @@ impl App {
                 if up { KeyCode::Up } else { KeyCode::Down },
                 KeyModifiers::NONE,
             );
-            let arrow = encode_key(arrow, pane.emulator().application_cursor());
+            let arrow = encode_key(arrow, pane.emulator().key_modes());
             let bytes = arrow.repeat(WHEEL_LINES as usize);
             self.outbox.push(ClientMsg::Input { pane: Some(id), bytes });
         } else {
