@@ -11,6 +11,8 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 
+use crate::escape::{CONTROL_MASK, CSI, DEL, ESC, SS3, csi};
+
 pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
     let alt = mods.contains(KeyModifiers::ALT);
@@ -20,7 +22,7 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     match key.code {
         KeyCode::Char(c) => {
             if alt {
-                out.push(0x1b);
+                out.push(ESC);
             }
             if ctrl && let Some(b) = ctrl_byte(c) {
                 out.push(b);
@@ -32,16 +34,16 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
         // Alt sends Escape first, for these as for characters.
         KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc => {
             if alt {
-                out.push(0x1b);
+                out.push(ESC);
             }
             out.push(match key.code {
                 KeyCode::Enter => b'\r',
                 KeyCode::Tab => b'\t',
-                KeyCode::Backspace => 0x7f,
-                _ => 0x1b,
+                KeyCode::Backspace => DEL,
+                _ => ESC,
             });
         }
-        KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
+        KeyCode::BackTab => out.extend_from_slice(csi!("Z").as_bytes()),
         KeyCode::Up => cursor_key(&mut out, b'A', mods, application_cursor),
         KeyCode::Down => cursor_key(&mut out, b'B', mods, application_cursor),
         KeyCode::Right => cursor_key(&mut out, b'C', mods, application_cursor),
@@ -73,25 +75,38 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     out
 }
 
+/// The control character Ctrl+`c` sends, if any: `c`'s code with all but
+/// the low bits cleared, so Ctrl+A is 1 and Ctrl+[ is Escape.
 fn ctrl_byte(c: char) -> Option<u8> {
-    match c.to_ascii_lowercase() {
-        c @ 'a'..='z' => Some(c as u8 - b'a' + 1),
-        ' ' | '@' | '2' => Some(0),
-        '[' | '3' => Some(0x1b),
-        '\\' | '4' => Some(0x1c),
-        ']' | '5' => Some(0x1d),
-        '^' | '6' => Some(0x1e),
-        '_' | '-' | '/' | '7' => Some(0x1f),
-        '?' | '8' => Some(0x7f),
-        _ => None,
-    }
+    // Terminals also take a few keys for the punctuation that's hard to
+    // type with Ctrl: Ctrl+2 for Ctrl+@, Ctrl+3 for Ctrl+[, and so on.
+    let c = match c.to_ascii_lowercase() {
+        ' ' | '2' => '@',
+        '3' => '[',
+        '4' => '\\',
+        '5' => ']',
+        '6' => '^',
+        '-' | '/' | '7' => '_',
+        '?' | '8' => return Some(DEL),
+        c => c,
+    };
+    matches!(c, '@' | 'a'..='z' | '[' | '\\' | ']' | '^' | '_')
+        .then(|| c as u8 & CONTROL_MASK)
 }
 
-/// xterm's modifier parameter: 1 + shift + 2*alt + 4*ctrl.
+/// xterm's modifier parameter for keys: one more than the sum of these.
+const KEY_SHIFT: u8 = 1;
+const KEY_ALT: u8 = 2;
+const KEY_CTRL: u8 = 4;
+/// The modifier parameter for no modifiers, which goes unsaid.
+const NO_MODIFIERS: u8 = 1;
+
 fn modifier_param(mods: KeyModifiers) -> u8 {
-    1 + u8::from(mods.contains(KeyModifiers::SHIFT))
-        + 2 * u8::from(mods.contains(KeyModifiers::ALT))
-        + 4 * u8::from(mods.contains(KeyModifiers::CONTROL))
+    let has = |m| u8::from(mods.contains(m));
+    NO_MODIFIERS
+        + KEY_SHIFT * has(KeyModifiers::SHIFT)
+        + KEY_ALT * has(KeyModifiers::ALT)
+        + KEY_CTRL * has(KeyModifiers::CONTROL)
 }
 
 fn cursor_key(
@@ -101,17 +116,18 @@ fn cursor_key(
     application: bool,
 ) {
     match modifier_param(mods) {
-        1 if application => out.extend_from_slice(b"\x1bO"),
-        1 => out.extend_from_slice(b"\x1b["),
-        m => write!(out, "\x1b[1;{m}").expect("writing to memory can't fail"),
+        NO_MODIFIERS if application => out.extend_from_slice(SS3.as_bytes()),
+        NO_MODIFIERS => out.extend_from_slice(CSI.as_bytes()),
+        m => write!(out, "{CSI}{NO_MODIFIERS};{m}")
+            .expect("writing to memory can't fail"),
     }
     out.push(final_byte);
 }
 
 fn tilde_key(out: &mut Vec<u8>, code: u8, mods: KeyModifiers) {
     match modifier_param(mods) {
-        1 => write!(out, "\x1b[{code}~"),
-        m => write!(out, "\x1b[{code};{m}~"),
+        NO_MODIFIERS => write!(out, "{CSI}{code}~"),
+        m => write!(out, "{CSI}{code};{m}~"),
     }
     .expect("writing to memory can't fail");
 }
@@ -137,6 +153,32 @@ impl MouseModes {
     }
 }
 
+// xterm's mouse protocol: an event is a code, the button's or wheel's plus
+// modifier and motion bits, and a position counted from 1.
+const LEFT_BUTTON: u32 = 0;
+const MIDDLE_BUTTON: u32 = 1;
+const RIGHT_BUTTON: u32 = 2;
+/// No button: movement with none held, and in the older encodings, which
+/// can't say which was let go, any release.
+const NO_BUTTON: u32 = 3;
+/// The low bits that hold the button, below the modifier and motion bits.
+const BUTTON_BITS: u32 = 3;
+/// Added for movement rather than a press.
+const MOTION: u32 = 32;
+/// The wheel's codes, one for each way it turns.
+const WHEEL_UP: u32 = 64;
+const WHEEL_DOWN: u32 = 65;
+const WHEEL_LEFT: u32 = 66;
+const WHEEL_RIGHT: u32 = 67;
+const MOUSE_SHIFT: u32 = 4;
+const MOUSE_ALT: u32 = 8;
+const MOUSE_CTRL: u32 = 16;
+/// The older encodings add this to every value, keeping them printable.
+const LEGACY_OFFSET: u32 = 32;
+/// The SGR encoding's final character for a press, and for a release.
+const SGR_PRESS: char = 'M';
+const SGR_RELEASE: char = 'm';
+
 /// Encodes a mouse event at (`col`, `row`), zero-based within the pane, the
 /// way the pane's program asked for. None if it didn't ask for this kind of
 /// event, or the position can't be expressed in its encoding.
@@ -151,39 +193,41 @@ pub fn encode_mouse(
         return None;
     }
     let button = |b: MouseButton| match b {
-        MouseButton::Left => 0,
-        MouseButton::Middle => 1,
-        MouseButton::Right => 2,
+        MouseButton::Left => LEFT_BUTTON,
+        MouseButton::Middle => MIDDLE_BUTTON,
+        MouseButton::Right => RIGHT_BUTTON,
     };
     let (mut code, release) = match kind {
         MouseEventKind::Down(b) => (button(b), false),
         MouseEventKind::Up(b) => (button(b), true),
         MouseEventKind::Drag(b) if modes.drag || modes.motion => {
-            (button(b) + 32, false)
+            (button(b) + MOTION, false)
         }
-        MouseEventKind::Moved if modes.motion => (3 + 32, false),
-        MouseEventKind::ScrollUp => (64, false),
-        MouseEventKind::ScrollDown => (65, false),
-        MouseEventKind::ScrollLeft => (66, false),
-        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved if modes.motion => (NO_BUTTON + MOTION, false),
+        MouseEventKind::ScrollUp => (WHEEL_UP, false),
+        MouseEventKind::ScrollDown => (WHEEL_DOWN, false),
+        MouseEventKind::ScrollLeft => (WHEEL_LEFT, false),
+        MouseEventKind::ScrollRight => (WHEEL_RIGHT, false),
         _ => return None,
     };
-    code += 4 * u32::from(mods.contains(KeyModifiers::SHIFT))
-        + 8 * u32::from(mods.contains(KeyModifiers::ALT))
-        + 16 * u32::from(mods.contains(KeyModifiers::CONTROL));
+    let has = |m| u32::from(mods.contains(m));
+    code += MOUSE_SHIFT * has(KeyModifiers::SHIFT)
+        + MOUSE_ALT * has(KeyModifiers::ALT)
+        + MOUSE_CTRL * has(KeyModifiers::CONTROL);
+    // Positions count from 1.
     let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
 
     if modes.sgr {
-        let end = if release { 'm' } else { 'M' };
-        return Some(format!("\x1b[<{code};{x};{y}{end}").into_bytes());
+        let end = if release { SGR_RELEASE } else { SGR_PRESS };
+        return Some(format!("{CSI}<{code};{x};{y}{end}").into_bytes());
     }
     // The older encodings can't say which button was released.
     if release {
-        code = 3 + (code & !3);
+        code = NO_BUTTON + (code & !BUTTON_BITS);
     }
-    let mut out = b"\x1b[M".to_vec();
+    let mut out = csi!("M").as_bytes().to_vec();
     for value in [code, x, y] {
-        let value = value + 32;
+        let value = value + LEGACY_OFFSET;
         if modes.utf8 {
             let mut buf = [0u8; 4];
             out.extend_from_slice(

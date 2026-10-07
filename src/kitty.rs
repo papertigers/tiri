@@ -13,8 +13,26 @@ use std::io::Write as _;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::escape::{ST, apc};
 use crate::render::{Color, Frame};
 use crate::thumbnail::Image;
+
+/// What starts every graphics command: its keys, then `;`, any payload, and
+/// [`ST`].
+const COMMAND: &str = apc!("G");
+/// q=2: the terminal answers nothing, errors included. Answers would arrive
+/// as input, typed into the pane.
+const QUIET: u8 = 2;
+/// f=: images are sent as 32-bit RGBA pixels, or 24-bit RGB.
+const RGBA: u8 = 32;
+const RGB: u8 = 24;
+/// U=1: a virtual placement, shown through [`PLACEHOLDER`] cells.
+const VIRTUAL: u8 = 1;
+
+/// The image id of the query asking whether a terminal supports graphics.
+const QUERY_ID: u32 = 31;
+/// The query's image: one black pixel, in base64.
+const QUERY_PIXEL: &str = "AAAA";
 
 /// A cell showing part of an image. The image id is carried in the cell's
 /// foreground color, and which part of the image in two combining marks.
@@ -433,19 +451,19 @@ pub fn transmit_compressed(out: &mut Vec<u8>, id: u32, image: &Compressed) {
     let chunks = payload.as_bytes().chunks(CHUNK);
     let last = chunks.len().saturating_sub(1);
     for (n, chunk) in chunks.enumerate() {
-        out.extend_from_slice(b"\x1b_G");
+        out.extend_from_slice(COMMAND.as_bytes());
         if n == 0 {
             let (width, height) = (image.width, image.height);
-            write!(out, "a=t,f=32,o=z,s={width},v={height},i={id},")
+            write!(out, "a=t,f={RGBA},o=z,s={width},v={height},i={id},")
                 .expect("writing to memory can't fail");
         }
-        // q=2 keeps the terminal from replying; replies would arrive as
-        // input. It's on every chunk, since terminals differ on which
-        // chunk's they go by.
+        // Quiet on every chunk, since terminals differ on which chunk's
+        // they go by.
         let more = u8::from(n < last);
-        write!(out, "q=2,m={more};").expect("writing to memory can't fail");
+        write!(out, "q={QUIET},m={more};")
+            .expect("writing to memory can't fail");
         out.extend_from_slice(chunk);
-        out.extend_from_slice(b"\x1b\\");
+        out.extend_from_slice(ST.as_bytes());
     }
 }
 
@@ -462,14 +480,32 @@ pub fn transmit_compressed(out: &mut Vec<u8>, id: u32, image: &Compressed) {
 /// iTerm2 treats them as global, so images sharing one would take each
 /// other's placement there. Placeholders name it in their underline color.
 pub fn place(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
-    write!(out, "\x1b_Ga=p,U=1,i={id},p={id},c={cols},r={rows},q=2\x1b\\")
-        .expect("writing to memory can't fail");
+    write!(
+        out,
+        "{COMMAND}a=p,U={VIRTUAL},i={id},p={id},c={cols},r={rows},q={QUIET}{ST}"
+    )
+    .expect("writing to memory can't fail");
 }
 
 /// Frees image `id` and its placements.
 pub fn delete(out: &mut Vec<u8>, id: u32) {
-    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+    write!(out, "{COMMAND}a=d,d=I,i={id},q={QUIET}{ST}")
         .expect("writing to memory can't fail");
+}
+
+/// Asks whether the terminal supports graphics, with a one-pixel image it
+/// checks but doesn't keep. One that does answers as [`supported`] spots.
+pub fn query(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    write!(
+        out,
+        "{COMMAND}i={QUERY_ID},s=1,v=1,a=q,t=d,f={RGB};{QUERY_PIXEL}{ST}"
+    )
+}
+
+/// Whether a terminal's `answers` say it supports graphics: an OK to the
+/// [`query`].
+pub fn supported(answers: &str) -> bool {
+    answers.contains(&format!("{COMMAND}i={QUERY_ID};OK"))
 }
 
 #[cfg(test)]

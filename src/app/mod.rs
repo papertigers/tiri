@@ -28,6 +28,7 @@ use portable_pty::Child;
 use crate::colors::Palette;
 use crate::config::Config;
 use crate::effects::Effects;
+use crate::escape;
 use crate::layout::{MIN_PANE_HEIGHT, PaneId};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
@@ -417,7 +418,7 @@ impl App {
                 };
                 let bracketed = pane.bracketed_paste();
                 if bracketed {
-                    pane.write(b"\x1b[200~");
+                    pane.write(escape::PASTE_START.as_bytes());
                 }
                 Paste { pane: id, bracketed }
             }
@@ -429,7 +430,7 @@ impl App {
         };
         pane.write(text.as_bytes());
         if last && paste.bracketed {
-            pane.write(b"\x1b[201~");
+            pane.write(escape::PASTE_END.as_bytes());
         }
     }
 

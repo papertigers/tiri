@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
 
+use crate::escape;
 use crate::input;
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
@@ -132,7 +133,7 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
 /// would end the program's bracketed paste early, and what followed would
 /// arrive as if typed.
 fn paste_messages(text: &str) -> impl Iterator<Item = ClientMsg> {
-    let mut rest = text.replace("\x1b[201~", "");
+    let mut rest = text.replace(escape::PASTE_END, "");
     let mut done = false;
     std::iter::from_fn(move || {
         if done {

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::colors::Palette;
 use crate::effects::{Effects, Transition};
+use crate::escape;
 use crate::layout::PaneId;
 use crate::pane::{Pane, ScrollMark};
 use crate::render::{Frame, Renderer};
@@ -158,8 +159,7 @@ impl Client {
     pub fn copy(&mut self, text: &str) {
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-        write!(self.escapes, "\x1b]52;c;{encoded}\x07")
-            .expect("writing to memory can't fail");
+        escape::set_clipboard(&mut self.escapes, &encoded);
     }
 
     /// How many lines back this client is scrolled in `pane`. Output since

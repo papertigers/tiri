@@ -11,6 +11,7 @@ use compact_str::CompactString;
 use crossterm::{QueueableCommand, cursor, style, terminal};
 use unicode_width::UnicodeWidthChar;
 
+use crate::escape::{CSI, sgr};
 use crate::kitty;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -334,48 +335,71 @@ fn change_style(
     from: Style,
     to: Style,
 ) -> io::Result<()> {
+    use std::fmt::Write as _;
     let mut params = String::new();
-    let mut add = |param: &str| {
+    let mut add = |param: std::fmt::Arguments| {
         if !params.is_empty() {
             params.push(';');
         }
-        params.push_str(param);
+        params.write_fmt(param).expect("writing to a string can't fail");
     };
     // One code turns off both bold and dim, so the one staying goes back on.
     let bold_or_dim_off = (from.bold && !to.bold) || (from.dim && !to.dim);
     if bold_or_dim_off {
-        add("22");
+        add(format_args!("{}", sgr::NORMAL_INTENSITY));
     }
     for (was, is, on, off) in [
-        (from.bold && !bold_or_dim_off, to.bold, "1", ""),
-        (from.dim && !bold_or_dim_off, to.dim, "2", ""),
-        (from.italic, to.italic, "3", "23"),
-        (from.underline, to.underline, "4", "24"),
-        (from.inverse, to.inverse, "7", "27"),
-        (from.strikeout, to.strikeout, "9", "29"),
+        (from.bold && !bold_or_dim_off, to.bold, sgr::BOLD, None),
+        (from.dim && !bold_or_dim_off, to.dim, sgr::DIM, None),
+        (from.italic, to.italic, sgr::ITALIC, Some(sgr::NOT_ITALIC)),
+        (
+            from.underline,
+            to.underline,
+            sgr::UNDERLINE,
+            Some(sgr::NOT_UNDERLINED),
+        ),
+        (from.inverse, to.inverse, sgr::INVERSE, Some(sgr::NOT_INVERSE)),
+        (
+            from.strikeout,
+            to.strikeout,
+            sgr::STRIKEOUT,
+            Some(sgr::NOT_STRIKEOUT),
+        ),
     ] {
-        if was != is {
-            add(if is { on } else { off });
+        // Bold and dim have no codes of their own to turn off: they went
+        // with the one above.
+        match (was != is, is, off) {
+            (true, true, _) => add(format_args!("{on}")),
+            (true, false, Some(off)) => add(format_args!("{off}")),
+            _ => {}
         }
     }
-    for (was, is, base) in [
-        (from.fg, to.fg, 38),
-        (from.bg, to.bg, 48),
-        (from.underline_color, to.underline_color, 58),
+    for (was, is, code, default) in [
+        (from.fg, to.fg, sgr::FOREGROUND, sgr::DEFAULT_FOREGROUND),
+        (from.bg, to.bg, sgr::BACKGROUND, sgr::DEFAULT_BACKGROUND),
+        (
+            from.underline_color,
+            to.underline_color,
+            sgr::UNDERLINE_COLOR,
+            sgr::DEFAULT_UNDERLINE_COLOR,
+        ),
     ] {
         if was != is {
-            add(&match is {
-                // 39, 49 and 59.
-                Color::Default => format!("{}", base + 1),
-                Color::Idx(i) => format!("{base};5;{i}"),
-                Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
-            });
+            match is {
+                Color::Default => add(format_args!("{default}")),
+                Color::Idx(i) => {
+                    add(format_args!("{code};{};{i}", sgr::INDEXED));
+                }
+                Color::Rgb(r, g, b) => {
+                    add(format_args!("{code};{};{r};{g};{b}", sgr::RGB));
+                }
+            }
         }
     }
     if params.is_empty() {
         return Ok(());
     }
-    write!(out, "\x1b[{params}m")
+    write!(out, "{CSI}{params}{}", sgr::FINAL)
 }
 
 #[cfg(test)]

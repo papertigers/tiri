@@ -7,6 +7,7 @@ mod client;
 mod colors;
 mod config;
 mod effects;
+mod escape;
 mod input;
 mod keys;
 mod kitty;
