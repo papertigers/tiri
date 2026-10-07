@@ -223,29 +223,22 @@ fn run(
     trace: Option<&mut Trace>,
 ) -> Result<ExitReason> {
     let mut stdout = Traced::new(io::stdout().lock(), trace);
-    let mut animating = false;
-    let mut dirty = true;
-    let mut last_tick = Instant::now();
-    let mut last_draw = last_tick - FRAME;
+    let mut pacing = Pacing::new(Instant::now());
     // What the server's been told this client has taken in, and what it
     // has.
     let (mut acked, mut taken) = (0, 0);
     loop {
         // Wake for the next frame, if one's owed, or anything else due.
-        let next_frame = (dirty || animating).then(|| last_draw + FRAME);
-        let deadline =
-            [next_frame, app.next_deadline(client)].into_iter().flatten().min();
+        let deadline = [pacing.next_frame(), app.next_deadline(client)]
+            .into_iter()
+            .flatten()
+            .min();
         let first = match deadline {
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(Instant::now());
                 match incoming.recv_timeout(wait) {
                     Ok(incoming) => Some(incoming),
-                    // Whatever was due changes the screen: an animation's
-                    // next step (its last included, which ends it), a
-                    // pane's update showing, or a notice going. So a frame
-                    // is owed, even if it's too soon to draw one now.
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        dirty = true;
                         if let Some(trace) = stdout.trace() {
                             trace.note("woke: something due");
                         }
@@ -258,9 +251,9 @@ fn run(
             }
             None => Some(incoming.recv()?),
         };
+        pacing.woke();
         // Everything waiting goes in before the next frame.
         for incoming in first.into_iter().chain(incoming.try_iter()) {
-            dirty = true;
             if let Some(trace) = stdout.trace()
                 && let Some(note) = describe(&incoming)
             {
@@ -309,31 +302,84 @@ fn run(
 
         let now = Instant::now();
         app.expire_syncs(now);
-        // Don't let a long idle wait turn into one giant animation step.
-        let dt = if animating { now - last_tick } else { Duration::ZERO };
-        last_tick = now;
         // Effects and fades run on frames as animations do.
-        animating = app.tick(dt.max(Duration::from_millis(1)))
-            || client.effects_running();
-        let draw = (dirty || animating) && now >= last_draw + FRAME;
+        let animating = app.tick(pacing.step(now)) || client.effects_running();
+        let draw = pacing.draw_now(now, animating);
         if let Some(trace) = stdout.trace() {
             let (y, active) = app.slide();
             trace.note(format_args!(
                 "tick: y {y:.4} heading for {active}, animating {animating}, \
-                 dirty {dirty}, {}",
+                 {}",
                 if draw { "drawing" } else { "not drawing" }
             ));
         }
         if !draw {
-            // Nothing to draw, or too soon after the last frame: the next
+            // Too soon after the last frame, or nothing to draw: the next
             // comes when it's due.
             continue;
         }
         let (frame, cursor) = app.draw(client);
         client.render(&mut stdout, frame, cursor)?;
         stdout.flush()?;
-        last_draw = now;
-        dirty = false;
+        pacing.drew(now);
+    }
+}
+
+/// When the client draws: whenever what's on screen may have changed, but
+/// no sooner than [`FRAME`] after the last time, so a flood of output or a
+/// fast animation costs one frame per [`FRAME`] at most.
+struct Pacing {
+    /// Something has changed since the last frame.
+    dirty: bool,
+    /// Something was still moving after the last step.
+    animating: bool,
+    last_step: Instant,
+    last_draw: Instant,
+}
+
+impl Pacing {
+    fn new(now: Instant) -> Self {
+        Self {
+            dirty: true,
+            animating: false,
+            last_step: now,
+            last_draw: now - FRAME,
+        }
+    }
+
+    /// When the next frame is due, if one is owed.
+    fn next_frame(&self) -> Option<Instant> {
+        (self.dirty || self.animating).then(|| self.last_draw + FRAME)
+    }
+
+    /// The client woke. Whatever woke it changes the screen: a message, a
+    /// key, or something that came due, like an animation's next step (its
+    /// last included, which ends it), a pane's update showing or a notice
+    /// going. So a frame is owed, even if it's too soon to draw one now.
+    fn woke(&mut self) {
+        self.dirty = true;
+    }
+
+    /// How far to move animations on at `now`: the time since the last
+    /// step while they're moving, and a moment for one that's starting,
+    /// not the whole idle wait before it.
+    fn step(&mut self, now: Instant) -> Duration {
+        let dt =
+            if self.animating { now - self.last_step } else { Duration::ZERO };
+        self.last_step = now;
+        dt.max(Duration::from_millis(1))
+    }
+
+    /// Whether to draw at `now`, `animating` being whether anything still
+    /// moves after this step.
+    fn draw_now(&mut self, now: Instant, animating: bool) -> bool {
+        self.animating = animating;
+        (self.dirty || animating) && now >= self.last_draw + FRAME
+    }
+
+    fn drew(&mut self, now: Instant) {
+        self.last_draw = now;
+        self.dirty = false;
     }
 }
 
@@ -671,4 +717,74 @@ fn restore() {
     let _ = out.execute(cursor::Show);
     let _ = terminal::disable_raw_mode();
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wakes `pacing` at `now`, as the client's loop does, with animations
+    /// still moving after the step or not. Returns whether it drew.
+    fn wake(pacing: &mut Pacing, now: Instant, animating: bool) -> bool {
+        pacing.woke();
+        pacing.step(now);
+        let draw = pacing.draw_now(now, animating);
+        if draw {
+            pacing.drew(now);
+        }
+        draw
+    }
+
+    #[test]
+    fn the_last_step_of_an_animation_is_drawn() {
+        let t0 = Instant::now();
+        let mut pacing = Pacing::new(t0);
+        assert!(wake(&mut pacing, t0, true));
+        // The next frame's due, and that step ends the animation: it's
+        // drawn all the same, or the screen stays a step short.
+        assert_eq!(pacing.next_frame(), Some(t0 + FRAME));
+        assert!(wake(&mut pacing, t0 + FRAME, false));
+        assert_eq!(pacing.next_frame(), None, "then nothing's owed");
+    }
+
+    #[test]
+    fn an_animation_ending_between_frames_is_drawn_at_the_next() {
+        let t0 = Instant::now();
+        let mut pacing = Pacing::new(t0);
+        assert!(wake(&mut pacing, t0, true));
+        // Something else comes due just after a frame, and the step then
+        // ends the animation: too soon to draw, so a frame is still owed.
+        let early = t0 + FRAME / 4;
+        assert!(!wake(&mut pacing, early, false));
+        assert_eq!(pacing.next_frame(), Some(t0 + FRAME));
+        assert!(wake(&mut pacing, t0 + FRAME, false));
+        assert_eq!(pacing.next_frame(), None);
+    }
+
+    #[test]
+    fn frames_are_a_frame_apart_however_often_it_wakes() {
+        let t0 = Instant::now();
+        let mut pacing = Pacing::new(t0);
+        let mut drawn = Vec::new();
+        for ms in 0..64 {
+            let now = t0 + Duration::from_millis(ms);
+            if wake(&mut pacing, now, true) {
+                drawn.push(ms);
+            }
+        }
+        assert_eq!(drawn, [0, 16, 32, 48]);
+    }
+
+    #[test]
+    fn animations_start_from_a_moment_not_the_idle_wait() {
+        let t0 = Instant::now();
+        let mut pacing = Pacing::new(t0);
+        wake(&mut pacing, t0, false);
+        // Idle a minute, then something starts moving.
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(pacing.step(later), Duration::from_millis(1));
+        pacing.draw_now(later, true);
+        let next = later + Duration::from_millis(10);
+        assert_eq!(pacing.step(next), Duration::from_millis(10));
+    }
 }
