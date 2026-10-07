@@ -66,6 +66,8 @@ pub mod osc_code {
     pub const BACKGROUND: u16 = 11;
     /// A palette color: its index, then the color or `?`.
     pub const PALETTE: u16 = 4;
+    /// The cursor's color, likewise.
+    pub const CURSOR: u16 = 12;
     /// Sets a selection: which (`c`, the clipboard), then base64 text.
     pub const CLIPBOARD: u16 = 52;
 }
@@ -128,6 +130,7 @@ pub mod sgr {
     pub const ITALIC: u8 = 3;
     pub const UNDERLINE: u8 = 4;
     pub const INVERSE: u8 = 7;
+    pub const HIDDEN: u8 = 8;
     pub const STRIKEOUT: u8 = 9;
     /// Neither bold nor dim: one code turns off both.
     pub const NORMAL_INTENSITY: u8 = 22;
@@ -144,33 +147,143 @@ pub mod sgr {
     /// An underline color follows, likewise.
     pub const UNDERLINE_COLOR: u8 = 58;
     pub const DEFAULT_UNDERLINE_COLOR: u8 = 59;
+    /// The basic colors' own codes: the first eight added to these, for
+    /// text and background, and the bright eight to the others.
+    pub const BASIC_FOREGROUND: u8 = 30;
+    pub const BASIC_BACKGROUND: u8 = 40;
+    pub const BRIGHT_FOREGROUND: u8 = 90;
+    pub const BRIGHT_BACKGROUND: u8 = 100;
+    /// How many colors each of those runs covers.
+    pub const BASIC_COLORS: u8 = 8;
     /// After a color code: a palette index follows.
     pub const INDEXED: u8 = 5;
     /// After a color code: red, green and blue follow.
     pub const RGB: u8 = 2;
     /// The final character of an SGR sequence.
     pub const FINAL: char = 'm';
+
+    /// Underline styles, after [`UNDERLINE`] and a colon.
+    pub mod underline {
+        pub const SINGLE: u8 = 1;
+        pub const DOUBLE: u8 = 2;
+        pub const CURLY: u8 = 3;
+        pub const DOTTED: u8 = 4;
+        pub const DASHED: u8 = 5;
+    }
 }
 
 /// Private modes, turned on with [`decset`] and off with [`decrst`].
 pub mod mode {
-    /// Mouse reporting of presses, releases, and movement while a button is
-    /// held. 1000, 1002 and 1003 are one setting with three values.
+    /// Cursor keys send application sequences.
+    pub const APP_CURSOR: u16 = 1;
+    /// The cursor goes relative to the scroll region.
+    pub const ORIGIN: u16 = 6;
+    /// Text wraps at the right edge.
+    pub const LINE_WRAP: u16 = 7;
+    pub const SHOW_CURSOR: u16 = 25;
+    /// Mouse reporting of presses and releases. 1000, 1002 and 1003 are one
+    /// setting with three values.
+    pub const NORMAL_MOUSE: u16 = 1000;
+    /// Mouse reporting of movement while a button is held too.
     pub const BUTTON_EVENT_MOUSE: u16 = 1002;
     /// Mouse reporting of every movement too.
     pub const ANY_EVENT_MOUSE: u16 = 1003;
-    /// Mouse reports in SGR's encoding, separate from what's reported.
+    /// Reports of the terminal gaining and losing focus.
+    pub const FOCUS_EVENTS: u16 = 1004;
+    /// Mouse reports in UTF-8's encoding. Encodings are separate from what's
+    /// reported, and one setting with each other.
+    pub const UTF8_MOUSE: u16 = 1005;
+    /// Mouse reports in SGR's encoding.
     pub const SGR_MOUSE: u16 = 1006;
+    /// The wheel sends arrow keys on the alternate screen.
+    pub const ALTERNATE_SCROLL: u16 = 1007;
+    /// A bell marks the window urgent.
+    pub const URGENCY_HINTS: u16 = 1042;
+    /// The alternate screen, saving the cursor on the way in and restoring
+    /// it on the way out.
+    pub const ALT_SCREEN: u16 = 1049;
+    pub const BRACKETED_PASTE: u16 = 2004;
+}
+
+/// ANSI (not private) modes, turned on and off with [`set_ansi_mode`].
+pub mod ansi_mode {
+    /// IRM: written text pushes what's after it along.
+    pub const INSERT: u16 = 4;
+    /// LNM: a line feed returns the cursor to the line's start too.
+    pub const NEWLINE: u16 = 20;
+}
+
+/// SM or RM: turns ANSI mode `mode` on or off.
+pub fn set_ansi_mode(out: &mut Vec<u8>, mode: u16, on: bool) {
+    let end = if on { MODE_ON } else { MODE_OFF };
+    write!(out, "{CSI}{mode}{end}").expect("writing to memory can't fail");
+}
+
+/// The final characters that turn a mode on and off.
+const MODE_ON: char = 'h';
+const MODE_OFF: char = 'l';
+
+/// SO and SI: map output through character set G1, or back to G0.
+pub const SHIFT_OUT: u8 = 0x0e;
+pub const SHIFT_IN: u8 = 0x0f;
+/// RIS, after [`ESC`]: resets everything.
+pub const RESET: u8 = b'c';
+/// DECSC, after [`ESC`]: saves the cursor, its pen and character sets.
+pub const SAVE_CURSOR: u8 = b'7';
+/// DECRC, after [`ESC`]: restores what [`SAVE_CURSOR`] saved.
+pub const RESTORE_CURSOR: u8 = b'8';
+/// DECKPAM and DECKPNM, after [`ESC`]: the keypad sends application
+/// sequences, or not.
+pub const KEYPAD_APPLICATION: u8 = b'=';
+pub const KEYPAD_NUMERIC: u8 = b'>';
+/// After [`ESC`], designates a character set as G0 to G3.
+pub const DESIGNATE: [u8; 4] = *b"()*+";
+/// After a [`DESIGNATE`]: plain ASCII, or DEC's line drawing.
+pub const CHARSET_ASCII: u8 = b'B';
+pub const CHARSET_LINE_DRAWING: u8 = b'0';
+/// DECSTBM with no rows given: the scroll region back to the whole screen.
+pub const RESET_SCROLL_REGION: &str = csi!("r");
+/// DECSTBM's final character: sets the scroll region, top;bottom.
+pub const SET_SCROLL_REGION: char = 'r';
+/// CUP's final character: moves the cursor to row;column, from 1.
+pub const CURSOR_POSITION: char = 'H';
+/// CUU's final character: moves the cursor up so many rows.
+pub const CURSOR_UP: char = 'A';
+/// CUD's final character: moves the cursor down so many rows.
+pub const CURSOR_DOWN: char = 'B';
+/// CHA's final character: moves the cursor to a column, from 1.
+pub const CURSOR_COLUMN: char = 'G';
+/// ICH's final character: inserts so many blank cells at the cursor,
+/// pushing the rest of the line along and off its end.
+pub const INSERT_CHARACTERS: char = '@';
+/// DCH's final character: deletes so many cells at the cursor, pulling
+/// the rest of the line back.
+pub const DELETE_CHARACTERS: char = 'P';
+/// ECH's final character: clears so many cells from the cursor, in the
+/// pen's background.
+pub const ERASE_CHARACTERS: char = 'X';
+/// EL: clears from the cursor to the end of its line, in the pen's
+/// background.
+pub const CLEAR_TO_LINE_END: &str = csi!("K");
+
+/// DECSCUSR, after its number: sets the cursor's shape. Each shape's number
+/// blinks; the next one up is the same shape, steady.
+pub const CURSOR_STYLE: &str = " q";
+pub mod cursor_shape {
+    pub const BLOCK: u8 = 1;
+    pub const UNDERLINE: u8 = 3;
+    pub const BEAM: u8 = 5;
 }
 
 /// DECSET: turns private mode `mode` on.
 pub fn decset(out: &mut Vec<u8>, mode: u16) {
-    write!(out, "{CSI}?{mode}h").expect("writing to memory can't fail");
+    write!(out, "{CSI}?{mode}{MODE_ON}").expect("writing to memory can't fail");
 }
 
 /// DECRST: turns private mode `mode` off.
 pub fn decrst(out: &mut Vec<u8>, mode: u16) {
-    write!(out, "{CSI}?{mode}l").expect("writing to memory can't fail");
+    write!(out, "{CSI}?{mode}{MODE_OFF}")
+        .expect("writing to memory can't fail");
 }
 
 /// How much of the mouse a client's terminal reports to tiri.
