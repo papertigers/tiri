@@ -19,6 +19,7 @@ mod protocol;
 mod render;
 mod selection;
 mod server;
+mod snapshot;
 mod socket;
 mod theme;
 mod thumbnail;

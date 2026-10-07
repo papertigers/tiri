@@ -29,6 +29,7 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use crate::colors::Palette;
 use crate::input::MouseModes;
+use crate::snapshot::{self, Tracker};
 
 /// The most output to take from one pane per wakeup, so a pane streaming
 /// output can't starve input or the others. The rest is read next time.
@@ -69,6 +70,8 @@ pub struct Pane {
     scroll: ScrollMark,
     /// The most lines of history the emulator keeps.
     history_limit: usize,
+    /// What the emulator keeps to itself that a snapshot needs.
+    tracker: Tracker,
 }
 
 /// A moment in a pane's scrolling. What a client has scrolled back to, or
@@ -143,6 +146,7 @@ impl Pane {
             copied: Vec::new(),
             palette: Palette::default(),
             scroll: ScrollMark::default(),
+            tracker: Tracker::new(usize::from(rows)),
             history_limit,
         })
     }
@@ -259,6 +263,7 @@ impl Pane {
 
     fn process(&mut self, bytes: &[u8]) {
         self.generation += 1;
+        self.tracker.advance(bytes);
         self.track_scroll(|pane| pane.parser.advance(&mut pane.term, bytes));
         self.handle_term_events();
     }
@@ -302,6 +307,22 @@ impl Pane {
     pub fn scrolled_since(&self, mark: ScrollMark) -> Option<usize> {
         (mark.epoch == self.scroll.epoch)
             .then(|| (self.scroll.lines - mark.lines) as usize)
+    }
+
+    /// Output that rebuilds this pane's terminal from scratch, with up to
+    /// `history` lines of history. A synchronized update in progress is
+    /// applied first, as the output the tracker has seen already is.
+    #[expect(
+        dead_code,
+        reason = "clients start their copies of panes from these"
+    )]
+    pub fn snapshot(&mut self, history: usize) -> Vec<u8> {
+        if self.sync_deadline().is_some() {
+            self.generation += 1;
+            self.track_scroll(|pane| pane.parser.stop_sync(&mut pane.term));
+            self.handle_term_events();
+        }
+        snapshot::snapshot(&mut self.term, self.tracker.hidden(), history)
     }
 
     /// When the child is mid synchronized update, the time at which we stop
@@ -397,6 +418,7 @@ impl Pane {
         }
         self.generation += 1;
         self.term.resize(Size { rows, cols });
+        self.tracker.resize(usize::from(rows));
         if let Err(e) = self.master.resize(pty_size(rows, cols)) {
             log::warn!("couldn't resize a pane to {cols}x{rows}: {e:#}");
         }
