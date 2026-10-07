@@ -9,13 +9,16 @@ use serde::{Deserialize, Serialize};
 
 pub type Rgb = [u8; 3];
 
+/// The basic colors at the start of the palette, which terminals report.
+pub const ANSI_COLORS: usize = 16;
+
 /// What a terminal said about its colors; None where it didn't answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedColors {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
-    /// The 16 ANSI colors.
-    pub ansi: [Option<Rgb>; 16],
+    /// The basic colors.
+    pub ansi: [Option<Rgb>; ANSI_COLORS],
 }
 
 /// A complete set of colors to draw or answer with.
@@ -23,7 +26,7 @@ pub struct ReportedColors {
 pub struct Palette {
     pub foreground: Rgb,
     pub background: Rgb,
-    ansi: [Rgb; 16],
+    ansi: [Rgb; ANSI_COLORS],
 }
 
 impl Default for Palette {
@@ -33,7 +36,7 @@ impl Default for Palette {
 }
 
 /// xterm's 16 ANSI colors.
-const XTERM_ANSI: [Rgb; 16] = [
+const XTERM_ANSI: [Rgb; ANSI_COLORS] = [
     [0x00, 0x00, 0x00],
     [0xcd, 0x00, 0x00],
     [0x00, 0xcd, 0x00],

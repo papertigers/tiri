@@ -15,7 +15,9 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use crate::colors::{ReportedColors, Rgb};
+use crate::colors::{ANSI_COLORS, ReportedColors, Rgb};
+use crate::escape::{self, BEL, CSI, ESC, OSC, osc_code, report};
+use crate::kitty;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::termios::{QueueSelector, tcflush};
@@ -42,16 +44,16 @@ pub struct TerminalInfo {
 /// answers aren't echoed or held back for a newline.
 pub fn probe() -> io::Result<TerminalInfo> {
     let mut out = io::stdout().lock();
-    // A one-pixel kitty graphics query; supporting terminals answer OK.
-    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")?;
-    out.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")?;
-    for i in 0..16 {
-        write!(out, "\x1b]4;{i};?\x1b\\")?;
+    kitty::query(&mut out)?;
+    escape::query_color(&mut out, osc_code::FOREGROUND)?;
+    escape::query_color(&mut out, osc_code::BACKGROUND)?;
+    for i in 0..ANSI_COLORS {
+        escape::query_palette(&mut out, i)?;
     }
-    // Cell size, then text area size, in pixels (XTWINOPS 16 and 14).
-    // The size of the terminal itself often comes without pixel sizes.
-    out.write_all(b"\x1b[16t\x1b[14t")?;
-    out.write_all(b"\x1b[c")?;
+    // Pixel sizes: the size of the terminal itself often comes without.
+    out.write_all(escape::QUERY_CELL_SIZE.as_bytes())?;
+    out.write_all(escape::QUERY_TEXT_AREA_SIZE.as_bytes())?;
+    out.write_all(escape::QUERY_DEVICE_ATTRIBUTES.as_bytes())?;
     out.flush()?;
 
     let stdin = io::stdin();
@@ -87,14 +89,15 @@ pub fn probe() -> io::Result<TerminalInfo> {
 }
 
 /// Whether `answers` include the reply to the primary device attributes
-/// request: `ESC [ ? … c`.
+/// request: `CSI ? …numbers… c`.
 fn has_device_attributes(answers: &[u8]) -> bool {
-    answers.windows(3).enumerate().any(|(i, w)| {
-        w == b"\x1b[?"
-            && answers[i + 3..]
+    let start = report::DEVICE_ATTRIBUTES.as_bytes();
+    answers.windows(start.len()).enumerate().any(|(i, w)| {
+        w == start
+            && answers[i + start.len()..]
                 .iter()
                 .find(|b| !(b.is_ascii_digit() || **b == b';'))
-                == Some(&b'c')
+                == Some(&report::DEVICE_ATTRIBUTES_FINAL)
     })
 }
 
@@ -102,39 +105,52 @@ fn has_device_attributes(answers: &[u8]) -> bool {
 pub fn parse(answers: &[u8]) -> TerminalInfo {
     let text = String::from_utf8_lossy(answers);
     let mut info = TerminalInfo {
-        kitty_graphics: text.contains("\x1b_Gi=31;OK"),
+        kitty_graphics: kitty::supported(&text),
         ..TerminalInfo::default()
     };
-    // Size reports: CSI 6 ; height ; width t for a cell, CSI 4 ; … t for
-    // the text area.
-    for report in text.split("\x1b[").skip(1) {
+    // Window reports: CSI kind ; height ; width t.
+    for report in text.split(CSI).skip(1) {
         let Some(end) =
             report.find(|c: char| !(c.is_ascii_digit() || c == ';'))
         else {
             continue;
         };
-        if !report[end..].starts_with('t') {
+        if !report[end..].starts_with(report::WINDOW_FINAL) {
             continue;
         }
         let numbers: Vec<u16> =
             report[..end].split(';').filter_map(|n| n.parse().ok()).collect();
-        match numbers.as_slice() {
-            [6, h, w] if *h > 0 && *w > 0 => info.cell_pixels = Some((*w, *h)),
-            [4, h, w] if *h > 0 && *w > 0 => info.area_pixels = Some((*w, *h)),
+        let [kind, h, w] = numbers[..] else {
+            continue;
+        };
+        if h == 0 || w == 0 {
+            continue;
+        }
+        match kind {
+            report::CELL_SIZE => info.cell_pixels = Some((w, h)),
+            report::TEXT_AREA_SIZE => info.area_pixels = Some((w, h)),
             _ => {}
         }
     }
-    // Color answers: OSC 10/11 ; rgb:… and OSC 4 ; n ; rgb:…, each ended
+    // Color answers: OSC code ; rgb:… and OSC 4 ; index ; rgb:…, each ended
     // by BEL or ST.
-    for osc in text.split("\x1b]").skip(1) {
-        let end = osc.find(['\x07', '\x1b']).unwrap_or(osc.len());
+    for osc in text.split(OSC).skip(1) {
+        let end = osc.find([BEL, char::from(ESC)]).unwrap_or(osc.len());
         let parts: Vec<&str> = osc[..end].split(';').collect();
-        match parts.as_slice() {
-            ["10", color] => info.colors.foreground = parse_rgb(color),
-            ["11", color] => info.colors.background = parse_rgb(color),
-            ["4", index, color] => {
+        let Some(code) = parts.first().and_then(|c| c.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        match (code, &parts[1..]) {
+            (osc_code::FOREGROUND, [color]) => {
+                info.colors.foreground = parse_rgb(color);
+            }
+            (osc_code::BACKGROUND, [color]) => {
+                info.colors.background = parse_rgb(color);
+            }
+            (osc_code::PALETTE, [index, color]) => {
                 if let Ok(i) = index.parse::<usize>()
-                    && i < 16
+                    && i < ANSI_COLORS
                 {
                     info.colors.ansi[i] = parse_rgb(color);
                 }
@@ -147,7 +163,7 @@ pub fn parse(answers: &[u8]) -> TerminalInfo {
 
 /// Parses `rgb:RRRR/GGGG/BBBB`, where each part has one to four hex digits.
 fn parse_rgb(spec: &str) -> Option<Rgb> {
-    let mut channels = spec.strip_prefix("rgb:")?.split('/');
+    let mut channels = spec.strip_prefix(report::RGB_PREFIX)?.split('/');
     let mut rgb = [0u8; 3];
     for channel in &mut rgb {
         let hex = channels.next()?;

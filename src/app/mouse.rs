@@ -7,9 +7,11 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
-use crate::input::encode_mouse;
+use crate::input::{encode_key, encode_mouse};
 use crate::layout::PaneId;
 use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
@@ -195,14 +197,13 @@ impl App {
                 self.forward_mouse(id, event.kind, col, row, event.modifiers);
             }
         } else if pane.alternate_scroll() {
-            let arrow: &[u8] = match (up, pane.application_cursor()) {
-                (true, true) => b"\x1bOA",
-                (true, false) => b"\x1b[A",
-                (false, true) => b"\x1bOB",
-                (false, false) => b"\x1b[B",
-            };
+            let arrow = KeyEvent::new(
+                if up { KeyCode::Up } else { KeyCode::Down },
+                KeyModifiers::NONE,
+            );
+            let arrow = encode_key(arrow, pane.application_cursor());
             for _ in 0..WHEEL_LINES {
-                pane.write(arrow);
+                pane.write(&arrow);
             }
         } else {
             client.scroll(
