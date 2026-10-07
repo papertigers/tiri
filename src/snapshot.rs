@@ -13,10 +13,16 @@
 //! [`Tracker`] watches the output for them alongside it.
 //!
 //! Not carried: tab stops a program set, which are rare and also private;
-//! links (OSC 8), which tiri doesn't show; the keyboard modes and the stack
-//! of window titles, which only the server, answering the program, needs;
-//! and, when the cursor is below the scroll region in origin mode, the
-//! saved cursor, which becomes the cursor (see [`snapshot`]).
+//! links (OSC 8), which tiri doesn't show; the stack of window titles,
+//! which only the server, answering the program, needs; and, when the
+//! cursor is below the scroll region in origin mode, the saved cursor,
+//! which becomes the cursor (see [`snapshot`]).
+//!
+//! Of the kitty keyboard flags, which decide how keys are sent, only those
+//! in force are carried: the emulator keeps the stacks of earlier ones, and
+//! the other screen's, private. A program that pushes once and pops once,
+//! as they do, is followed exactly; one that pops back past where the
+//! snapshot was taken leaves the copy with none.
 
 use std::io::Write as _;
 
@@ -24,8 +30,8 @@ use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{
     CharsetIndex, Color, CursorShape, NamedColor, StandardCharset,
 };
@@ -35,10 +41,11 @@ use crate::colors::ANSI_COLORS;
 use crate::escape::{
     CHARSET_ASCII, CHARSET_LINE_DRAWING, CLEAR_TO_LINE_END, CSI, CURSOR_COLUMN,
     CURSOR_DOWN, CURSOR_POSITION, CURSOR_STYLE, CURSOR_UP, DELETE_CHARACTERS,
-    DESIGNATE, ERASE_CHARACTERS, ESC, INSERT_CHARACTERS, KEYPAD_APPLICATION,
-    KEYPAD_NUMERIC, OSC, RESET, RESET_SCROLL_REGION, RESTORE_CURSOR,
-    SAVE_CURSOR, SET_SCROLL_REGION, SHIFT_IN, SHIFT_OUT, ST, ansi_mode,
-    cursor_shape, decrst, decset, mode, osc_code, set_ansi_mode, sgr,
+    DESIGNATE, ERASE_CHARACTERS, ESC, INSERT_CHARACTERS, KEYBOARD_FLAGS_FINAL,
+    KEYPAD_APPLICATION, KEYPAD_NUMERIC, OSC, PUSH_KEYBOARD_FLAGS, RESET,
+    RESET_SCROLL_REGION, RESTORE_CURSOR, SAVE_CURSOR, SET_SCROLL_REGION,
+    SHIFT_IN, SHIFT_OUT, ST, ansi_mode, cursor_shape, decrst, decset, mode,
+    osc_code, set_ansi_mode, sgr,
 };
 
 /// Watches a pane's output for the state alacritty keeps to itself: the
@@ -210,6 +217,12 @@ pub fn snapshot<T: EventListener>(
     }
 
     set_modes(&mut out, *term.mode());
+    // On the screen the program is on, which has its own.
+    let keyboard = keyboard_flags(*term.mode());
+    if keyboard != 0 {
+        write!(out, "{PUSH_KEYBOARD_FLAGS}{keyboard}{KEYBOARD_FLAGS_FINAL}")
+            .expect("writing to memory can't fail");
+    }
     set_colors(&mut out, term);
     set_cursor_style(&mut out, term);
 
@@ -720,6 +733,28 @@ fn save_cursor(out: &mut Vec<u8>, saved: &Cursor<Cell>, wraps: bool) {
 }
 
 /// Sets every mode a program can change, on or off as `modes` has it.
+/// The kitty keyboard protocol's flags in `modes`, as the protocol numbers
+/// them.
+pub fn keyboard_flags(modes: TermMode) -> u8 {
+    [
+        (TermMode::DISAMBIGUATE_ESC_CODES, 1),
+        (TermMode::REPORT_EVENT_TYPES, 2),
+        (TermMode::REPORT_ALTERNATE_KEYS, 4),
+        (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
+        (TermMode::REPORT_ASSOCIATED_TEXT, 16),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| modes.contains(*flag))
+    .map(|(_, bit)| bit)
+    .sum()
+}
+
+/// What an emulator is configured with, wherever tiri makes one: like a
+/// terminal, but speaking the kitty keyboard protocol to programs that ask.
+pub fn config() -> Config {
+    Config { kitty_keyboard: true, ..Config::default() }
+}
+
 fn set_modes(out: &mut Vec<u8>, modes: TermMode) {
     for (flag, number) in [
         (TermMode::APP_CURSOR, mode::APP_CURSOR),
@@ -800,7 +835,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::term::{Config, test::TermSize};
+    use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::vte::ansi::Processor;
 
     use super::*;
@@ -822,7 +857,7 @@ mod tests {
         fn new(rows: usize, columns: usize) -> Self {
             Self {
                 term: Term::new(
-                    Config::default(),
+                    config(),
                     &TermSize::new(columns, rows),
                     VoidListener,
                 ),
@@ -869,9 +904,7 @@ mod tests {
             let grid = self.term.grid();
             lines.push(describe_cursor("cursor", &grid.cursor));
             lines.push(describe_cursor("saved", &grid.saved_cursor));
-            let modes = *self.term.mode()
-                - TermMode::VI
-                - TermMode::KITTY_KEYBOARD_PROTOCOL;
+            let modes = *self.term.mode() - TermMode::VI;
             lines.push(format!("modes {modes:?}"));
             let colors = self.term.colors();
             lines.push(format!(
@@ -1104,6 +1137,29 @@ mod tests {
             &b[..b.len().min(160)],
             differ.join("\n"),
         );
+    }
+
+    #[test]
+    fn snapshots_carry_the_keyboard_flags_in_force() {
+        let flags = |e: &Emulator| keyboard_flags(*e.term.mode());
+        for (setup, pushed) in [
+            // A program on the normal screen, like a shell's line editor.
+            (&b"\x1b[>1u"[..], 1),
+            // A full-screen one, on the alternate screen, over a shell
+            // that asked for nothing.
+            (b"\x1b[?1049h\x1b[>9u", 9),
+        ] {
+            let mut server = Emulator::new(6, 20);
+            server.feed(setup);
+            let mut copy = Emulator::new(6, 20);
+            copy.feed(&server.snapshot());
+            assert_eq!((flags(&server), flags(&copy)), (pushed, pushed));
+            // And they keep in step as the program lets go.
+            for e in [&mut server, &mut copy] {
+                e.feed(b"\x1b[<u\x1b[?1049l");
+            }
+            assert_eq!((flags(&server), flags(&copy)), (0, 0));
+        }
     }
 
     #[test]
