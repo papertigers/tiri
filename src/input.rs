@@ -13,7 +13,110 @@ use crossterm::event::{
 
 use crate::escape::{CONTROL_MASK, CSI, DEL, ESC, SS3, csi};
 
-pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
+/// What decides how a pane's program wants its keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyModes {
+    /// Cursor keys as SS3, not CSI (DECCKM).
+    pub application_cursor: bool,
+    /// The kitty keyboard protocol flags it asked for.
+    pub keyboard: u8,
+}
+
+/// Kitty keyboard flag: keys that send the same as others otherwise, like
+/// Escape and Alt combinations, Shift+Enter and Enter, are sent as
+/// `CSI code ; modifiers u` instead.
+const DISAMBIGUATE: u8 = 1;
+/// Kitty keyboard flag: every key is sent that way, typing included.
+const ALL_KEYS_AS_ESCAPES: u8 = 8;
+
+/// The bytes a key sends to a program, as `modes` say it wants them.
+pub fn encode_key(key: KeyEvent, modes: KeyModes) -> Vec<u8> {
+    if modes.keyboard & (DISAMBIGUATE | ALL_KEYS_AS_ESCAPES) != 0
+        && let Some(out) = kitty_key(key, modes.keyboard)
+    {
+        return out;
+    }
+    legacy_key(key, modes.application_cursor)
+}
+
+/// A key in the kitty keyboard protocol's own form, `CSI code ; modifiers
+/// u`: for the keys the legacy encoding can't tell apart, or with
+/// [`ALL_KEYS_AS_ESCAPES`] for all that have a code. None for the others,
+/// like the arrows and function keys, whose legacy forms already say their
+/// modifiers, as the protocol keeps them.
+fn kitty_key(key: KeyEvent, flags: u8) -> Option<Vec<u8>> {
+    let mut mods = kitty_modifiers(key.modifiers);
+    let code = match key.code {
+        KeyCode::Esc => ESCAPE_CODE,
+        KeyCode::Enter => ENTER_CODE,
+        KeyCode::Tab => TAB_CODE,
+        KeyCode::BackTab => {
+            mods |= KITTY_SHIFT;
+            TAB_CODE
+        }
+        KeyCode::Backspace => BACKSPACE_CODE,
+        // Letters by their unshifted form, Shift said in the modifiers.
+        KeyCode::Char(c) => {
+            if c.is_uppercase() {
+                mods |= KITTY_SHIFT;
+            }
+            u32::from(c.to_lowercase().next().unwrap_or(c))
+        }
+        _ => return None,
+    };
+    let ambiguous = match key.code {
+        KeyCode::Esc | KeyCode::BackTab => true,
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace => mods != 0,
+        // Shift alone just types the other character.
+        _ => mods & !KITTY_SHIFT != 0,
+    };
+    if !ambiguous && flags & ALL_KEYS_AS_ESCAPES == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    if mods == 0 {
+        write!(out, "{CSI}{code}{KITTY_FINAL}")
+    } else {
+        write!(out, "{CSI}{code};{}{KITTY_FINAL}", NO_MODIFIERS + mods)
+    }
+    .expect("writing to memory can't fail");
+    Some(out)
+}
+
+/// The kitty keyboard protocol's codes for keys that are control
+/// characters, and how its sequences end.
+const ESCAPE_CODE: u32 = 27;
+const ENTER_CODE: u32 = 13;
+const TAB_CODE: u32 = 9;
+const BACKSPACE_CODE: u32 = 127;
+const KITTY_FINAL: char = 'u';
+
+/// The kitty keyboard protocol's modifier bits: xterm's three, then the
+/// keys xterm has no room for.
+const KITTY_SHIFT: u8 = 1;
+const KITTY_ALT: u8 = 2;
+const KITTY_CTRL: u8 = 4;
+const KITTY_SUPER: u8 = 8;
+const KITTY_HYPER: u8 = 16;
+const KITTY_META: u8 = 32;
+
+fn kitty_modifiers(mods: KeyModifiers) -> u8 {
+    [
+        (KeyModifiers::SHIFT, KITTY_SHIFT),
+        (KeyModifiers::ALT, KITTY_ALT),
+        (KeyModifiers::CONTROL, KITTY_CTRL),
+        (KeyModifiers::SUPER, KITTY_SUPER),
+        (KeyModifiers::HYPER, KITTY_HYPER),
+        (KeyModifiers::META, KITTY_META),
+    ]
+    .into_iter()
+    .filter(|(m, _)| mods.contains(*m))
+    .map(|(_, bit)| bit)
+    .sum()
+}
+
+/// A key as terminals have always sent it, xterm's way.
+fn legacy_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
     let alt = mods.contains(KeyModifiers::ALT);
     let ctrl = mods.contains(KeyModifiers::CONTROL);
@@ -341,46 +444,97 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    const PLAIN: KeyModes = KeyModes { application_cursor: false, keyboard: 0 };
+    const APP_CURSOR: KeyModes =
+        KeyModes { application_cursor: true, keyboard: 0 };
+    const KITTY: KeyModes =
+        KeyModes { application_cursor: false, keyboard: DISAMBIGUATE };
+    const KITTY_ALL: KeyModes = KeyModes {
+        application_cursor: false,
+        keyboard: DISAMBIGUATE | ALL_KEYS_AS_ESCAPES,
+    };
+
+    #[test]
+    fn keys_legacy_encoding_confuses_are_told_apart_for_programs_that_ask() {
+        let (none, shift) = (KeyModifiers::NONE, KeyModifiers::SHIFT);
+        let ctrl = KeyModifiers::CONTROL;
+        let enc = |code, mods, modes| encode_key(key(code, mods), modes);
+        // Shift+Enter, Enter's twin until now.
+        assert_eq!(enc(KeyCode::Enter, shift, KITTY), b"\x1b[13;2u");
+        assert_eq!(enc(KeyCode::Enter, shift, PLAIN), b"\r");
+        assert_eq!(enc(KeyCode::Enter, none, KITTY), b"\r");
+        // Ctrl+I and Tab, Ctrl+[ and Escape.
+        assert_eq!(enc(KeyCode::Char('i'), ctrl, KITTY), b"\x1b[105;5u");
+        assert_eq!(enc(KeyCode::Tab, none, KITTY), b"\t");
+        assert_eq!(enc(KeyCode::Esc, none, KITTY), b"\x1b[27u");
+        assert_eq!(enc(KeyCode::BackTab, shift, KITTY), b"\x1b[9;2u");
+        // Alt and Super with letters; Ctrl+Shift by the letter's lower case.
+        let alt = KeyModifiers::ALT;
+        assert_eq!(enc(KeyCode::Char('a'), alt, KITTY), b"\x1b[97;3u");
+        assert_eq!(
+            enc(KeyCode::Char('h'), KeyModifiers::SUPER, KITTY),
+            b"\x1b[104;9u"
+        );
+        assert_eq!(enc(KeyCode::Char('A'), ctrl | shift, KITTY), b"\x1b[97;6u");
+        // Typing stays typing, Shift included.
+        assert_eq!(enc(KeyCode::Char('a'), none, KITTY), b"a");
+        assert_eq!(enc(KeyCode::Char('A'), shift, KITTY), b"A");
+        // Keys that already say their modifiers keep their forms.
+        assert_eq!(enc(KeyCode::Up, shift, KITTY), b"\x1b[1;2A");
+        assert_eq!(enc(KeyCode::F(5), none, KITTY), b"\x1b[15~");
+    }
+
+    #[test]
+    fn with_all_keys_as_escapes_typing_is_sent_as_codes_too() {
+        let (none, shift) = (KeyModifiers::NONE, KeyModifiers::SHIFT);
+        let enc = |code, mods| encode_key(key(code, mods), KITTY_ALL);
+        assert_eq!(enc(KeyCode::Char('a'), none), b"\x1b[97u");
+        assert_eq!(enc(KeyCode::Char('A'), shift), b"\x1b[97;2u");
+        assert_eq!(enc(KeyCode::Enter, none), b"\x1b[13u");
+        assert_eq!(enc(KeyCode::Backspace, none), b"\x1b[127u");
+        assert_eq!(enc(KeyCode::Up, none), b"\x1b[A");
+    }
+
     #[test]
     fn encodes_common_keys() {
         let none = KeyModifiers::NONE;
         assert_eq!(
-            encode_key(key(KeyCode::Char('é'), none), false),
+            encode_key(key(KeyCode::Char('é'), none), PLAIN),
             "é".as_bytes()
         );
         assert_eq!(
-            encode_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
+            encode_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), PLAIN),
             [3]
         );
         assert_eq!(
-            encode_key(key(KeyCode::Char('b'), KeyModifiers::ALT), false),
+            encode_key(key(KeyCode::Char('b'), KeyModifiers::ALT), PLAIN),
             b"\x1bb"
         );
-        assert_eq!(encode_key(key(KeyCode::Up, none), false), b"\x1b[A");
-        assert_eq!(encode_key(key(KeyCode::Up, none), true), b"\x1bOA");
+        assert_eq!(encode_key(key(KeyCode::Up, none), PLAIN), b"\x1b[A");
+        assert_eq!(encode_key(key(KeyCode::Up, none), APP_CURSOR), b"\x1bOA");
         assert_eq!(
-            encode_key(key(KeyCode::Left, KeyModifiers::CONTROL), true),
+            encode_key(key(KeyCode::Left, KeyModifiers::CONTROL), APP_CURSOR),
             b"\x1b[1;5D"
         );
-        assert_eq!(encode_key(key(KeyCode::Delete, none), false), b"\x1b[3~");
-        assert_eq!(encode_key(key(KeyCode::F(1), none), false), b"\x1bOP");
-        assert_eq!(encode_key(key(KeyCode::F(5), none), false), b"\x1b[15~");
+        assert_eq!(encode_key(key(KeyCode::Delete, none), PLAIN), b"\x1b[3~");
+        assert_eq!(encode_key(key(KeyCode::F(1), none), PLAIN), b"\x1bOP");
+        assert_eq!(encode_key(key(KeyCode::F(5), none), PLAIN), b"\x1b[15~");
     }
 
     #[test]
     fn modifiers_reach_function_keys_tab_and_escape() {
         let (shift, alt) = (KeyModifiers::SHIFT, KeyModifiers::ALT);
-        assert_eq!(encode_key(key(KeyCode::F(3), shift), false), b"\x1b[1;2R");
+        assert_eq!(encode_key(key(KeyCode::F(3), shift), PLAIN), b"\x1b[1;2R");
         assert_eq!(
-            encode_key(key(KeyCode::F(4), KeyModifiers::CONTROL), false),
+            encode_key(key(KeyCode::F(4), KeyModifiers::CONTROL), PLAIN),
             b"\x1b[1;5S"
         );
-        assert_eq!(encode_key(key(KeyCode::F(5), shift), false), b"\x1b[15;2~");
-        assert_eq!(encode_key(key(KeyCode::Tab, alt), false), b"\x1b\t");
-        assert_eq!(encode_key(key(KeyCode::Esc, alt), false), b"\x1b\x1b");
-        assert_eq!(encode_key(key(KeyCode::Enter, alt), false), b"\x1b\r");
+        assert_eq!(encode_key(key(KeyCode::F(5), shift), PLAIN), b"\x1b[15;2~");
+        assert_eq!(encode_key(key(KeyCode::Tab, alt), PLAIN), b"\x1b\t");
+        assert_eq!(encode_key(key(KeyCode::Esc, alt), PLAIN), b"\x1b\x1b");
+        assert_eq!(encode_key(key(KeyCode::Enter, alt), PLAIN), b"\x1b\r");
         assert_eq!(
-            encode_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL), false),
+            encode_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL), PLAIN),
             [0x1f]
         );
     }
