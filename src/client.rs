@@ -261,8 +261,10 @@ fn run(
         // Everything waiting goes in before the next frame.
         for incoming in first.into_iter().chain(incoming.try_iter()) {
             dirty = true;
-            if let Some(trace) = stdout.trace() {
-                trace.note(describe(&incoming));
+            if let Some(trace) = stdout.trace()
+                && let Some(note) = describe(&incoming)
+            {
+                trace.note(note);
             }
             match incoming {
                 Incoming::Input(event) => input(app, client, event),
@@ -335,49 +337,25 @@ fn run(
     }
 }
 
-/// What `incoming` is, for a trace: what keys did, not what was typed.
-fn describe(incoming: &Incoming) -> String {
+/// What `incoming` was, for a trace, if it's worth noting: input, and
+/// the layout changing. What panes showed is in the frames. Of keys, only
+/// those that do something to tiri are named, not what was typed.
+fn describe(incoming: &Incoming) -> Option<String> {
     use event::{Event, KeyCode, KeyModifiers};
     match incoming {
-        Incoming::Input(Event::Key(key)) => {
-            let typed = matches!(key.code, KeyCode::Char(_))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            if typed {
-                format!("key: typed ({:?})", key.kind)
-            } else {
-                format!(
-                    "key: {:?} {:?} ({:?})",
-                    key.modifiers, key.code, key.kind
-                )
-            }
+        Incoming::Input(Event::Key(key))
+            if matches!(key.code, KeyCode::Char(_))
+                && !(key.modifiers)
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some("key: typed".to_owned())
         }
-        Incoming::Input(Event::Paste(text)) => {
-            format!("paste: {} bytes", text.len())
+        Incoming::Input(Event::Paste(_)) => Some("paste".to_owned()),
+        Incoming::Input(event) => Some(format!("input: {event:?}")),
+        Incoming::Server(ServerMsg::Layout(_), _) => {
+            Some("server: layout".to_owned())
         }
-        Incoming::Input(event) => format!("input: {event:?}"),
-        Incoming::InputFailed(e) => format!("input failed: {e}"),
-        Incoming::Server(msg, _) => match msg {
-            ServerMsg::Layout(layout) => format!(
-                "server: layout, {} workspaces, on {}",
-                layout.workspaces.len(),
-                layout.active
-            ),
-            ServerMsg::PaneOutput { pane, bytes } => {
-                format!("server: pane {} output, {} bytes", pane.0, bytes.len())
-            }
-            ServerMsg::PaneSnapshot { pane, rows, cols, bytes, .. } => format!(
-                "server: pane {} snapshot, {rows}x{cols}, {} bytes",
-                pane.0,
-                bytes.len()
-            ),
-            ServerMsg::PaneResize { pane, rows, cols } => {
-                format!("server: pane {} resized to {rows}x{cols}", pane.0)
-            }
-            other => format!("server: {other:?}"),
-        },
-        Incoming::Lost(e) => format!("lost the server: {e:?}"),
+        _ => None,
     }
 }
 
