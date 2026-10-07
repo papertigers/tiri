@@ -31,11 +31,20 @@ const MAX_WIDTH: u16 = 1000;
 const MAX_HEIGHT: u16 = 500;
 /// The lines of history a pane's snapshot carries.
 const SNAPSHOT_HISTORY: usize = 1000;
+/// The most of a pane's output in one message.
+const OUTPUT_CHUNK: usize = 16 * 1024;
 
 /// Bounds a client's claimed terminal size, so a bogus one can't make the
 /// server allocate enormous terminals.
 fn clamp_size(width: u16, height: u16) -> (u16, u16) {
     (width.clamp(1, MAX_WIDTH), height.clamp(1, MAX_HEIGHT))
+}
+
+/// Pane `id`'s terminal as it is now, for a client to start a copy from.
+fn snapshot(id: PaneId, pane: &mut Pane) -> ServerMsg {
+    let (rows, cols) = pane.emulator().size();
+    let bytes = pane.emulator_mut().snapshot(SNAPSHOT_HISTORY);
+    ServerMsg::PaneSnapshot { pane: id, rows, cols, bytes }
 }
 
 /// Where panes start for a client that hasn't said: the home directory.
@@ -159,12 +168,15 @@ impl Host {
     /// copies from.
     pub fn welcome(&mut self, guest: &Guest) -> Vec<ServerMsg> {
         let mut welcome = vec![ServerMsg::Layout(self.layout(guest))];
-        for (&pane, entry) in &mut self.panes {
-            let (rows, cols) = entry.emulator().size();
-            let bytes = entry.emulator_mut().snapshot(SNAPSHOT_HISTORY);
-            welcome.push(ServerMsg::PaneSnapshot { pane, rows, cols, bytes });
+        for (&id, pane) in &mut self.panes {
+            welcome.push(snapshot(id, pane));
         }
         welcome
+    }
+
+    /// Pane `id` as it is now, for a client to start its copy again from.
+    pub fn snapshot(&mut self, id: PaneId) -> Option<ServerMsg> {
+        Some(snapshot(id, self.panes.get_mut(&id)?))
     }
 
     /// The layout as `guest` is to draw it.
@@ -394,14 +406,7 @@ impl Host {
             return Err(e).context("couldn't watch the new pane's pty");
         }
         // Clients start their copies before its first resize below.
-        let (rows, cols) = pane.emulator().size();
-        let bytes = pane.emulator_mut().snapshot(SNAPSHOT_HISTORY);
-        self.outgoing.push(ServerMsg::PaneSnapshot {
-            pane: id,
-            rows,
-            cols,
-            bytes,
-        });
+        self.outgoing.push(snapshot(id, &mut pane));
         self.panes.insert(id, pane);
         self.workspaces.insert(guest.id, id);
         self.resize_panes();
@@ -488,8 +493,10 @@ impl Host {
         // Clients' copies see what the program copies, in the same output,
         // and put it on their own clipboards.
         drop(pane.emulator_mut().take_copied());
-        let bytes = pane.take_output();
-        if !bytes.is_empty() {
+        // In pieces, so a client falling behind can be held back partway
+        // through a big read rather than after it.
+        for bytes in pane.take_output().chunks(OUTPUT_CHUNK) {
+            let bytes = bytes.to_vec();
             self.outgoing.push(ServerMsg::PaneOutput { pane: id, bytes });
         }
         if !open {
