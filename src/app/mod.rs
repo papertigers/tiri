@@ -350,7 +350,7 @@ impl App {
             .filter(|_| showing)
             .filter_map(|(id, thumb)| {
                 let pane = self.panes.get(id)?;
-                (pane.generation() != thumb.generation)
+                (pane.emulator().generation() != thumb.generation)
                     .then(|| thumb.uploaded + THUMBNAIL_INTERVAL)
             });
         self.panes
@@ -423,7 +423,7 @@ impl App {
                 let Some(pane) = self.panes.get_mut(&id) else {
                     return;
                 };
-                let bracketed = pane.bracketed_paste();
+                let bracketed = pane.emulator().bracketed_paste();
                 if bracketed {
                     pane.write(escape::PASTE_START.as_bytes());
                 }
@@ -449,6 +449,8 @@ impl App {
     /// Text programs in panes have copied (OSC 52), for passing on to the
     /// clients' clipboards.
     pub fn take_copied(&mut self) -> Vec<String> {
-        self.panes.values_mut().flat_map(Pane::take_copied).collect()
+        (self.panes.values_mut())
+            .flat_map(|pane| pane.emulator_mut().take_copied())
+            .collect()
     }
 }

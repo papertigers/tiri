@@ -59,7 +59,7 @@ impl App {
             client.scrollback.remove(&id);
         }
         if let Some(pane) = self.focused_pane_mut(client) {
-            let bytes = encode_key(event, pane.application_cursor());
+            let bytes = encode_key(event, pane.emulator().application_cursor());
             pane.write(&bytes);
         }
         Ok(())
