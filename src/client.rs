@@ -226,7 +226,14 @@ fn run(
                 let wait = deadline.saturating_duration_since(Instant::now());
                 match incoming.recv_timeout(wait) {
                     Ok(incoming) => Some(incoming),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    // Whatever was due changes the screen: an animation's
+                    // next step (its last included, which ends it), a
+                    // pane's update showing, or a notice going. So a frame
+                    // is owed, even if it's too soon to draw one now.
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        dirty = true;
+                        None
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         bail!("lost the terminal and the server")
                     }
