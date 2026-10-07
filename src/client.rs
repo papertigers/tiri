@@ -31,7 +31,8 @@ use crate::escape;
 use crate::link::{Link, LinkReader, LinkWriter, Server};
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
-    ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send,
+    ClientMsg, Decoder, ExitReason, Greeting, Hello, Intent, PROTOCOL,
+    ServerMsg, Target, recv, recv_greeting, send,
 };
 use crate::socket;
 use crate::trace::{Trace, Traced};
@@ -84,6 +85,10 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
     };
     let cell_pixels = probed_cell_pixels(&terminal_info, width, height)
         .or_else(size_cell_pixels);
+    // Sent with the hello, so finding the server isn't this version costs
+    // no wait: one that is turns it away unread.
+    link.write_all(&Greeting::ours(Intent::Talk).encode())
+        .with_context(talking)?;
     send(
         &mut link,
         &ClientMsg::Hello(Hello {
@@ -100,6 +105,7 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
     )
     .with_context(talking)?;
     let mut decoder = Decoder::from_server();
+    check_greeting(&mut link, &mut decoder, server)?;
     match recv(&mut link, &mut decoder).with_context(talking)? {
         Some(ServerMsg::Attached) => {}
         Some(ServerMsg::Error(e)) => bail!(e),
@@ -462,8 +468,11 @@ pub fn list(socket: &Path) -> Result<()> {
         println!("{NO_SERVER}");
         return Ok(());
     };
+    stream.write_all(&Greeting::ours(Intent::Talk).encode())?;
     send(&mut stream, &ClientMsg::List)?;
-    match recv(&mut stream, &mut Decoder::from_server())? {
+    let mut decoder = Decoder::from_server();
+    check_greeting(&mut stream, &mut decoder, &Server::Local(socket.into()))?;
+    match recv(&mut stream, &mut decoder)? {
         Some(ServerMsg::Workspaces(workspaces)) => {
             for ws in workspaces {
                 if ws.panes == 0 && ws.name.is_none() {
@@ -498,10 +507,92 @@ pub fn kill_server(socket: &Path) -> Result<()> {
         println!("{NO_SERVER}");
         return Ok(());
     };
-    send(&mut stream, &ClientMsg::KillServer)?;
-    // Wait for the server to hang up, so it's gone when we return.
-    let _ = recv::<ServerMsg>(&mut stream, &mut Decoder::from_server());
+    // Asked in a greeting, which a server of any version since there have
+    // been greetings takes: a server from before an upgrade still stops.
+    send_raw(&mut stream, &Greeting::ours(Intent::Kill).encode())?;
+    let mut decoder = Decoder::from_server();
+    if !matches!(recv_greeting(&mut stream, &mut decoder), Ok(Some(_))) {
+        bail!(
+            "the tiri server at {} is from before servers said their \
+             version, and doesn't understand being asked to stop by this \
+             one. The tiri it was started with can stop it, with \
+             `tiri kill-server`",
+            socket.display()
+        );
+    }
+    // Wait for it to hang up, so it's gone when we return.
+    let _ = io::copy(&mut stream, &mut io::sink());
     Ok(())
+}
+
+/// Writes bytes that aren't a message, like a greeting, and flushes them.
+fn send_raw(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    stream.write_all(bytes)?;
+    stream.flush()
+}
+
+/// Reads the server's greeting, ours having gone first. A server that
+/// doesn't speak this tiri's protocol, or that's from before servers said,
+/// is an error saying so, and what to do about it.
+fn check_greeting(
+    link: &mut impl Read,
+    decoder: &mut Decoder,
+    server: &Server,
+) -> Result<()> {
+    let reply = recv_greeting(link, decoder);
+    let ours = Greeting::ours(Intent::Talk);
+    let (what, advice) = match server {
+        Server::Local(socket) => (
+            format!("the tiri server at {}", socket.display()),
+            format!(
+                "`{}` stops it, closing its panes, and attaching again \
+                 starts one of this version.",
+                kill_command(None, socket)
+            ),
+        ),
+        Server::Remote { host, socket } => (
+            format!("the tiri server on {host}"),
+            format!(
+                "Make tiri on {host} the same version as this one; a server \
+                 left running there from before is stopped with `ssh \
+                 {host} {}`, which closes its panes.",
+                kill_command(
+                    Some(host),
+                    socket.as_deref().unwrap_or(Path::new(""))
+                )
+            ),
+        ),
+    };
+    match reply {
+        Ok(Some(theirs)) if theirs.protocol == PROTOCOL => Ok(()),
+        Ok(Some(theirs)) => bail!(
+            "{what} is tiri {} (protocol {}), and this is tiri {} (protocol \
+             {}): they can't talk to each other. {advice}",
+            theirs.version,
+            theirs.protocol,
+            ours.version,
+            ours.protocol
+        ),
+        Ok(None) => bail!(
+            "{what} hung up without saying its version: it's likely from \
+             before tiri servers did, older than this one. {advice}"
+        ),
+        Err(e) => Err(e.context(format!(
+            "couldn't read what {what} answered: it's likely a different \
+             version of tiri. {advice}"
+        ))),
+    }
+}
+
+/// The command that stops the server at `socket`: here, or with `host`,
+/// as run there, where an empty socket is the default one.
+fn kill_command(host: Option<&str>, socket: &Path) -> String {
+    let default = socket.as_os_str().is_empty()
+        || (host.is_none() && socket == socket::default_path());
+    match default {
+        true => "tiri kill-server".to_owned(),
+        false => format!("tiri -S {} kill-server", socket.display()),
+    }
 }
 
 /// What `ls` and `kill-server` say when there's no server.
@@ -512,8 +603,43 @@ const NO_SERVER: &str = "no tiri server running";
 /// starting the server if none is running.
 pub fn bridge(socket: &Path) -> Result<()> {
     let mut stream = connect_or_start(socket)?;
-    // Before the client's hello, so it's known when the client attaches.
-    send(&mut stream, &ClientMsg::Agent(ssh_agent()))?;
+    let mut out = crate::link::compressing(io::stdout().lock())?;
+    // The client's greeting goes through first, and the server's back, so
+    // they find out whether they can talk.
+    let mut from_client = Decoder::from_client();
+    let greeting = {
+        let mut stdin = io::stdin().lock();
+        recv_greeting(&mut stdin, &mut from_client)
+            .context(
+                "the tiri client didn't say its version: it's likely older \
+                 than this tiri, at the other end. Make them the same \
+                 version",
+            )?
+            .context("the tiri client hung up")?
+    };
+    send_raw(&mut stream, &greeting.encode())?;
+    let mut from_server = Decoder::from_server();
+    let reply = recv_greeting(&mut stream, &mut from_server).ok().flatten();
+    if let Some(reply) = &reply {
+        out.write_all(&reply.encode())?;
+    }
+    out.write_all(&from_server.take_rest())?;
+    out.flush()?;
+    let talking = greeting.intent == Intent::Talk
+        && reply.as_ref().is_some_and(|r| r.protocol == greeting.protocol);
+    if !talking {
+        // The server's turned the client away, or hung up without a word,
+        // or is stopping: the client says why from what it got, which
+        // ends here.
+        out.finish()?.flush()?;
+        return Ok(());
+    }
+    // Ahead of the client's hello, so the agent's known when it attaches:
+    // only to a server that reads this tiri's messages.
+    if greeting.protocol == PROTOCOL {
+        send(&mut stream, &ClientMsg::Agent(ssh_agent()))?;
+    }
+    send_raw(&mut stream, &from_client.take_rest())?;
     let mut to_server = stream.try_clone()?;
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut to_server);
@@ -523,7 +649,6 @@ pub fn bridge(socket: &Path) -> Result<()> {
     // Compressed, and flushed as it comes: messages are often small, and
     // the client is waiting on them.
     let mut from_server = stream;
-    let mut out = crate::link::compressing(io::stdout().lock())?;
     let mut buf = vec![0u8; crate::protocol::READ_CHUNK];
     loop {
         match from_server.read(&mut buf) {

@@ -27,7 +27,8 @@ use crate::config;
 use crate::host::{Guest, Host};
 use crate::layout::PaneId;
 use crate::protocol::{
-    ClientMsg, Decoder, ExitReason, Hello, READ_CHUNK, ServerMsg, encode,
+    ClientMsg, Decoder, ExitReason, Greeting, Hello, Intent, PROTOCOL,
+    READ_CHUNK, ServerMsg, encode,
 };
 
 /// Pane PTYs are keyed by pane id, which is a u32; these sit above them.
@@ -93,6 +94,8 @@ struct Connection {
     history: HashMap<PaneId, usize>,
     /// The ssh agent its bridge said ssh forwarded, for its hello.
     agent: Option<PathBuf>,
+    /// It's greeted the server, with the same protocol: messages follow.
+    greeted: bool,
 }
 
 impl Connection {
@@ -111,6 +114,7 @@ impl Connection {
             behind: HashSet::new(),
             history: HashMap::new(),
             agent: None,
+            greeted: false,
         }
     }
 
@@ -477,6 +481,26 @@ impl Server<'_> {
                 && !connection.dead
                 && !connection.closing
             {
+                if !connection.greeted {
+                    match connection.decoder.next_greeting() {
+                        Ok(Some(greeting)) => {
+                            self.greet(key, greeting);
+                            continue;
+                        }
+                        Ok(None) => {
+                            connection.dead |= connection.eof;
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "{}: dropping it: {e:#}",
+                                connection.name()
+                            );
+                            connection.dead = true;
+                            break;
+                        }
+                    }
+                }
                 match connection.decoder.next::<ClientMsg>() {
                     Ok(Some(msg)) => self.handle(key, msg),
                     Ok(None) => {
@@ -491,6 +515,36 @@ impl Server<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// Greets a client back, so it knows what it's talking to. One of
+    /// another protocol hears nothing more; one that's come to stop the
+    /// server is obeyed whatever its protocol.
+    fn greet(&mut self, key: usize, greeting: Greeting) {
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return;
+        };
+        connection.send_encoded(&Greeting::ours(Intent::Talk).encode());
+        let theirs = format!(
+            "tiri {} (protocol {})",
+            greeting.version, greeting.protocol
+        );
+        match greeting.intent {
+            Intent::Kill => {
+                log::info!("{}: {theirs} says to stop", connection.name());
+                self.kill = true;
+                connection.closing = true;
+            }
+            Intent::Talk if greeting.protocol != PROTOCOL => {
+                log::warn!(
+                    "{}: turning away {theirs}: this server speaks protocol \
+                     {PROTOCOL}",
+                    connection.name()
+                );
+                connection.closing = true;
+            }
+            Intent::Talk => connection.greeted = true,
         }
     }
 

@@ -5,6 +5,11 @@
 //! What the client and server say to each other over the socket: serde
 //! messages encoded with postcard, each prefixed with its length so they can
 //! be picked out of a byte stream that arrives in arbitrary pieces.
+//!
+//! Before any message, each side sends a [`Greeting`], laid out so that
+//! every version of tiri reads it alike: messages change shape between
+//! versions, and a greeting is how a client finds the server isn't its
+//! own, and says so, rather than sending what the server can't read.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -34,6 +39,93 @@ pub const PASTE_CHUNK: usize = 64 * 1024;
 /// The lines of history a pane's snapshot carries unless more are asked
 /// for.
 pub const SNAPSHOT_HISTORY: usize = 1000;
+
+/// The version of the messages below. Bump it whenever any of them changes
+/// shape: a client and server talk only if theirs are the same.
+pub const PROTOCOL: u32 = 1;
+
+/// How a greeting starts, so one is told from anything else.
+const GREETING_MAGIC: &[u8; 4] = b"tiri";
+
+/// The first thing each side of a connection sends: [`GREETING_MAGIC`],
+/// the protocol (a little-endian u32), what the connection is for (a
+/// byte), and the version of tiri, as text after its length (a byte). This
+/// layout never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Greeting {
+    pub protocol: u32,
+    pub intent: Intent,
+    /// tiri's own version, for people to read.
+    pub version: String,
+}
+
+/// What a client connects for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Messages, of the protocol it gave.
+    Talk,
+    /// For the server to stop, whatever its protocol: the one request that
+    /// has to work between versions, since it's how a server left from
+    /// before an upgrade is got rid of.
+    Kill,
+}
+
+impl Intent {
+    const TALK: u8 = 0;
+    const KILL: u8 = 1;
+}
+
+impl Greeting {
+    /// This tiri's.
+    pub fn ours(intent: Intent) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            intent,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let version = &self.version.as_bytes()[..self.version.len().min(255)];
+        let mut out = GREETING_MAGIC.to_vec();
+        out.extend_from_slice(&self.protocol.to_le_bytes());
+        out.push(match self.intent {
+            Intent::Talk => Intent::TALK,
+            Intent::Kill => Intent::KILL,
+        });
+        out.push(version.len() as u8);
+        out.extend_from_slice(version);
+        out
+    }
+
+    /// A greeting from the front of `buf`, and how many bytes it took;
+    /// None until all of it is there.
+    fn decode(buf: &[u8]) -> Result<Option<(Self, usize)>> {
+        let magic = &buf[..buf.len().min(GREETING_MAGIC.len())];
+        if !GREETING_MAGIC.starts_with(magic) {
+            bail!(
+                "it didn't start by saying its version, so it's likely a tiri \
+                 from before they did"
+            );
+        }
+        const HEAD: usize = 4 + 4 + 1 + 1;
+        let Some(head) = buf.get(..HEAD) else {
+            return Ok(None);
+        };
+        let protocol =
+            u32::from_le_bytes(head[4..8].try_into().expect("four bytes"));
+        let intent = match head[8] {
+            Intent::KILL => Intent::Kill,
+            _ => Intent::Talk,
+        };
+        let len = HEAD + usize::from(head[9]);
+        let Some(version) = buf.get(HEAD..len) else {
+            return Ok(None);
+        };
+        let version = String::from_utf8_lossy(version).into_owned();
+        Ok(Some((Self { protocol, intent, version }, len)))
+    }
+}
 
 /// Which workspace a client wants to land on when it attaches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,10 +352,48 @@ impl Decoder {
         Ok(Some(msg))
     }
 
+    /// The greeting the other side starts with, once it's fully arrived.
+    pub fn next_greeting(&mut self) -> Result<Option<Greeting>> {
+        let Some((greeting, len)) = Greeting::decode(&self.buf[self.start..])?
+        else {
+            return Ok(None);
+        };
+        self.start += len;
+        self.taken += len as u64;
+        Ok(Some(greeting))
+    }
+
+    /// What's arrived and not been decoded yet, taken out.
+    pub fn take_rest(&mut self) -> Vec<u8> {
+        let rest = self.buf.split_off(self.start);
+        self.buf.clear();
+        self.start = 0;
+        rest
+    }
+
     /// Bytes of whole messages decoded so far, as [`ClientMsg::Ack`]
-    /// counts them.
+    /// counts them, the greeting included.
     pub fn taken(&self) -> u64 {
         self.taken
+    }
+}
+
+/// Reads the greeting from a blocking stream, or None if it ends first.
+pub fn recv_greeting(
+    stream: &mut impl Read,
+    decoder: &mut Decoder,
+) -> Result<Option<Greeting>> {
+    let mut buf = [0u8; READ_CHUNK];
+    loop {
+        if let Some(greeting) = decoder.next_greeting()? {
+            return Ok(Some(greeting));
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(None),
+            Ok(n) => decoder.push(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -295,6 +425,50 @@ pub fn recv<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greetings_read_alike_whenever_they_arrive() {
+        let greeting = Greeting {
+            protocol: 7,
+            intent: Intent::Kill,
+            version: "9.9.9".to_owned(),
+        };
+        let mut bytes = greeting.encode();
+        bytes.extend(encode(&ClientMsg::List));
+        let mut decoder = Decoder::from_client();
+        let mut got = None;
+        for &b in &bytes {
+            decoder.push(&[b]);
+            if got.is_none() {
+                got = decoder.next_greeting().unwrap();
+            }
+        }
+        assert_eq!(got, Some(greeting.clone()));
+        // Messages follow it as ever.
+        assert!(matches!(
+            decoder.next::<ClientMsg>(),
+            Ok(Some(ClientMsg::List))
+        ));
+        assert_eq!(decoder.taken(), bytes.len() as u64);
+
+        // An intent from a later version is just talking.
+        let mut later = greeting.encode();
+        later[8] = 200;
+        let mut decoder = Decoder::from_client();
+        decoder.push(&later);
+        assert_eq!(
+            decoder.next_greeting().unwrap().unwrap().intent,
+            Intent::Talk
+        );
+    }
+
+    #[test]
+    fn a_tiri_from_before_greetings_is_told_apart() {
+        let mut decoder = Decoder::from_client();
+        decoder.push(&encode(&ClientMsg::List));
+        let e = decoder.next_greeting().unwrap_err();
+        assert!(e.to_string().contains("version"), "{e}");
+    }
 
     #[test]
     fn messages_survive_arriving_a_byte_at_a_time() {
