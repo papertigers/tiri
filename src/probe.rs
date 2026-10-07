@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Asking a client's terminal, as it attaches, whether it supports kitty
-//! graphics and which colors it uses.
+//! graphics and the kitty keyboard protocol, and which colors it uses.
 //!
 //! The queries are sent together, followed by a request for the device's
 //! primary attributes, which every terminal answers. Answers come back in
@@ -35,6 +35,9 @@ const READ_CHUNK: usize = 4096;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalInfo {
     pub kitty_graphics: bool,
+    /// Whether it speaks the kitty keyboard protocol, which tells keys apart
+    /// that otherwise send the same bytes, like Enter and Shift+Enter.
+    pub kitty_keyboard: bool,
     pub colors: ReportedColors,
     /// A cell's (width, height) in pixels.
     pub cell_pixels: Option<(u16, u16)>,
@@ -56,6 +59,7 @@ pub fn probe() -> io::Result<TerminalInfo> {
     // Pixel sizes: the size of the terminal itself often comes without.
     out.write_all(escape::QUERY_CELL_SIZE.as_bytes())?;
     out.write_all(escape::QUERY_TEXT_AREA_SIZE.as_bytes())?;
+    out.write_all(escape::QUERY_KEYBOARD_FLAGS.as_bytes())?;
     out.write_all(escape::QUERY_DEVICE_ATTRIBUTES.as_bytes())?;
     out.flush()?;
 
@@ -94,13 +98,18 @@ pub fn probe() -> io::Result<TerminalInfo> {
 /// Whether `answers` include the reply to the primary device attributes
 /// request: `CSI ? …numbers… c`.
 fn has_device_attributes(answers: &[u8]) -> bool {
+    has_private_report(answers, report::DEVICE_ATTRIBUTES_FINAL)
+}
+
+/// Whether `answers` include a report `CSI ? …numbers… final`.
+fn has_private_report(answers: &[u8], last: u8) -> bool {
     let start = report::DEVICE_ATTRIBUTES.as_bytes();
     answers.windows(start.len()).enumerate().any(|(i, w)| {
         w == start
             && answers[i + start.len()..]
                 .iter()
                 .find(|b| !(b.is_ascii_digit() || **b == b';'))
-                == Some(&report::DEVICE_ATTRIBUTES_FINAL)
+                == Some(&last)
     })
 }
 
@@ -109,6 +118,10 @@ pub fn parse(answers: &[u8]) -> TerminalInfo {
     let text = String::from_utf8_lossy(answers);
     let mut info = TerminalInfo {
         kitty_graphics: kitty::supported(&text),
+        kitty_keyboard: has_private_report(
+            answers,
+            report::KEYBOARD_FLAGS_FINAL,
+        ),
         ..TerminalInfo::default()
     };
     // Window reports: CSI kind ; height ; width t.
@@ -211,6 +224,16 @@ mod tests {
         assert_eq!(parse(answers), TerminalInfo::default());
         assert!(has_device_attributes(answers));
         assert!(!has_device_attributes(b"\x1b[?1;2"));
+    }
+
+    #[test]
+    fn keyboard_flags_reports_mean_the_keyboard_protocol() {
+        let info = parse(b"\x1b[?0u\x1b[?62;22c");
+        assert!(info.kitty_keyboard);
+        assert!(has_device_attributes(b"\x1b[?0u\x1b[?62;22c"));
+        // Only device attributes: no protocol, and not mistaken for one.
+        assert!(!parse(b"\x1b[?62;22c").kitty_keyboard);
+        assert!(!has_device_attributes(b"\x1b[?1u"));
     }
 
     #[test]
