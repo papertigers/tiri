@@ -142,3 +142,30 @@ fn peer(fd: RawFd) -> Option<(i32, u32)> {
 fn peer(_fd: RawFd) -> Option<(i32, u32)> {
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// Each system says in its own way (illumos with `getpeerucred`, macOS
+    /// with `LOCAL_PEERPID`, Linux with `SO_PEERCRED`); connected to
+    /// itself, a process must hear it's itself, as itself.
+    #[test]
+    fn sockets_name_the_process_at_the_other_end() {
+        let dir = std::env::temp_dir()
+            .join(format!("tiri-peer-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let us =
+            (std::process::id() as i32, rustix::process::getuid().as_raw());
+        assert_eq!(peer_process(&client), Some(us), "the server's end");
+        assert_eq!(peer_process(&server), Some(us), "the client's end");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
