@@ -14,6 +14,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::colors::ReportedColors;
+use crate::keys::Action;
+use crate::layout::PaneId;
+use crate::workspace::Workspace;
 
 /// The biggest message a server may send: its output comes in pieces far
 /// smaller, so this is only a backstop.
@@ -49,39 +52,95 @@ pub struct Hello {
     /// Where panes this client opens should start; for a client on another
     /// machine, None, and they start in the home directory.
     pub cwd: Option<PathBuf>,
-    /// Whether its overview should use kitty graphics thumbnails.
-    pub kitty_overview: bool,
-    /// The colors its terminal reported.
+    /// The colors its terminal reported, for answering programs that ask.
     pub colors: ReportedColors,
-    /// Its terminal's cell size in pixels, if it says.
-    pub cell_pixels: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// The first message from an attaching client.
     Hello(Hello),
-    /// Input from the client's terminal. Pastes come as [`ClientMsg::Paste`].
-    Event(crossterm::event::Event),
-    /// Part of a paste, in order; `last` on its last part. The parts make
-    /// one paste, as far as the program receiving it can tell.
-    Paste {
-        text: String,
-        last: bool,
+    /// Bytes for pane `pane`'s program: typed, pasted, or a mouse report.
+    /// None is whichever pane the client has focused when the server gets
+    /// it, so keys typed just after a focus change follow it. Pastes come
+    /// in parts of at most [`PASTE_CHUNK`] bytes.
+    Input {
+        pane: Option<PaneId>,
+        bytes: Vec<u8>,
     },
-    /// The terminal's cell size in pixels changed, as after a font change.
-    CellPixels(Option<(u16, u16)>),
+    /// A change to the layout.
+    Command(Command),
+    /// The client's terminal changed size.
+    Resize {
+        width: u16,
+        height: u16,
+    },
+    /// The client is leaving; its panes keep running.
+    Detach,
     /// Asks for the workspace list instead of attaching.
     List,
     KillServer,
 }
 
+/// A change to the layout a client asks the server for. The server makes
+/// it, if it still can, and sends everyone the new [`Layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Command {
+    /// One of the configured actions that change the layout.
+    Action(Action),
+    /// Focuses this pane, wherever it is, and its workspace.
+    FocusPane(PaneId),
+    /// Goes to workspace `ws`.
+    FocusWorkspace(usize),
+    /// Focuses column `column` of the client's workspace.
+    FocusColumn(usize),
+    /// Makes column `column` of workspace `ws` `cells` wide, as dragging
+    /// its edge does.
+    ResizeColumn { ws: usize, column: usize, cells: i32 },
+    /// Makes pane `row` of column `column` of workspace `ws` `rows` tall.
+    ResizePane { ws: usize, column: usize, row: usize, rows: i32 },
+    /// Scrolls workspace `ws` to its focused column, after a drag.
+    ShowFocus { ws: usize },
+}
+
+/// The layout as a client is to draw it: every workspace, and which one
+/// the client is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Layout {
+    pub workspaces: Vec<Workspace>,
+    /// Index of the workspace this client is on.
+    pub active: usize,
+    /// Each pane's title until its program sets one: its shell's name.
+    pub titles: Vec<(PaneId, String)>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// The hello was accepted; output follows.
+    /// The hello was accepted; the layout and the panes follow.
     Attached,
-    /// Bytes to write to the client's terminal as they are.
-    Output(Vec<u8>),
+    /// The layout, whole, whenever it changes.
+    Layout(Layout),
+    /// Pane `pane`'s terminal, to start a copy from: output that rebuilds
+    /// it in a fresh emulator `rows` by `cols`. Its output follows.
+    PaneSnapshot {
+        pane: PaneId,
+        rows: u16,
+        cols: u16,
+        bytes: Vec<u8>,
+    },
+    /// What pane `pane`'s program wrote, in order.
+    PaneOutput {
+        pane: PaneId,
+        bytes: Vec<u8>,
+    },
+    /// Pane `pane` was resized here, between the output before and after.
+    PaneResize {
+        pane: PaneId,
+        rows: u16,
+        cols: u16,
+    },
+    /// Something to tell the user.
+    Notice(String),
     Workspaces(Vec<WorkspaceInfo>),
     /// The request failed; the server closes the connection after this.
     Error(String),
@@ -200,15 +259,15 @@ pub fn recv<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
     use super::*;
 
     #[test]
     fn messages_survive_arriving_a_byte_at_a_time() {
-        let key =
-            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
-        let mut bytes = encode(&ClientMsg::Event(key.clone()));
+        let input = ClientMsg::Input {
+            pane: Some(PaneId(3)),
+            bytes: b"\x1bx".to_vec(),
+        };
+        let mut bytes = encode(&input);
         bytes.extend(encode(&ClientMsg::KillServer));
 
         let mut decoder = Decoder::from_server();
@@ -219,28 +278,26 @@ mod tests {
                 got.push(msg);
             }
         }
-        assert!(
-            matches!(&got[..], [ClientMsg::Event(e), ClientMsg::KillServer] if *e == key)
-        );
+        assert!(matches!(
+            &got[..],
+            [ClientMsg::Input { pane: Some(PaneId(3)), bytes }, ClientMsg::KillServer]
+                if bytes == b"\x1bx"
+        ));
     }
 
     #[test]
     fn clients_may_only_send_small_messages() {
-        let paste = ClientMsg::Paste {
-            text: "x".repeat(MAX_CLIENT_MESSAGE),
-            last: true,
-        };
+        let input =
+            |len| ClientMsg::Input { pane: None, bytes: vec![b'x'; len] };
         let mut decoder = Decoder::from_client();
-        decoder.push(&encode(&paste));
+        decoder.push(&encode(&input(MAX_CLIENT_MESSAGE)));
         assert!(decoder.next::<ClientMsg>().is_err());
 
-        let paste =
-            ClientMsg::Paste { text: "x".repeat(PASTE_CHUNK), last: true };
         let mut decoder = Decoder::from_client();
-        decoder.push(&encode(&paste));
+        decoder.push(&encode(&input(PASTE_CHUNK)));
         assert!(matches!(
             decoder.next::<ClientMsg>(),
-            Ok(Some(ClientMsg::Paste { .. }))
+            Ok(Some(ClientMsg::Input { .. }))
         ));
     }
 
@@ -254,18 +311,44 @@ mod tests {
     #[test]
     fn blocking_send_and_recv_round_trip() {
         let mut wire = Vec::new();
-        send(&mut wire, &ServerMsg::Output(b"hello".to_vec())).unwrap();
+        let output =
+            ServerMsg::PaneOutput { pane: PaneId(1), bytes: b"hello".to_vec() };
+        send(&mut wire, &output).unwrap();
         send(&mut wire, &ServerMsg::Exit(ExitReason::Detached)).unwrap();
         let mut reader = &wire[..];
         let mut decoder = Decoder::from_server();
         let first: ServerMsg =
             recv(&mut reader, &mut decoder).unwrap().unwrap();
-        assert!(matches!(first, ServerMsg::Output(b) if b == b"hello"));
+        assert!(
+            matches!(first, ServerMsg::PaneOutput { bytes, .. } if bytes == b"hello")
+        );
         let second: ServerMsg =
             recv(&mut reader, &mut decoder).unwrap().unwrap();
         assert!(matches!(second, ServerMsg::Exit(ExitReason::Detached)));
         assert!(
             recv::<ServerMsg>(&mut reader, &mut decoder).unwrap().is_none()
         );
+    }
+
+    #[test]
+    fn the_layout_goes_over_whole() {
+        use crate::workspace::Workspaces;
+        let mut workspaces = Workspaces::new(80, &["notes".to_owned()]);
+        workspaces.add_client(crate::workspace::ClientId(0));
+        workspaces.insert(crate::workspace::ClientId(0), PaneId(7));
+        let layout = Layout {
+            workspaces: workspaces.list().to_vec(),
+            active: 0,
+            titles: vec![(PaneId(7), "zsh".to_owned())],
+        };
+        let mut decoder = Decoder::from_server();
+        decoder.push(&encode(&ServerMsg::Layout(layout)));
+        let Some(ServerMsg::Layout(got)) = decoder.next().unwrap() else {
+            panic!("not a layout");
+        };
+        assert_eq!(got.workspaces.len(), workspaces.list().len());
+        assert_eq!(got.workspaces[0].name(), Some("notes"));
+        assert_eq!(got.workspaces[0].strip().columns()[0].panes(), [PaneId(7)]);
+        assert_eq!(got.titles, [(PaneId(7), "zsh".to_owned())]);
     }
 }

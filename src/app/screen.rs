@@ -9,14 +9,15 @@ use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 
 use crate::colors::ANSI_COLORS;
 use crate::layout::PaneId;
-use crate::pane::Pane;
 use crate::render::{Color, Frame, Style};
 use crate::selection::{Point, Selection};
+
+use super::PaneCopy;
 
 /// The first line of `pane` to show in a box `h` rows high: the screen's
 /// top, or the rows around the cursor if the box is shorter (as in the
 /// overview), moved up by however far the client has scrolled back.
-pub(super) fn content_top(pane: &Pane, h: i32, scrolled: usize) -> i32 {
+pub(super) fn content_top(pane: &PaneCopy, h: i32, scrolled: usize) -> i32 {
     let (rows, _) = pane.emulator().size();
     let h = h.clamp(0, i32::from(rows)) as u16;
     let (cursor_row, _) = pane.emulator().cursor();
@@ -30,7 +31,7 @@ pub(super) fn content_top(pane: &Pane, h: i32, scrolled: usize) -> i32 {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_screen(
     frame: &mut Frame,
-    pane: &Pane,
+    pane: &PaneCopy,
     id: PaneId,
     x: i32,
     y: i32,
@@ -96,7 +97,7 @@ pub(super) fn draw_screen(
 }
 
 fn cell_style(
-    pane: &Pane,
+    pane: &PaneCopy,
     cell: &alacritty_terminal::term::cell::Cell,
 ) -> Style {
     let flags = cell.flags;
@@ -122,7 +123,7 @@ fn is_dim_named(color: TermColor) -> bool {
 /// Maps an emulator color to one the outer terminal understands. Colors an
 /// app redefined (OSC 4/10/11) are sent as RGB; the rest are left to the
 /// outer terminal's palette so tiri matches its theme.
-fn term_color(pane: &Pane, color: TermColor) -> Color {
+fn term_color(pane: &PaneCopy, color: TermColor) -> Color {
     let rgb = |c: alacritty_terminal::vte::ansi::Rgb| Color::Rgb(c.r, c.g, c.b);
     match color {
         TermColor::Spec(c) => rgb(c),

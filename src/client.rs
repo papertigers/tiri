@@ -3,9 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The tiri client: connects to the server (starting one if needed), puts
-//! the terminal in raw mode, and relays between the two. The server does all
-//! the drawing; the client just forwards input and writes out what it's
-//! sent. Also the bridge that relays to a server from another machine.
+//! the terminal in raw mode, and draws. The server sends the layout and
+//! each pane's output; the client keeps copies of the panes and draws and
+//! animates them itself, sending the server what's typed and what's asked
+//! of the layout. Also the bridge that relays to a server from another
+//! machine.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -18,16 +20,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
 
+use crate::app::{App, Client};
+use crate::colors::Palette;
+use crate::config::{self, Config};
 use crate::escape;
-use crate::link::{Link, LinkReader, Server};
+use crate::link::{Link, LinkReader, LinkWriter, Server};
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
-    ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target,
-    recv, send,
+    ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send,
 };
 use crate::socket;
 
@@ -35,6 +39,8 @@ use crate::socket;
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often to look for a starting server's socket.
 const SERVER_START_POLL: Duration = Duration::from_millis(20);
+/// The shortest time between frames.
+const FRAME: Duration = Duration::from_millis(16);
 
 /// Attaches this terminal to `target`, starting a server if none is running.
 pub fn attach(server: &Server, target: Target) -> Result<()> {
@@ -74,9 +80,7 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
             height,
             target,
             cwd,
-            kitty_overview,
-            colors: terminal_info.colors,
-            cell_pixels,
+            colors: terminal_info.colors.clone(),
         }),
     )
     .with_context(talking)?;
@@ -91,47 +95,47 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
         ),
     }
 
-    let (input_failed, input_error) = mpsc::channel();
+    // A config with mistakes gives way to the default one, with a word in
+    // the status bar: refusing would shut you out of your own panes.
+    // The whole of what's wrong goes to stderr once the terminal's back.
+    let (config, config_error) = match config::default_path() {
+        Some(path) => match Config::load(&path) {
+            Ok(config) => (config, None),
+            Err(e) => (Config::default(), Some(e)),
+        },
+        None => (Config::default(), None),
+    };
+    let mut app = App::new(config);
+    let mut client = Client::new(
+        width,
+        height,
+        Palette::from_reported(&terminal_info.colors),
+        cell_pixels,
+        kitty_overview,
+    );
+    if let Some(error) = &config_error {
+        client.notify(format!("{}; using the default config", error.summary));
+    }
+
     let reason = {
         let _guard = TerminalGuard::enter()?;
-        let (mut reader, mut writer) = link.split();
-        thread::spawn(move || {
-            loop {
-                let event = match event::read() {
-                    Ok(event) => event,
-                    Err(e) => {
-                        // Hang up, so the relay below stops too and the
-                        // terminal is put back before the error is shown.
-                        let _ = input_failed.send(e);
-                        writer.hang_up();
-                        break;
-                    }
-                };
-                // A resize may come with new cell proportions, say from a
-                // font size change. Only send them when the terminal says:
-                // many, Ghostty among them, leave pixel sizes out, and the
-                // size probed at attach still stands.
-                let resized = matches!(event, event::Event::Resize(..));
-                let pixels = if resized { size_cell_pixels() } else { None };
-                let sent = match event {
-                    event::Event::Paste(text) => paste_messages(&text)
-                        .try_for_each(|msg| send(&mut writer, &msg)),
-                    event => send(&mut writer, &ClientMsg::Event(event)),
-                };
-                if sent.is_err()
-                    || pixels.is_some_and(|p| {
-                        send(&mut writer, &ClientMsg::CellPixels(Some(p)))
-                            .is_err()
-                    })
-                {
-                    break;
-                }
-            }
-        });
-        relay(&mut reader, &mut decoder, server)
+        let (reader, mut writer) = link.split();
+        let (events, incoming) = mpsc::channel();
+        spawn_input(events.clone());
+        spawn_reader(reader, decoder, events);
+        let result = run(&mut app, &mut client, &incoming, &mut writer, server);
+        // Done with the server, so the reading thread stops, and ssh with
+        // it if that's the way there.
+        writer.hang_up();
+        // Thumbnails out of the terminal, before leaving its screen.
+        app.detach(&mut client);
+        let mut out = io::stdout();
+        let _ = out.write_all(&client.take_escapes());
+        let _ = out.flush();
+        result
     };
-    if let Ok(e) = input_error.try_recv() {
-        return Err(e).context("couldn't read input from the terminal");
+    if let Some(error) = config_error {
+        eprintln!("tiri used the default config, since:\n{error}");
     }
     match reason? {
         ExitReason::Detached => println!("[detached]"),
@@ -140,28 +144,162 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
     Ok(())
 }
 
-/// A paste as messages of at most [`PASTE_CHUNK`] bytes each, split
-/// between characters.
-///
-/// The end-of-paste marker is taken out first, as xterm does: in a paste it
-/// would end the program's bracketed paste early, and what followed would
-/// arrive as if typed.
-fn paste_messages(text: &str) -> impl Iterator<Item = ClientMsg> {
-    let mut rest = text.replace(escape::PASTE_END, "");
-    let mut done = false;
-    std::iter::from_fn(move || {
-        if done {
-            return None;
+/// What wakes the client: the terminal or the server.
+enum Incoming {
+    Input(event::Event),
+    InputFailed(io::Error),
+    Server(ServerMsg),
+    /// The server hung up, or sent something that makes no sense: None
+    /// for the first.
+    Lost(Option<anyhow::Error>),
+}
+
+/// Reads the terminal's input on a thread of its own.
+fn spawn_input(events: mpsc::Sender<Incoming>) {
+    thread::spawn(move || {
+        loop {
+            let incoming = match event::read() {
+                Ok(event) => Incoming::Input(event),
+                Err(e) => {
+                    let _ = events.send(Incoming::InputFailed(e));
+                    return;
+                }
+            };
+            if events.send(incoming).is_err() {
+                return;
+            }
         }
-        let mut end = rest.len().min(PASTE_CHUNK);
-        while !rest.is_char_boundary(end) {
-            end -= 1;
+    });
+}
+
+/// Reads what the server sends on a thread of its own.
+fn spawn_reader(
+    mut reader: LinkReader,
+    mut decoder: Decoder,
+    events: mpsc::Sender<Incoming>,
+) {
+    thread::spawn(move || {
+        loop {
+            let incoming = match recv(&mut reader, &mut decoder) {
+                Ok(Some(msg)) => Incoming::Server(msg),
+                Ok(None) => Incoming::Lost(None),
+                Err(e) => Incoming::Lost(Some(e)),
+            };
+            let lost = matches!(incoming, Incoming::Lost(_));
+            if events.send(incoming).is_err() || lost {
+                return;
+            }
         }
-        let tail = rest.split_off(end);
-        let text = std::mem::replace(&mut rest, tail);
-        done = rest.is_empty();
-        Some(ClientMsg::Paste { text, last: done })
-    })
+    });
+}
+
+/// Draws and animates, takes input, and keeps the copies of the panes up
+/// to date, until the server says goodbye.
+fn run(
+    app: &mut App,
+    client: &mut Client,
+    incoming: &mpsc::Receiver<Incoming>,
+    writer: &mut LinkWriter,
+    server: &Server,
+) -> Result<ExitReason> {
+    let mut stdout = io::stdout().lock();
+    let mut animating = false;
+    let mut dirty = true;
+    let mut last_tick = Instant::now();
+    let mut last_draw = last_tick - FRAME;
+    loop {
+        // Wake for the next frame, if one's owed, or anything else due.
+        let next_frame = (dirty || animating).then(|| last_draw + FRAME);
+        let deadline =
+            [next_frame, app.next_deadline(client)].into_iter().flatten().min();
+        let first = match deadline {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match incoming.recv_timeout(wait) {
+                    Ok(incoming) => Some(incoming),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("lost the terminal and the server")
+                    }
+                }
+            }
+            None => Some(incoming.recv()?),
+        };
+        // Everything waiting goes in before the next frame.
+        for incoming in first.into_iter().chain(incoming.try_iter()) {
+            dirty = true;
+            match incoming {
+                Incoming::Input(event) => input(app, client, event),
+                Incoming::InputFailed(e) => {
+                    return Err(e)
+                        .context("couldn't read input from the terminal");
+                }
+                Incoming::Server(ServerMsg::Exit(reason)) => return Ok(reason),
+                Incoming::Server(ServerMsg::Error(e)) => bail!(e),
+                Incoming::Server(msg) => app.apply(client, msg),
+                // A message that doesn't decode says what's wrong itself.
+                Incoming::Lost(Some(e)) if !e.is::<io::Error>() => {
+                    return Err(e);
+                }
+                Incoming::Lost(e) => {
+                    let lost = format!(
+                        "lost connection to the tiri server; its log may say \
+                         why: {}",
+                        server.log_hint()
+                    );
+                    return Err(match e {
+                        Some(e) => e.context(lost),
+                        None => anyhow!(lost),
+                    });
+                }
+            }
+        }
+        for msg in app.take_outbox() {
+            // A server that's gone says so on the reading side.
+            if send(writer, &msg).is_err() {
+                break;
+            }
+        }
+
+        let now = Instant::now();
+        app.expire_syncs(now);
+        // Don't let a long idle wait turn into one giant animation step.
+        let dt = if animating { now - last_tick } else { Duration::ZERO };
+        last_tick = now;
+        // Effects and fades run on frames as animations do.
+        animating = app.tick(dt.max(Duration::from_millis(1)))
+            || client.effects_running();
+        if !(dirty || animating) || now < last_draw + FRAME {
+            // Nothing to draw, or too soon after the last frame: the next
+            // comes when it's due.
+            continue;
+        }
+        let (frame, cursor) = app.draw(client);
+        client.render(&mut stdout, frame, cursor)?;
+        stdout.flush()?;
+        last_draw = now;
+        dirty = false;
+    }
+}
+
+/// Acts on input from the terminal.
+fn input(app: &mut App, client: &mut Client, event: event::Event) {
+    match event {
+        event::Event::Key(key) => app.key(client, key),
+        event::Event::Paste(text) => app.paste(client, &text),
+        event::Event::Mouse(mouse) => app.mouse(client, mouse),
+        event::Event::Resize(width, height) => {
+            app.resize(client, width, height);
+            // A resize may come with new cell proportions, say from a font
+            // size change. Only when the terminal says: many, Ghostty among
+            // them, leave pixel sizes out, and the size probed at attach
+            // still stands.
+            if let Some(pixels) = size_cell_pixels() {
+                client.set_cell_pixels(Some(pixels));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The cell size in pixels from the probe: the terminal's own cell size
@@ -193,41 +331,6 @@ fn detect_terminal() -> TerminalInfo {
     let info = probe::probe().unwrap_or_default();
     let _ = terminal::disable_raw_mode();
     info
-}
-
-/// Writes the server's output to the terminal until it says goodbye.
-fn relay(
-    stream: &mut LinkReader,
-    decoder: &mut Decoder,
-    server: &Server,
-) -> Result<ExitReason> {
-    let mut stdout = io::stdout().lock();
-    loop {
-        let msg = recv(stream, decoder).map_err(|e| {
-            // A message that doesn't decode says what's wrong itself.
-            if !e.is::<io::Error>() {
-                return e;
-            }
-            e.context(format!(
-                "lost connection to the tiri server; its log may say why: {}",
-                server.log_hint()
-            ))
-        })?;
-        match msg {
-            Some(ServerMsg::Output(bytes)) => {
-                stdout.write_all(&bytes)?;
-                stdout.flush()?;
-            }
-            Some(ServerMsg::Exit(reason)) => return Ok(reason),
-            Some(ServerMsg::Error(e)) => bail!(e),
-            Some(_) => {}
-            // A server that's shutting down says so first.
-            None => bail!(
-                "the tiri server went away unexpectedly; its log may say why: {}",
-                server.log_hint()
-            ),
-        }
-    }
 }
 
 /// Prints the server's workspaces.
@@ -505,48 +608,4 @@ fn restore() {
     let _ = out.execute(cursor::Show);
     let _ = terminal::disable_raw_mode();
     let _ = out.flush();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parts(text: &str) -> Vec<(String, bool)> {
-        paste_messages(text)
-            .map(|msg| match msg {
-                ClientMsg::Paste { text, last } => (text, last),
-                other => panic!("not a paste: {other:?}"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn pastes_go_in_chunks_split_between_characters() {
-        let text = "é".repeat(PASTE_CHUNK); // two bytes each
-        let parts = parts(&text);
-        assert_eq!(parts.len(), 2);
-        assert!(parts.iter().all(|(t, _)| t.len() <= PASTE_CHUNK));
-        assert_eq!(
-            parts.iter().map(|(t, _)| t.as_str()).collect::<String>(),
-            text
-        );
-        assert_eq!(
-            parts.iter().map(|(_, last)| *last).collect::<Vec<_>>(),
-            [false, true]
-        );
-    }
-
-    #[test]
-    fn small_and_empty_pastes_are_one_part() {
-        assert_eq!(parts("hi"), [("hi".to_owned(), true)]);
-        assert_eq!(parts(""), [(String::new(), true)]);
-    }
-
-    #[test]
-    fn pastes_cant_end_a_bracketed_paste_early() {
-        assert_eq!(
-            parts("a\x1b[201~rm -rf ~\r"),
-            [("arm -rf ~\r".to_owned(), true)]
-        );
-    }
 }

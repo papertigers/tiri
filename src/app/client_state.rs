@@ -2,45 +2,39 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! One attached terminal's own state: its size, scrollback positions,
-//! selection and drag, and what it was last sent.
+//! The terminal's own state: its size, scrollback positions, selection
+//! and drag, and what it was last sent.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::colors::Palette;
 use crate::effects::{Effects, Transition};
 use crate::emulator::ScrollMark;
 use crate::escape::{self, MouseReporting};
-use crate::layout::PaneId;
-use crate::pane::Pane;
+use crate::layout::{PaneId, STATUS_HEIGHT};
 use crate::render::{Frame, Renderer};
 use crate::selection::{Point, Selection};
 use crate::thumbnail;
 use crate::workspace::ClientId;
 
-use super::STATUS_HEIGHT;
 use super::geometry::Seam;
 use super::thumbnails::Thumbnail;
+use super::{LOCAL, PaneCopy};
 
-/// One attached terminal: its size, its prefix-key and overview settings,
-/// the thumbnails uploaded to it, and the renderer that remembers what it
-/// was last sent.
+/// The terminal: its size, its prefix-key and overview settings, the
+/// thumbnails uploaded to it, and the renderer that remembers what it was
+/// last sent.
 pub struct Client {
+    /// Who it is in its copy of the workspaces.
     pub(super) id: ClientId,
     pub(super) width: u16,
     pub(super) height: u16,
-    /// Where panes this client opens start.
-    pub(super) cwd: PathBuf,
-    /// Its terminal's colors, for its thumbnails and for answering
-    /// programs that ask.
+    /// Its terminal's colors, for its thumbnails and effects.
     pub(super) palette: Palette,
     /// Its thumbnails' cell size, the same shape as its terminal's cells.
     pub(super) thumbnail_cell: thumbnail::CellSize,
-    /// Set when the client asks to detach; the server then lets it go.
-    pub(super) detach_requested: bool,
     pub(super) prefix_pending: bool,
     /// Whether this client's overview shows kitty graphics thumbnails
     /// instead of text.
@@ -64,18 +58,8 @@ pub struct Client {
     pub(super) transition: Option<Transition>,
     /// Something to tell the user, shown in the status bar for a while.
     pub(super) notice: Option<Notice>,
-    /// A paste partway through arriving.
-    pub(super) paste: Option<Paste>,
     /// How much of the mouse its terminal reports.
     pub(super) mouse: MouseReporting,
-}
-
-/// Where a paste is going, while it arrives in parts.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Paste {
-    pub(super) pane: PaneId,
-    /// Whether it began with the start-of-paste marker, so needs the end.
-    pub(super) bracketed: bool,
 }
 
 /// A left press in a pane.
@@ -119,16 +103,44 @@ pub(super) enum Drag {
     /// picked a word or line, which copies even a single character.
     Selecting { pane: PaneId, snapped: bool },
     /// Dragging `seam` to resize, measuring from `anchor`: the x of its
-    /// column's left edge, or the y of the top of the pane above it.
-    Resizing { seam: Seam, anchor: i32 },
+    /// column's left edge, or the y of the top of the pane above it. `to`
+    /// is the size it was last dragged to, if it's moved yet.
+    Resizing { seam: Seam, anchor: i32, to: Option<i32> },
 }
 
 impl Client {
-    pub fn detach_requested(&self) -> bool {
-        self.detach_requested
+    /// A terminal `width` by `height` cells, with these colors and, if it
+    /// says, cells this many pixels in size, showing kitty graphics
+    /// thumbnails in the overview if `kitty_overview`.
+    pub fn new(
+        width: u16,
+        height: u16,
+        palette: Palette,
+        cell_pixels: Option<(u16, u16)>,
+        kitty_overview: bool,
+    ) -> Self {
+        Self {
+            id: LOCAL,
+            width,
+            height,
+            palette,
+            thumbnail_cell: thumbnail::cell_size_for(cell_pixels),
+            prefix_pending: false,
+            kitty_overview,
+            thumbnails: HashMap::new(),
+            escapes: Vec::new(),
+            renderer: Renderer::default(),
+            scrollback: HashMap::new(),
+            selection: None,
+            drag: Drag::None,
+            last_click: None,
+            effects: Effects::default(),
+            transition: None,
+            notice: None,
+            mouse: MouseReporting::default(),
+        }
     }
 
-    /// Whether effects are running, so frames must keep coming.
     /// Tells the user something, say that what they asked for failed.
     pub fn notify(&mut self, text: impl Into<String>) {
         self.notice = Some(Notice {
@@ -137,6 +149,7 @@ impl Client {
         });
     }
 
+    /// Whether effects are running, so frames must keep coming.
     pub fn effects_running(&self) -> bool {
         self.effects.is_active() || self.transition.is_some()
     }
@@ -150,7 +163,8 @@ impl Client {
         }
     }
 
-    /// Escape sequences to write before drawing the next frame.
+    /// Escape sequences to write before drawing the next frame, or before
+    /// leaving.
     pub fn take_escapes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.escapes)
     }
@@ -165,7 +179,7 @@ impl Client {
     /// How many lines back this client is scrolled in `pane`. Output since
     /// it scrolled pushes the view further back, so what it was reading
     /// stays put.
-    pub(super) fn scrolled(&self, id: PaneId, pane: &Pane) -> usize {
+    pub(super) fn scrolled(&self, id: PaneId, pane: &PaneCopy) -> usize {
         let Some(scroll) = self.scrollback.get(&id) else {
             return 0;
         };
@@ -178,7 +192,10 @@ impl Client {
 
     /// Keeps the selection on the text it was made on as output moves that
     /// up, and drops it once the text or its pane has gone.
-    pub(super) fn follow_selection(&mut self, panes: &HashMap<PaneId, Pane>) {
+    pub(super) fn follow_selection(
+        &mut self,
+        panes: &HashMap<PaneId, PaneCopy>,
+    ) {
         let Some(selection) = &mut self.selection else {
             return;
         };
@@ -206,7 +223,7 @@ impl Client {
 
     /// Scrolls `pane` back by `lines` (forward if negative), returning to
     /// the live screen at the bottom.
-    pub(super) fn scroll(&mut self, id: PaneId, pane: &Pane, lines: i32) {
+    pub(super) fn scroll(&mut self, id: PaneId, pane: &PaneCopy, lines: i32) {
         let history = pane.emulator().history_size();
         let current = self.scrolled(id, pane) as i32;
         let target = (current + lines).clamp(0, history as i32) as usize;

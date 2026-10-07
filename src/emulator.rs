@@ -18,6 +18,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 
+use crate::escape;
 use crate::input::MouseModes;
 use crate::snapshot::{self, Tracker};
 
@@ -222,17 +223,19 @@ impl Emulator {
     }
 
     /// Output that rebuilds this terminal from scratch, with up to
-    /// `history` lines of history. A synchronized update in progress is
-    /// applied first, as the output the tracker has seen already is.
-    #[expect(
-        dead_code,
-        reason = "clients start their copies of panes from these"
-    )]
+    /// `history` lines of history, and its title. A synchronized update in
+    /// progress is applied first, as the output the tracker has seen
+    /// already is.
     pub fn snapshot(&mut self, history: usize) -> Vec<u8> {
         if self.sync_deadline().is_some() {
             self.stop_sync();
         }
-        snapshot::snapshot(&mut self.term, self.tracker.hidden(), history)
+        let mut out =
+            snapshot::snapshot(&mut self.term, self.tracker.hidden(), history);
+        if let Some(title) = &self.title {
+            escape::set_title(&mut out, title);
+        }
+        out
     }
 
     /// When the program is mid synchronized update, the time at which we
@@ -350,6 +353,15 @@ mod tests {
         // Clearing history leaves nothing to measure from.
         emulator.feed(b"\x1b[3J");
         assert_eq!(emulator.scrolled_since(full), None);
+    }
+
+    #[test]
+    fn snapshots_carry_the_title() {
+        let mut emulator = Emulator::new(5, 20);
+        emulator.feed(b"\x1b]2;vim notes.txt\x07hi");
+        let mut copy = Emulator::new(5, 20);
+        copy.feed(&emulator.snapshot(0));
+        assert_eq!(copy.title(), Some("vim notes.txt"));
     }
 
     #[test]

@@ -3,9 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The tiri server: owns every pane and workspace, and serves the clients
-//! attached over its Unix socket. Everything runs on one `polling` loop:
-//! pane PTYs, the listening socket and client connections are all
-//! non-blocking, so a busy pane or a slow client never holds up the rest.
+//! attached over its Unix socket. It draws nothing: it passes each pane's
+//! output on to every client, which keeps a copy of the pane and draws from
+//! it, and does what clients ask of the layout. Everything runs on one
+//! `polling` loop: pane PTYs, the listening socket and client connections
+//! are all non-blocking, so a busy pane or a slow client never holds up the
+//! rest.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -16,14 +19,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::Event;
 use polling::{Event as PollEvent, Events, Poller};
 use signal_hook::consts::SIGCHLD;
 
-use crate::app::{App, Client};
 use crate::config;
+use crate::host::{Guest, Host};
 use crate::protocol::{
-    ClientMsg, Decoder, ExitReason, READ_CHUNK, ServerMsg, encode,
+    ClientMsg, Decoder, ExitReason, Hello, READ_CHUNK, ServerMsg, encode,
 };
 
 /// Pane PTYs are keyed by pane id, which is a u32; these sit above them.
@@ -33,13 +35,12 @@ const LISTENER_KEY: usize = usize::MAX - 1;
 const SIGCHLD_KEY: usize = usize::MAX - 2;
 const CONNECTION_KEY_BASE: usize = 1 << 32;
 
-const FRAME: Duration = Duration::from_millis(16);
 /// The most read from one connection per wakeup, so a client flooding the
 /// socket can't keep the server from everything else.
 const READ_BUDGET: usize = 256 * 1024;
-/// The most terminal output in one message, far below what the client
-/// refuses to take.
-const MAX_OUTPUT: usize = 1 << 20;
+/// The most a client may fall behind by, in bytes not yet taken by its
+/// socket, before it's dropped rather than queued for without end.
+const MAX_BACKLOG: usize = 64 * 1024 * 1024;
 /// A server started for a client that never attaches gives up after this.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// How long shutting down waits, in all, for clients to take their goodbyes.
@@ -63,7 +64,7 @@ struct Connection {
     /// Encoded messages the socket hasn't accepted yet.
     outgoing: Vec<u8>,
     /// Set once the connection's hello has been accepted.
-    client: Option<Client>,
+    client: Option<Guest>,
     /// Close once `outgoing` has been sent.
     closing: bool,
     /// The other end has sent all it's going to. What it sent first is
@@ -71,8 +72,6 @@ struct Connection {
     eof: bool,
     /// The connection failed, or has been dealt with after `eof`.
     dead: bool,
-    /// A frame was held back while this was behind, so it's owed one.
-    owed_frame: bool,
 }
 
 impl Connection {
@@ -86,7 +85,6 @@ impl Connection {
             closing: false,
             eof: false,
             dead: false,
-            owed_frame: false,
         }
     }
 
@@ -96,15 +94,29 @@ impl Connection {
     }
 
     fn send(&mut self, msg: &ServerMsg) {
-        self.outgoing.extend(encode(msg));
+        self.send_encoded(&encode(msg));
     }
 
-    /// Sends bytes for the client's terminal, in messages of a size the
-    /// client will take however much there is (a big clipboard copy, say).
-    fn send_output(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(MAX_OUTPUT) {
-            self.send(&ServerMsg::Output(chunk.to_vec()));
+    /// Queues an encoded message, unless the client is too far behind to
+    /// catch up, in which case it's dropped.
+    fn send_encoded(&mut self, bytes: &[u8]) {
+        if self.dead {
+            return;
         }
+        if self.outgoing.len() + bytes.len() > MAX_BACKLOG {
+            log::warn!(
+                "{}: dropping it: over {MAX_BACKLOG} bytes behind",
+                self.name()
+            );
+            self.dead = true;
+            return;
+        }
+        self.outgoing.extend(bytes);
+    }
+
+    /// Whether it's attached and still taking messages.
+    fn attached(&self) -> bool {
+        self.client.is_some() && !self.closing && !self.dead
     }
 
     /// Sends as much queued output as the socket will take.
@@ -153,22 +165,6 @@ impl Connection {
             log::warn!("{}: {doing} failed: {e}", self.name());
         }
         self.dead = true;
-    }
-
-    /// Whether this client is ready for a frame: not closing, and with
-    /// everything sent to it so far taken by its socket.
-    ///
-    /// A client that's behind gets no new frames until it catches up. Its
-    /// next frame is then diffed against the last one it was sent, so it
-    /// skips the states in between but never sees a broken screen. Over a
-    /// slow link, an animation's frames would otherwise queue up faster than
-    /// they can be sent, and anything typed meanwhile would wait its turn
-    /// behind all of them.
-    ///
-    /// Nor is it worth waiting on its deadlines: they'd only wake the
-    /// server for nothing.
-    fn wants_frames(&self) -> bool {
-        !self.closing && self.outgoing.is_empty()
     }
 
     fn finished(&self) -> bool {
@@ -252,12 +248,12 @@ fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
     unsafe { poller.add(&sigchld, PollEvent::readable(SIGCHLD_KEY)) }
         .context("couldn't watch the signal pipe")?;
 
-    let mut app = App::new(Arc::clone(&poller), config_path);
+    let mut host = Host::new(Arc::clone(&poller), config_path);
     let mut connections = HashMap::new();
     let result =
-        event_loop(listener, &sigchld, &poller, &mut app, &mut connections);
+        event_loop(listener, &sigchld, &poller, &mut host, &mut connections);
     // However the loop ended, panes are killed and clients told.
-    shut_down(&mut app, &poller, std::mem::take(&mut connections));
+    shut_down(&mut host, &poller, std::mem::take(&mut connections));
     let _ = poller.delete(&sigchld);
     signal_hook::low_level::unregister(handler);
     let _ = poller.delete(listener);
@@ -269,35 +265,32 @@ fn event_loop(
     listener: &UnixListener,
     sigchld: &UnixStream,
     poller: &Poller,
-    app: &mut App,
+    host: &mut Host,
     connections: &mut HashMap<usize, Connection>,
 ) -> Result<()> {
-    let now = Instant::now();
     let mut server = Server {
         listener,
         sigchld,
         poller,
-        app,
+        host,
         connections,
         events: Events::new(),
         next_connection: CONNECTION_KEY_BASE,
-        started: now,
+        started: Instant::now(),
         had_panes: false,
         kill: false,
-        animating: false,
-        last_tick: now,
-        last_draw: now,
         accept_paused_until: None,
     };
     loop {
         server.wait()?;
         server.take_events();
         server.handle_messages();
+        server.host.expire_syncs(Instant::now());
+        server.deliver();
         if server.should_stop() {
             return Ok(());
         }
-        server.tick();
-        server.draw();
+        server.flush();
         server.drop_finished();
     }
 }
@@ -308,7 +301,7 @@ struct Server<'a> {
     /// Readable when a child process has exited.
     sigchld: &'a UnixStream,
     poller: &'a Poller,
-    app: &'a mut App,
+    host: &'a mut Host,
     connections: &'a mut HashMap<usize, Connection>,
     /// What woke the loop this turn.
     events: Events,
@@ -319,10 +312,6 @@ struct Server<'a> {
     had_panes: bool,
     /// A client asked the server to stop.
     kill: bool,
-    /// Something is moving, so frames are due every [`FRAME`].
-    animating: bool,
-    last_tick: Instant,
-    last_draw: Instant,
     /// When to accept connections again, after accepting failed.
     accept_paused_until: Option<Instant>,
 }
@@ -336,25 +325,20 @@ impl Server<'_> {
             self.accept_paused_until = None;
         }
 
-        // Wake for the next animation frame, a pane or thumbnail deadline,
-        // accepting again, or giving up on a first client that never came;
-        // otherwise only for I/O and exiting children.
-        let client_deadlines = (self.connections.values())
-            .filter(|c| c.wants_frames())
-            .filter_map(|c| c.client.as_ref())
-            .filter_map(|client| self.app.next_deadline(client));
+        // Wake for a pane's synchronized update timing out, accepting again,
+        // or giving up on a first client that never came; otherwise only
+        // for I/O and exiting children.
         let deadline = [
-            self.animating.then(|| self.last_draw + FRAME),
+            self.host.next_deadline(),
             (!self.had_panes).then_some(self.started + STARTUP_GRACE),
             self.accept_paused_until,
         ]
         .into_iter()
         .flatten()
-        .chain(client_deadlines)
         .min();
 
         // `polling` reports each source once per arming, so re-arm them all.
-        self.app.arm_panes();
+        self.host.arm_panes();
         if self.accept_paused_until.is_none() {
             (self.poller)
                 .modify(self.listener, PollEvent::readable(LISTENER_KEY))
@@ -409,7 +393,7 @@ impl Server<'_> {
                     while matches!((&*self.sigchld).read(&mut buf), Ok(n) if n > 0)
                     {
                     }
-                    self.app.children_exited();
+                    self.host.children_exited();
                 }
                 key if key >= CONNECTION_KEY_BASE => {
                     if let Some(connection) = self.connections.get_mut(&key) {
@@ -421,47 +405,155 @@ impl Server<'_> {
                         }
                     }
                 }
-                _ => self.app.pane_ready(event),
+                _ => self.host.pane_ready(event),
             }
         }
     }
 
-    /// Acts on what clients have sent, then on what panes have copied.
+    /// Acts on what clients have sent.
     fn handle_messages(&mut self) {
-        for connection in self.connections.values_mut() {
-            // A connection that's been answered and is closing has had its
-            // say; anything more is dropped with it.
-            while !connection.dead && !connection.closing {
+        let keys: Vec<usize> = self.connections.keys().copied().collect();
+        for key in keys {
+            while let Some(connection) = self.connections.get_mut(&key)
+                // A connection that's been answered and is closing has had
+                // its say; anything more is dropped with it.
+                && !connection.dead
+                && !connection.closing
+            {
                 match connection.decoder.next::<ClientMsg>() {
-                    Ok(Some(msg)) => {
-                        handle(self.app, connection, msg, &mut self.kill)
+                    Ok(Some(msg)) => self.handle(key, msg),
+                    Ok(None) => {
+                        // Nothing more is coming. One still owed a reply
+                        // gets it first.
+                        connection.dead |= connection.eof;
+                        break;
                     }
-                    Ok(None) => break,
                     Err(e) => {
                         log::warn!("{}: dropping it: {e:#}", connection.name());
                         connection.dead = true;
                     }
                 }
             }
-            // Nothing more is coming. One still owed a reply gets it first.
-            connection.dead |= connection.eof && !connection.closing;
-            if let Some(mut client) =
-                (connection.client).take_if(|client| client.detach_requested())
-            {
-                self.app.detach(&mut client);
-                // Thumbnail cleanup, before the client leaves the screen.
-                connection.send_output(&client.take_escapes());
-                connection.send(&ServerMsg::Exit(ExitReason::Detached));
+        }
+    }
+
+    fn handle(&mut self, key: usize, msg: ClientMsg) {
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return;
+        };
+        match msg {
+            ClientMsg::Hello(hello) if connection.client.is_none() => {
+                log::info!(
+                    "{}: attaching: {}x{} cells, foreground {:?}, \
+                     background {:?}",
+                    connection.name(),
+                    hello.width,
+                    hello.height,
+                    hello.colors.foreground,
+                    hello.colors.background,
+                );
+                self.attach(key, hello);
+            }
+            ClientMsg::Hello(_) => {}
+            ClientMsg::Input { pane, bytes } => {
+                if let Some(guest) = &connection.client {
+                    self.host.input(guest, pane, &bytes);
+                }
+            }
+            ClientMsg::Command(command) => {
+                let Some(guest) = &connection.client else {
+                    return;
+                };
+                if let Err(e) = self.host.command(guest, command) {
+                    // Otherwise the key just seems to do nothing.
+                    log::error!("{}: {e:#}", connection.name());
+                    connection.send(&ServerMsg::Notice(format!("{e:#}")));
+                }
+            }
+            ClientMsg::Resize { width, height } => {
+                if let Some(guest) = connection.client.as_mut() {
+                    self.host.resize(guest, width, height);
+                }
+            }
+            ClientMsg::Detach => {
+                if let Some(guest) = connection.client.take() {
+                    self.host.detach(&guest);
+                    connection.send(&ServerMsg::Exit(ExitReason::Detached));
+                    connection.closing = true;
+                }
+            }
+            ClientMsg::List => {
+                connection
+                    .send(&ServerMsg::Workspaces(self.host.workspace_infos()));
+                connection.closing = true;
+            }
+            ClientMsg::KillServer => {
+                self.kill = true;
                 connection.closing = true;
             }
         }
+    }
 
-        // Programs copying with OSC 52 reach every attached clipboard.
-        for text in self.app.take_copied() {
-            for client in (self.connections.values_mut())
-                .filter_map(|c| c.client.as_mut())
-            {
-                client.copy(&text);
+    /// Attaches the client on connection `key`, and starts its copies of
+    /// the panes.
+    fn attach(&mut self, key: usize, hello: Hello) {
+        // What the panes did before this client's snapshots goes only to
+        // those already attached; it's in the snapshots for this one.
+        self.deliver_outgoing();
+        let attached = self.host.attach(hello);
+        self.deliver_outgoing();
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return;
+        };
+        match attached {
+            Ok(guest) => {
+                connection.send(&ServerMsg::Attached);
+                for msg in self.host.welcome(&guest) {
+                    connection.send(&msg);
+                }
+                connection.client = Some(guest);
+            }
+            Err(e) => {
+                log::warn!("{}: couldn't attach: {e:#}", connection.name());
+                connection.send(&ServerMsg::Error(format!("{e:#}")));
+                connection.closing = true;
+            }
+        }
+    }
+
+    /// Passes on what the host has for clients: pane output and the like,
+    /// then the layout, if it's changed.
+    fn deliver(&mut self) {
+        self.deliver_outgoing();
+        if self.host.take_layout_changed() {
+            for connection in self.connections.values_mut() {
+                if let (true, Some(guest)) =
+                    (connection.attached(), &connection.client)
+                {
+                    let layout = self.host.layout(guest);
+                    connection.send(&ServerMsg::Layout(layout));
+                }
+            }
+        }
+    }
+
+    fn deliver_outgoing(&mut self) {
+        for msg in self.host.take_outgoing() {
+            // Encoded once, however many clients it goes to.
+            let bytes = encode(&msg);
+            for connection in self.connections.values_mut() {
+                if connection.attached() {
+                    connection.send_encoded(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Sends what each connection's socket will take now.
+    fn flush(&mut self) {
+        for connection in self.connections.values_mut() {
+            if !connection.dead {
+                connection.flush();
             }
         }
     }
@@ -469,81 +561,15 @@ impl Server<'_> {
     /// Whether the server is done: asked to stop, out of panes, or never
     /// attached to in time.
     fn should_stop(&mut self) -> bool {
-        self.had_panes |= !self.app.is_empty();
+        self.had_panes |= !self.host.is_empty();
         // Connections that never said hello don't keep the server alive;
         // shutting down tells them it's gone.
         let abandoned =
             !self.had_panes && self.started.elapsed() >= STARTUP_GRACE;
         self.kill
-            || self.app.quit
-            || (self.had_panes && self.app.is_empty())
+            || self.host.quit
+            || (self.had_panes && self.host.is_empty())
             || abandoned
-    }
-
-    /// Moves animations on to now.
-    fn tick(&mut self) {
-        let now = Instant::now();
-        self.app.expire_syncs(now);
-        // Don't let a long idle wait turn into one giant animation step.
-        let dt =
-            if self.animating { now - self.last_tick } else { Duration::ZERO };
-        self.last_tick = now;
-        self.animating = self.app.tick(dt.max(Duration::from_millis(1)));
-    }
-
-    /// Draws for each client that's due a frame and ready for one.
-    fn draw(&mut self) {
-        // Draw when something may have changed: a pane or a client said
-        // something, a deadline passed, an animation's next frame is due,
-        // or a client that was behind has caught up. Waking only because a
-        // socket can take more output isn't a reason: drawing then would
-        // answer a slow client with more frames.
-        let now = Instant::now();
-        let changed = self.events.is_empty()
-            || self.events.iter().any(|event| match event.key {
-                LISTENER_KEY => false,
-                // A shell exiting closes its pane.
-                SIGCHLD_KEY => true,
-                key if key >= CONNECTION_KEY_BASE => event.readable,
-                _ => true,
-            });
-        let frame_due =
-            self.animating && now.duration_since(self.last_draw) >= FRAME;
-        let caught_up = (self.connections.values())
-            .any(|c| c.owed_frame && c.wants_frames());
-        let drawing = changed || frame_due || caught_up;
-        if drawing {
-            self.last_draw = now;
-        }
-
-        for connection in self.connections.values_mut() {
-            if connection.dead || connection.client.is_none() {
-                continue;
-            }
-            if !drawing || !connection.wants_frames() {
-                connection.owed_frame |= drawing;
-                // Effects still running need their next frame in time.
-                self.animating |= connection.wants_frames()
-                    && (connection.client.as_ref())
-                        .is_some_and(Client::effects_running);
-                continue;
-            }
-            connection.owed_frame = false;
-            let Some(client) = connection.client.as_mut() else {
-                continue;
-            };
-            let (frame, cursor) = self.app.draw(client);
-            // Running effects need further frames, as animations do.
-            self.animating |= client.effects_running();
-            let mut bytes = Vec::new();
-            if let Err(e) = client.render(&mut bytes, frame, cursor) {
-                log::error!("{}: couldn't render: {e}", connection.name());
-                connection.dead = true;
-                continue;
-            }
-            connection.send_output(&bytes);
-            connection.flush();
-        }
     }
 
     /// Lets go of connections that are done with.
@@ -552,8 +578,8 @@ impl Server<'_> {
             if !connection.finished() {
                 return true;
             }
-            if let Some(mut client) = connection.client.take() {
-                self.app.detach(&mut client);
+            if let Some(guest) = connection.client.take() {
+                self.host.detach(&guest);
             }
             let _ = self.poller.delete(&connection.stream);
             false
@@ -599,100 +625,18 @@ fn accept(
     }
 }
 
-fn handle(
-    app: &mut App,
-    connection: &mut Connection,
-    msg: ClientMsg,
-    kill: &mut bool,
-) {
-    match msg {
-        ClientMsg::Hello(hello) if connection.client.is_none() => {
-            log::info!(
-                "{}: attaching: {}x{} cells, cell pixels {:?}, \
-                 kitty overview {}, foreground {:?}, background {:?}",
-                connection.name(),
-                hello.width,
-                hello.height,
-                hello.cell_pixels,
-                hello.kitty_overview,
-                hello.colors.foreground,
-                hello.colors.background,
-            );
-            match app.attach(hello) {
-                Ok(client) => {
-                    connection.send(&ServerMsg::Attached);
-                    connection.client = Some(client);
-                }
-                Err(e) => {
-                    log::warn!("{}: couldn't attach: {e:#}", connection.name());
-                    connection.send(&ServerMsg::Error(format!("{e:#}")));
-                    connection.closing = true;
-                }
-            }
-        }
-        ClientMsg::Hello(_) => {}
-        ClientMsg::Event(event) => {
-            let Some(client) = connection.client.as_mut() else {
-                return;
-            };
-            let result = match event {
-                Event::Key(key) => app.key(client, key),
-                // Clients send pastes as ClientMsg::Paste; one sent whole
-                // is still one paste.
-                Event::Paste(text) => {
-                    app.paste(client, &text, true);
-                    Ok(())
-                }
-                Event::Resize(width, height) => {
-                    app.resize(client, width, height);
-                    Ok(())
-                }
-                Event::Mouse(mouse) => {
-                    app.mouse(client, mouse);
-                    Ok(())
-                }
-                _ => Ok(()),
-            };
-            if let Err(e) = result {
-                // Otherwise the key just seems to do nothing.
-                client.notify(format!("{e:#}"));
-                log::error!("{}: {e:#}", connection.name());
-            }
-        }
-        ClientMsg::Paste { text, last } => {
-            if let Some(client) = connection.client.as_mut() {
-                app.paste(client, &text, last);
-            }
-        }
-        ClientMsg::CellPixels(cell_pixels) => {
-            if let Some(client) = connection.client.as_mut() {
-                client.set_cell_pixels(cell_pixels);
-            }
-        }
-        ClientMsg::List => {
-            connection.send(&ServerMsg::Workspaces(app.workspace_infos()));
-            connection.closing = true;
-        }
-        ClientMsg::KillServer => {
-            *kill = true;
-            connection.closing = true;
-        }
-    }
-}
-
 /// Kills every pane and tells every client the server is gone, giving them
 /// a moment, between them, to receive it.
 fn shut_down(
-    app: &mut App,
+    host: &mut Host,
     poller: &Poller,
     connections: HashMap<usize, Connection>,
 ) {
-    app.shutdown();
+    host.shutdown();
     let deadline = Instant::now() + SHUTDOWN_GRACE;
     for (_, mut connection) in connections {
-        if let Some(mut client) = connection.client.take() {
-            app.detach(&mut client);
-            connection.send_output(&client.take_escapes());
+        if let Some(guest) = connection.client.take() {
+            host.detach(&guest);
         }
         connection.send(&ServerMsg::Exit(ExitReason::ServerExited));
         let _ = poller.delete(&connection.stream);

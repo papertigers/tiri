@@ -12,7 +12,9 @@ use crossterm::event::{
 };
 
 use crate::input::{encode_key, encode_mouse};
+use crate::keys::Action;
 use crate::layout::PaneId;
+use crate::protocol::{ClientMsg, Command};
 use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
 
@@ -117,7 +119,7 @@ impl App {
         row: u16,
         mods: KeyModifiers,
     ) {
-        if let Some(pane) = self.panes.get_mut(&id)
+        if let Some(pane) = self.panes.get(&id)
             && let Some(bytes) = encode_mouse(
                 kind,
                 col,
@@ -126,13 +128,12 @@ impl App {
                 pane.emulator().mouse_modes(),
             )
         {
-            pane.write(&bytes);
+            self.outbox.push(ClientMsg::Input { pane: Some(id), bytes });
         }
     }
 
     /// Handles a mouse event from `client`.
     pub fn mouse(&mut self, client: &mut Client, event: MouseEvent) {
-        self.lay_out_for(client);
         client.follow_selection(&self.panes);
         let (x, y) = (i32::from(event.column), i32::from(event.row));
         let overview = self.workspaces.in_overview(client.id);
@@ -145,19 +146,19 @@ impl App {
             // and terminals don't report gestures well enough to snap a
             // free scroll the way niri does.
             MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft if shift => {
-                self.workspaces.active_mut(client.id).focus_left();
+                self.command(Command::Action(Action::FocusColumnLeft));
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollRight
                 if shift =>
             {
-                self.workspaces.active_mut(client.id).focus_right();
+                self.command(Command::Action(Action::FocusColumnRight));
             }
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {}
             MouseEventKind::ScrollUp if overview => {
-                self.workspaces.focus_up(client.id)
+                self.command(Command::Action(Action::FocusWorkspaceUp));
             }
             MouseEventKind::ScrollDown if overview => {
-                self.workspaces.focus_down(client.id)
+                self.command(Command::Action(Action::FocusWorkspaceDown));
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.wheel(client, event, x, y);
@@ -198,7 +199,7 @@ impl App {
         let Hit::Pane { id, inner } = self.hit(client, x, y) else {
             return;
         };
-        let Some(pane) = self.panes.get_mut(&id) else {
+        let Some(pane) = self.panes.get(&id) else {
             return;
         };
         let up = event.kind == MouseEventKind::ScrollUp;
@@ -212,9 +213,8 @@ impl App {
                 KeyModifiers::NONE,
             );
             let arrow = encode_key(arrow, pane.emulator().application_cursor());
-            for _ in 0..WHEEL_LINES {
-                pane.write(&arrow);
-            }
+            let bytes = arrow.repeat(WHEEL_LINES as usize);
+            self.outbox.push(ClientMsg::Input { pane: Some(id), bytes });
         } else {
             client.scroll(
                 id,
@@ -236,24 +236,26 @@ impl App {
         if let Some(seam) = self.seam_at(client, x, y)
             && let Some(anchor) = self.seam_anchor(client, seam)
         {
-            client.drag = Drag::Resizing { seam, anchor };
+            client.drag = Drag::Resizing { seam, anchor, to: None };
             return;
         }
         let overview = self.workspaces.in_overview(client.id);
         match self.hit(client, x, y) {
             Hit::Status(StatusTarget::Workspace(ws)) => {
-                self.workspaces.focus_workspace(client.id, ws);
+                self.command(Command::FocusWorkspace(ws));
             }
             Hit::Status(StatusTarget::Column(idx)) => {
-                self.workspaces.active_mut(client.id).focus_column(idx);
+                self.command(Command::FocusColumn(idx));
             }
             Hit::EmptyWorkspace(ws) => {
-                self.workspaces.focus_workspace(client.id, ws);
+                self.command(Command::FocusWorkspace(ws));
                 self.set_overview(client, false);
             }
             Hit::Pane { id, inner } => {
                 let focused = self.workspaces.focused(client.id) == Some(id);
-                self.workspaces.focus_pane(client.id, id);
+                if !focused || overview {
+                    self.command(Command::FocusPane(id));
+                }
                 if overview {
                     self.set_overview(client, false);
                     return;
@@ -359,20 +361,25 @@ impl App {
                     selection.head = point;
                 }
             }
-            Drag::Resizing { seam, anchor } => {
-                let (Seam::Column { ws, .. } | Seam::Pane { ws, .. }) = seam;
-                let strip = self.workspaces.strip_mut(ws);
+            Drag::Resizing { seam, anchor, .. } => {
                 // The mouse is on the box's border: the box ends there.
-                let size_to = |at: i32| at - anchor + 1;
-                match seam {
-                    Seam::Column { column, .. } => {
-                        strip.resize_column(column, size_to(x));
+                let to = match seam {
+                    Seam::Column { .. } => x,
+                    Seam::Pane { .. } => y,
+                } - anchor
+                    + 1;
+                client.drag = Drag::Resizing { seam, anchor, to: Some(to) };
+                // Here at once, so the edge keeps up with the mouse, and on
+                // the server, which tells everyone.
+                self.resize_seam(seam, to);
+                self.command(match seam {
+                    Seam::Column { ws, column } => {
+                        Command::ResizeColumn { ws, column, cells: to }
                     }
-                    Seam::Pane { column, row, .. } => {
-                        strip.resize_pane(column, row, size_to(y));
+                    Seam::Pane { ws, column, row } => {
+                        Command::ResizePane { ws, column, row, rows: to }
                     }
-                }
-                self.resize_panes();
+                });
             }
             Drag::None | Drag::Ignored => {}
         }
@@ -421,10 +428,7 @@ impl App {
             Drag::Resizing {
                 seam: Seam::Column { ws, .. } | Seam::Pane { ws, .. },
                 ..
-            } => {
-                self.workspaces.strip_mut(ws).show_focus();
-                self.resize_panes();
-            }
+            } => self.command(Command::ShowFocus { ws }),
             Drag::None | Drag::Ignored => {}
         }
     }
