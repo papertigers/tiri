@@ -87,6 +87,9 @@ struct Connection {
     /// Panes whose output was held back while it was behind, to send it
     /// snapshots of once it catches up.
     behind: HashSet<PaneId>,
+    /// Panes it asked for more history of, and how many lines, to answer
+    /// once the output read before the asking has gone out.
+    history: HashMap<PaneId, usize>,
 }
 
 impl Connection {
@@ -103,6 +106,7 @@ impl Connection {
             sent: 0,
             acked: 0,
             behind: HashSet::new(),
+            history: HashMap::new(),
         }
     }
 
@@ -516,6 +520,10 @@ impl Server<'_> {
                 connection.acked =
                     taken.clamp(connection.acked, connection.sent);
             }
+            ClientMsg::History { pane, lines } => {
+                let wanted = connection.history.entry(pane).or_default();
+                *wanted = (*wanted).max(lines as usize);
+            }
             ClientMsg::Detach => {
                 if let Some(guest) = connection.client.take() {
                     self.host.detach(&guest);
@@ -567,6 +575,7 @@ impl Server<'_> {
     fn deliver(&mut self) {
         self.deliver_outgoing();
         self.catch_up();
+        self.answer_history();
         if self.host.take_layout_changed() {
             for connection in self.connections.values_mut() {
                 if let (true, Some(guest)) =
@@ -615,6 +624,21 @@ impl Server<'_> {
                 // A pane that's closed since has nothing to catch up on.
                 if let Some(snapshot) = self.host.snapshot(pane) {
                     connection.send(&snapshot);
+                }
+            }
+        }
+    }
+
+    /// Sends the panes clients asked for more history of. A pane they're
+    /// behind on gets a snapshot when they catch up anyway.
+    fn answer_history(&mut self) {
+        for connection in self.connections.values_mut() {
+            for (pane, lines) in std::mem::take(&mut connection.history) {
+                if !connection.attached() || connection.behind.contains(&pane) {
+                    continue;
+                }
+                if let Some(snapshot) = self.host.history(pane, lines) {
+                    connection.send_pane(pane, &encode(&snapshot));
                 }
             }
         }

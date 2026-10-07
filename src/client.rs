@@ -267,7 +267,7 @@ fn run(
         // Taken in, so the server can send more.
         let ack = (taken > acked).then_some(ClientMsg::Ack(taken));
         acked = taken;
-        for msg in app.take_outbox().into_iter().chain(ack) {
+        for msg in app.take_outbox(client).into_iter().chain(ack) {
             // A server that's gone says so on the reading side.
             if send(writer, &msg).is_err() {
                 break;

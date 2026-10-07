@@ -152,7 +152,12 @@ impl App {
             let scrolled = client.scrolled(id, pane);
             let title = if scrolled > 0 {
                 let history = pane.emulator().history_size();
-                format!(" {number}: {} [{scrolled}/{history}] ", pane.title())
+                // More to come from the server as it's scrolled to.
+                let more = if pane.missing_history() { "+" } else { "" };
+                format!(
+                    " {number}: {} [{scrolled}/{history}{more}] ",
+                    pane.title()
+                )
             } else {
                 format!(" {number}: {} ", pane.title())
             };

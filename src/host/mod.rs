@@ -22,15 +22,13 @@ use crate::keys::Action;
 use crate::layout::{DEFAULT_VIEW, MIN_PANE_HEIGHT, PaneId, STATUS_HEIGHT};
 use crate::pane::Pane;
 use crate::protocol::{
-    Command, Hello, Layout, ServerMsg, Target, WorkspaceInfo,
+    Command, Hello, Layout, SNAPSHOT_HISTORY, ServerMsg, Target, WorkspaceInfo,
 };
 use crate::workspace::{ClientId, Workspaces};
 
 /// The largest terminal a client may claim to have, in cells.
 const MAX_WIDTH: u16 = 1000;
 const MAX_HEIGHT: u16 = 500;
-/// The lines of history a pane's snapshot carries.
-const SNAPSHOT_HISTORY: usize = 1000;
 /// The most of a pane's output in one message.
 const OUTPUT_CHUNK: usize = 16 * 1024;
 
@@ -40,11 +38,19 @@ fn clamp_size(width: u16, height: u16) -> (u16, u16) {
     (width.clamp(1, MAX_WIDTH), height.clamp(1, MAX_HEIGHT))
 }
 
-/// Pane `id`'s terminal as it is now, for a client to start a copy from.
-fn snapshot(id: PaneId, pane: &mut Pane) -> ServerMsg {
-    let (rows, cols) = pane.emulator().size();
-    let bytes = pane.emulator_mut().snapshot(SNAPSHOT_HISTORY);
-    ServerMsg::PaneSnapshot { pane: id, rows, cols, bytes }
+/// Pane `id`'s terminal as it is now, with up to `history` lines of its
+/// history, for a client to start a copy from.
+fn snapshot(
+    id: PaneId,
+    pane: &mut Pane,
+    history: usize,
+    requested: bool,
+) -> ServerMsg {
+    let emulator = pane.emulator_mut();
+    let (rows, cols) = emulator.size();
+    let complete = emulator.history_size() <= history;
+    let bytes = emulator.snapshot(history);
+    ServerMsg::PaneSnapshot { pane: id, rows, cols, bytes, complete, requested }
 }
 
 /// Where panes start for a client that hasn't said: the home directory.
@@ -169,14 +175,20 @@ impl Host {
     pub fn welcome(&mut self, guest: &Guest) -> Vec<ServerMsg> {
         let mut welcome = vec![ServerMsg::Layout(self.layout(guest))];
         for (&id, pane) in &mut self.panes {
-            welcome.push(snapshot(id, pane));
+            welcome.push(snapshot(id, pane, SNAPSHOT_HISTORY, false));
         }
         welcome
     }
 
     /// Pane `id` as it is now, for a client to start its copy again from.
     pub fn snapshot(&mut self, id: PaneId) -> Option<ServerMsg> {
-        Some(snapshot(id, self.panes.get_mut(&id)?))
+        Some(snapshot(id, self.panes.get_mut(&id)?, SNAPSHOT_HISTORY, false))
+    }
+
+    /// Pane `id` as it is now with up to `lines` lines of history, for a
+    /// client that asked for more than its copy has.
+    pub fn history(&mut self, id: PaneId, lines: usize) -> Option<ServerMsg> {
+        Some(snapshot(id, self.panes.get_mut(&id)?, lines, true))
     }
 
     /// The layout as `guest` is to draw it.
@@ -406,7 +418,7 @@ impl Host {
             return Err(e).context("couldn't watch the new pane's pty");
         }
         // Clients start their copies before its first resize below.
-        self.outgoing.push(snapshot(id, &mut pane));
+        self.outgoing.push(snapshot(id, &mut pane, SNAPSHOT_HISTORY, false));
         self.panes.insert(id, pane);
         self.workspaces.insert(guest.id, id);
         self.resize_panes();
