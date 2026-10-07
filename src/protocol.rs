@@ -46,8 +46,9 @@ pub struct Hello {
     pub width: u16,
     pub height: u16,
     pub target: Target,
-    /// Where panes this client opens should start.
-    pub cwd: PathBuf,
+    /// Where panes this client opens should start; for a client on another
+    /// machine, None, and they start in the home directory.
+    pub cwd: Option<PathBuf>,
     /// Whether its overview should use kitty graphics thumbnails.
     pub kitty_overview: bool,
     /// The colors its terminal reported.
@@ -86,6 +87,8 @@ pub enum ServerMsg {
     Error(String),
     /// The server is done with this client.
     Exit(ExitReason),
+    /// From `tiri bridge --no-start`: there's no server to relay to.
+    NoServer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
