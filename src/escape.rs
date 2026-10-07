@@ -70,6 +70,15 @@ pub mod osc_code {
     pub const CURSOR: u16 = 12;
     /// Sets a selection: which (`c`, the clipboard), then base64 text.
     pub const CLIPBOARD: u16 = 52;
+    /// Sets the window title.
+    pub const TITLE: u16 = 2;
+}
+
+/// Sets the window title to `title`, with OSC 2.
+pub fn set_title(out: &mut Vec<u8>, title: &str) {
+    let code = osc_code::TITLE;
+    write!(out, "{OSC}{code};{title}{BEL}")
+        .expect("writing to memory can't fail");
 }
 
 /// Sets the clipboard to `base64`-encoded text, with OSC 52.

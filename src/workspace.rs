@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::layout::{
     DEFAULT_VIEW, OVERVIEW_MAX_ZOOM, PaneId, SizePresets, Strip, StripView,
 };
@@ -25,7 +27,8 @@ const SLIDE_TAU: f64 = 0.05;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u32);
 
-#[derive(Debug)]
+/// A workspace as everyone shares it, and as clients are sent it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     name: Option<String>,
     strip: Strip,
@@ -122,6 +125,47 @@ impl Workspaces {
 
     pub fn list(&self) -> &[Workspace] {
         &self.list
+    }
+
+    /// Whether `ws` is the empty workspace that's always kept at the
+    /// bottom.
+    pub fn is_new(&self, ws: usize) -> bool {
+        let list = &self.list;
+        ws + 1 == list.len() && list[ws].is_empty() && list[ws].name().is_none()
+    }
+
+    /// A workspace's name: its own, its position if it has none, or "+" for
+    /// the empty one at the bottom.
+    pub fn label(&self, ws: usize) -> String {
+        match self.list[ws].name() {
+            Some(name) => name.to_owned(),
+            None if self.is_new(ws) => "+".to_owned(),
+            None => format!("{}", ws + 1),
+        }
+    }
+
+    /// Takes the workspaces as the server has them, `active` being the one
+    /// `client`, the only one a client's copy has, is on. Its view of each
+    /// stays as it was where there still is one, to ease on from there.
+    pub fn set_shared(
+        &mut self,
+        client: ClientId,
+        list: Vec<Workspace>,
+        active: usize,
+    ) {
+        let zoom = self.overview_zoom();
+        let view = self.views.get_mut(&client).expect("client is attached");
+        let overview = view.overview.then_some(zoom);
+        view.strips.truncate(list.len());
+        for workspace in &list[view.strips.len()..] {
+            view.strips.push(StripView::settled(&workspace.strip, overview));
+        }
+        view.active = active.min(list.len().saturating_sub(1));
+        if let Some(first) = list.first() {
+            self.view_width = first.strip.view_width();
+            self.view_height = first.strip.view_height();
+        }
+        self.list = list;
     }
 
     pub fn find(&self, name: &str) -> Option<usize> {

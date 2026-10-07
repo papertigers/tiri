@@ -156,6 +156,10 @@ TIRI_REMOTE_COMMAND=~/.cargo/bin/tiri tiri -H box
 New panes there start in your home directory. `-S` names the socket on
 that machine.
 
+Your terminal draws everything itself, animations included: the server
+sends only what programs in panes write and changes to the layout, so a
+slow link slows those and nothing else.
+
 ## Config
 
 tiri reads `~/.config/tiri/config.kdl` (or
@@ -170,8 +174,13 @@ tiri config default > ~/.config/tiri/config.kdl
 
 The config is read each time a terminal attaches, so changes apply from
 your next `tiri`. If it has a mistake, tiri uses the default config
-instead, and the status bar names the line at fault. The full report is in
-the server's log.
+instead, and the status bar names the line at fault. The full report is
+printed when you detach.
+
+Keys, the theme and animations come from the config where you run `tiri`,
+so with `-H` your own apply there too. Column widths and pane heights come
+from the config on the server's machine, since everyone attached shares
+the layout.
 
 ### Keys
 

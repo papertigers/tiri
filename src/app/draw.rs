@@ -237,22 +237,6 @@ impl App {
         }
     }
 
-    /// Whether `ws` is the empty workspace that's always kept at the bottom.
-    pub(super) fn is_new_workspace(&self, ws: usize) -> bool {
-        let list = self.workspaces.list();
-        ws + 1 == list.len() && list[ws].is_empty() && list[ws].name().is_none()
-    }
-
-    /// A workspace's name: its own, its position if it has none, or "+" for
-    /// the empty one at the bottom.
-    pub(super) fn workspace_label(&self, ws: usize) -> String {
-        match self.workspaces.list()[ws].name() {
-            Some(name) => name.to_owned(),
-            None if self.is_new_workspace(ws) => "+".to_owned(),
-            None => format!("{}", ws + 1),
-        }
-    }
-
     /// Zoomed out, labels each workspace row on the line above it. An empty
     /// workspace gets a hint, or in the overview a placeholder box, so
     /// there's something to see and select.
@@ -275,14 +259,14 @@ impl App {
             frame.put_str(
                 1,
                 top - 1,
-                &format!(" {} ", self.workspace_label(ws)),
+                &format!(" {} ", self.workspaces.label(ws)),
                 style,
             );
         }
         if !self.workspaces.list()[ws].is_empty() {
             return;
         }
-        let hint = match (self.is_new_workspace(ws), active) {
+        let hint = match (self.workspaces.is_new(ws), active) {
             (true, true) => "+ new workspace: C-a n opens a column",
             (true, false) => "+ new workspace",
             (false, true) => "empty workspace: C-a n opens a column",
@@ -333,7 +317,7 @@ impl App {
         }
         if let Some(&last) = below.last() {
             let extra =
-                if self.is_new_workspace(last) { " (incl. new)" } else { "" };
+                if self.workspaces.is_new(last) { " (incl. new)" } else { "" };
             note(area - 1, format!(" ▼ {} below{extra} ", below.len()));
         }
     }
