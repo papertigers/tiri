@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use polling::{Event as PollEvent, Poller};
 use portable_pty::Child;
 
+use crate::agent::AgentProxy;
 use crate::colors::Palette;
 use crate::config::Config;
 use crate::keys::Action;
@@ -78,6 +79,11 @@ pub struct Host {
     outgoing: Vec<ServerMsg>,
     /// The layout has changed since clients were last sent it.
     layout_changed: bool,
+    /// The ssh agent programs in panes reach, if it started.
+    agent: Option<AgentProxy>,
+    /// Attached clients' ssh agents, the most recently used last: the one
+    /// programs in panes reach.
+    agents: Vec<(ClientId, PathBuf)>,
     pub quit: bool,
 }
 
@@ -90,11 +96,19 @@ pub struct Guest {
     cwd: PathBuf,
     /// Its terminal's colors, for answering programs that ask.
     palette: Palette,
+    /// Its ssh agent's socket on this machine, if it has one.
+    agent: Option<PathBuf>,
 }
 
 impl Host {
     /// Starts with no panes; the first client to attach gets a shell.
-    pub fn new(poller: Arc<Poller>, config_path: Option<PathBuf>) -> Self {
+    /// Programs in panes reach the latest client's ssh agent through
+    /// `agent`.
+    pub fn new(
+        poller: Arc<Poller>,
+        config_path: Option<PathBuf>,
+        agent: Option<AgentProxy>,
+    ) -> Self {
         Self {
             workspaces: Workspaces::new(DEFAULT_VIEW.0, &[]),
             panes: HashMap::new(),
@@ -107,6 +121,8 @@ impl Host {
             config_path,
             outgoing: Vec::new(),
             layout_changed: false,
+            agent,
+            agents: Vec::new(),
             quit: false,
         }
     }
@@ -115,7 +131,7 @@ impl Host {
     /// no panes yet, starts with a shell. The caller sends the guest
     /// [`Self::welcome`] next.
     pub fn attach(&mut self, hello: Hello) -> Result<Guest> {
-        let Hello { width, height, target, cwd, colors } = hello;
+        let Hello { width, height, target, cwd, colors, agent } = hello;
         let (width, height) = clamp_size(width, height);
         // The layout presets come from the config. One with mistakes
         // gives way to the default, and the client, which reads it too,
@@ -154,6 +170,11 @@ impl Host {
             // aren't this machine's.
             cwd: cwd.unwrap_or_else(home_dir),
             palette: Palette::from_reported(&colors),
+            // A client inside one of these panes has the proxy as its
+            // agent, which would only lead back to itself.
+            agent: agent.filter(|agent| {
+                self.agent.as_ref().is_none_or(|proxy| agent != proxy.path())
+            }),
         };
         self.lay_out_for(&guest);
         if (matches!(target, Target::New(_)) || self.panes.is_empty())
@@ -229,6 +250,9 @@ impl Host {
 
     pub fn detach(&mut self, guest: &Guest) {
         self.workspaces.remove_client(guest.id);
+        // The agent before it is the one programs reach now.
+        self.agents.retain(|(id, _)| *id != guest.id);
+        self.update_agent();
         if self.size_owner == Some(guest.id) {
             self.size_owner = None;
         }
@@ -405,7 +429,8 @@ impl Host {
         self.next_pane += 1;
         // Width isn't known until it's in the strip, so start narrow and fix
         // it below.
-        let mut pane = Pane::spawn(self.pane_rows(), 1, &guest.cwd)?;
+        let agent = self.agent.as_ref().map(AgentProxy::path);
+        let mut pane = Pane::spawn(self.pane_rows(), 1, &guest.cwd, agent)?;
         pane.set_palette(guest.palette);
         // SAFETY: the pane is deleted from the poller in `close_pane` or
         // `shutdown`, before it's dropped and its PTY closed.
@@ -430,6 +455,7 @@ impl Host {
     /// whose size counts. Called whenever a client is used, so panes follow
     /// whichever terminal you're typing in.
     fn lay_out_for(&mut self, guest: &Guest) {
+        self.use_agent_of(guest);
         let size = (guest.width, guest.height);
         if self.size_owner == Some(guest.id) && self.layout_size == size {
             return;
@@ -446,6 +472,28 @@ impl Host {
         self.workspaces.set_view_height(size.1.saturating_sub(STATUS_HEIGHT));
         self.resize_panes();
         self.layout_changed = true;
+    }
+
+    /// Makes `guest`'s ssh agent, if it has one, the one programs in panes
+    /// reach.
+    fn use_agent_of(&mut self, guest: &Guest) {
+        let Some(agent) = &guest.agent else {
+            return;
+        };
+        if self.agents.last().is_some_and(|(id, _)| *id == guest.id) {
+            return;
+        }
+        self.agents.retain(|(id, _)| *id != guest.id);
+        self.agents.push((guest.id, agent.clone()));
+        self.update_agent();
+    }
+
+    /// Points the panes' agent at the most recently used client's.
+    fn update_agent(&self) {
+        if let Some(proxy) = &self.agent {
+            proxy
+                .set_target(self.agents.last().map(|(_, agent)| agent.clone()));
+        }
     }
 
     /// Brings every pane's PTY size in line with its share of its column,
@@ -553,5 +601,61 @@ impl Host {
         // Whatever shared its column grows into the space.
         self.resize_panes();
         self.layout_changed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::colors::ReportedColors;
+    use std::path::Path;
+
+    fn hello(agent: Option<&str>) -> Hello {
+        Hello {
+            width: 80,
+            height: 24,
+            target: Target::Default,
+            cwd: Some(PathBuf::from("/")),
+            colors: ReportedColors::default(),
+            agent: agent.map(PathBuf::from),
+        }
+    }
+
+    fn current(host: &Host) -> Option<&Path> {
+        host.agents.last().map(|(_, agent)| agent.as_path())
+    }
+
+    #[test]
+    fn panes_reach_the_agent_of_the_client_used_last() {
+        let dir = std::env::temp_dir()
+            .join(format!("tiri-host-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proxy = AgentProxy::start(dir.join("default.agent")).unwrap();
+        let proxy_path = proxy.path().to_owned();
+        let mut host =
+            Host::new(Arc::new(Poller::new().unwrap()), None, Some(proxy));
+
+        let a = host.attach(hello(Some("/a"))).unwrap();
+        assert_eq!(current(&host), Some(Path::new("/a")));
+        let b = host.attach(hello(Some("/b"))).unwrap();
+        assert_eq!(current(&host), Some(Path::new("/b")));
+        // Using a client makes its agent the one.
+        host.input(&a, None, b"");
+        assert_eq!(current(&host), Some(Path::new("/a")));
+        // A client with no agent, or with this server's own, leaves it be.
+        let none = host.attach(hello(None)).unwrap();
+        let nested = host.attach(hello(proxy_path.to_str())).unwrap();
+        host.input(&none, None, b"");
+        host.input(&nested, None, b"");
+        assert_eq!(current(&host), Some(Path::new("/a")));
+        // Once it's gone, the one used before it.
+        host.detach(&a);
+        assert_eq!(current(&host), Some(Path::new("/b")));
+        host.detach(&b);
+        assert_eq!(current(&host), None);
+
+        host.shutdown();
+        drop(host);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

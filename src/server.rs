@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use polling::{Event as PollEvent, Events, Poller};
 use signal_hook::consts::SIGCHLD;
 
+use crate::agent::{self, AgentProxy};
 use crate::config;
 use crate::host::{Guest, Host};
 use crate::layout::PaneId;
@@ -90,6 +91,8 @@ struct Connection {
     /// Panes it asked for more history of, and how many lines, to answer
     /// once the output read before the asking has gone out.
     history: HashMap<PaneId, usize>,
+    /// The ssh agent its bridge said ssh forwarded, for its hello.
+    agent: Option<PathBuf>,
 }
 
 impl Connection {
@@ -107,6 +110,7 @@ impl Connection {
             acked: 0,
             behind: HashSet::new(),
             history: HashMap::new(),
+            agent: None,
         }
     }
 
@@ -237,7 +241,16 @@ fn listen(socket: &Path) -> Result<()> {
         Some(path) => log::info!("config: {}", path.display()),
         None => log::warn!("no $HOME or $XDG_CONFIG_HOME, so no config file"),
     }
-    let result = serve(&listener, config_path);
+    // The ssh agent for programs in panes. Without it they keep whatever
+    // agent the server started with.
+    let agent = match AgentProxy::start(agent::path(socket)) {
+        Ok(agent) => Some(agent),
+        Err(e) => {
+            log::warn!("no ssh agent for panes: {e}");
+            None
+        }
+    };
+    let result = serve(&listener, config_path, agent);
     let current =
         std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
     if let (Ok(bound), Ok(current)) = (bound, current)
@@ -268,7 +281,11 @@ fn init_logging() {
     .init();
 }
 
-fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
+fn serve(
+    listener: &UnixListener,
+    config_path: Option<PathBuf>,
+    agent: Option<AgentProxy>,
+) -> Result<()> {
     let poller = Arc::new(Poller::new().context("couldn't create a poller")?);
     // SAFETY: deleted from the poller before `serve` returns.
     unsafe { poller.add(listener, PollEvent::readable(LISTENER_KEY)) }
@@ -288,7 +305,7 @@ fn serve(listener: &UnixListener, config_path: Option<PathBuf>) -> Result<()> {
     unsafe { poller.add(&sigchld, PollEvent::readable(SIGCHLD_KEY)) }
         .context("couldn't watch the signal pipe")?;
 
-    let mut host = Host::new(Arc::clone(&poller), config_path);
+    let mut host = Host::new(Arc::clone(&poller), config_path, agent);
     let mut connections = HashMap::new();
     let result =
         event_loop(listener, &sigchld, &poller, &mut host, &mut connections);
@@ -482,7 +499,15 @@ impl Server<'_> {
             return;
         };
         match msg {
-            ClientMsg::Hello(hello) if connection.client.is_none() => {
+            ClientMsg::Agent(agent) if connection.client.is_none() => {
+                connection.agent = agent;
+            }
+            ClientMsg::Agent(_) => {}
+            ClientMsg::Hello(mut hello) if connection.client.is_none() => {
+                // Through a bridge, the agent's the one ssh forwarded there.
+                if let Some(agent) = connection.agent.take() {
+                    hello.agent = Some(agent);
+                }
                 log::info!(
                     "{}: attaching: {}x{} cells, foreground {:?}, \
                      background {:?}",
