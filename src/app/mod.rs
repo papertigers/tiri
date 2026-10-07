@@ -25,7 +25,9 @@ use crate::config::Config;
 use crate::emulator::Emulator;
 use crate::escape;
 use crate::layout::PaneId;
-use crate::protocol::{ClientMsg, Command, Layout, PASTE_CHUNK, ServerMsg};
+use crate::protocol::{
+    ClientMsg, Command, Layout, PASTE_CHUNK, SNAPSHOT_HISTORY, ServerMsg,
+};
 use crate::workspace::{ClientId, Workspaces};
 
 pub use client_state::Client;
@@ -42,6 +44,10 @@ pub(super) struct PaneCopy {
     emulator: Emulator,
     /// The title until the program sets one: its shell's name.
     fallback_title: String,
+    /// Whether it has all the history the server's pane does.
+    complete: bool,
+    /// Whether more history has been asked for and not come yet.
+    fetching: bool,
 }
 
 impl PaneCopy {
@@ -51,6 +57,11 @@ impl PaneCopy {
 
     pub(super) fn title(&self) -> &str {
         self.emulator.title().unwrap_or(&self.fallback_title)
+    }
+
+    /// Whether the server's pane has history older than the copy's.
+    pub(super) fn missing_history(&self) -> bool {
+        !self.complete
     }
 }
 
@@ -87,21 +98,44 @@ impl App {
     pub fn apply(&mut self, client: &mut Client, msg: ServerMsg) {
         match msg {
             ServerMsg::Layout(layout) => self.lay_out(client, layout),
-            ServerMsg::PaneSnapshot { pane, rows, cols, bytes } => {
+            ServerMsg::PaneSnapshot {
+                pane,
+                rows,
+                cols,
+                bytes,
+                complete,
+                requested,
+            } => {
                 let mut emulator = Emulator::new(rows, cols);
                 emulator.feed(&bytes);
                 // The server answers the program; the copy only listens.
                 drop(emulator.take_questions());
                 drop(emulator.take_copied());
+                // An answer to asking for more history is the terminal the
+                // copy has, further back, so the client stays where it was
+                // in it. Otherwise the client had caught up on output it
+                // fell behind on, if it's not a new pane, and where it was
+                // in the old copy needn't be anywhere in this one.
+                let place = match self.panes.get(&pane) {
+                    Some(old) if requested => {
+                        client.follow_selection(&self.panes);
+                        Some(client.scrolled(pane, old))
+                    }
+                    _ => None,
+                };
                 let fallback_title =
                     self.titles.get(&pane).cloned().unwrap_or_default();
-                // Where the client had scrolled to, or selected, was in
-                // the copy this replaces.
-                client.scrollback.remove(&pane);
-                if client.selection.is_some_and(|s| s.pane == pane) {
-                    client.selection = None;
+                let copy = PaneCopy {
+                    emulator,
+                    fallback_title,
+                    complete,
+                    fetching: false,
+                };
+                match place {
+                    Some(lines) => client.move_to_copy(pane, lines, &copy),
+                    None => client.forget_place(pane),
                 }
-                self.panes.insert(pane, PaneCopy { emulator, fallback_title });
+                self.panes.insert(pane, copy);
             }
             ServerMsg::PaneOutput { pane, bytes } => {
                 let Some(copy) = self.panes.get_mut(&pane) else {
@@ -168,8 +202,32 @@ impl App {
     }
 
     /// What to tell the server, in order, since the last call.
-    pub fn take_outbox(&mut self) -> Vec<ClientMsg> {
+    pub fn take_outbox(&mut self, client: &Client) -> Vec<ClientMsg> {
+        self.fetch_history(client);
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Asks the server for older history of the panes `client` has
+    /// scrolled within a screen of the top of, where the copies have less
+    /// than the server's: twice as much as they have.
+    fn fetch_history(&mut self, client: &Client) {
+        for &id in client.scrollback.keys() {
+            let Some(pane) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            if pane.complete || pane.fetching {
+                continue;
+            }
+            let history = pane.emulator.history_size();
+            let (rows, _) = pane.emulator.size();
+            if client.scrolled(id, pane) + usize::from(rows) < history {
+                continue;
+            }
+            pane.fetching = true;
+            let lines = (history * 2).max(SNAPSHOT_HISTORY);
+            let lines = u32::try_from(lines).unwrap_or(u32::MAX);
+            self.outbox.push(ClientMsg::History { pane: id, lines });
+        }
     }
 
     fn command(&mut self, command: Command) {
@@ -264,6 +322,100 @@ fn paste_parts(text: &str, bracketed: bool) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colors::Palette;
+
+    /// The first character of each of `pane`'s lines from `top` down.
+    fn text_from(pane: &Emulator, top: i32, lines: i32) -> String {
+        (top..top + lines).map(|line| pane.cell(line, 0).c).collect()
+    }
+
+    fn snapshot_of(
+        pane: &mut Emulator,
+        history: usize,
+        requested: bool,
+    ) -> ServerMsg {
+        let (rows, cols) = pane.size();
+        ServerMsg::PaneSnapshot {
+            pane: PaneId(1),
+            rows,
+            cols,
+            complete: pane.history_size() <= history,
+            bytes: pane.snapshot(history),
+            requested,
+        }
+    }
+
+    #[test]
+    fn scrolling_back_fetches_older_history_and_keeps_its_place() {
+        let id = PaneId(1);
+        let mut app = App::new(Config::default());
+        let mut client = Client::new(80, 24, Palette::default(), None, false);
+        // The server's pane, with more history than a snapshot carries.
+        let mut server = Emulator::new(5, 20);
+        for i in 0..3000 {
+            server.feed(format!("{}\r\n", i % 10).as_bytes());
+        }
+        app.apply(
+            &mut client,
+            snapshot_of(&mut server, SNAPSHOT_HISTORY, false),
+        );
+        assert!(app.panes[&id].missing_history());
+        assert!(app.take_outbox(&client).is_empty(), "not scrolled yet");
+
+        // Near the top of what the copy has, it asks for more.
+        client.scroll(id, &app.panes[&id], 998);
+        let asked = app.take_outbox(&client);
+        assert!(matches!(
+            asked[..],
+            [ClientMsg::History { pane, lines: 2000 }] if pane == id
+        ));
+        assert!(app.take_outbox(&client).is_empty(), "asked only once");
+
+        // Output on the way to the server, and back with the answer.
+        let output = b"a\r\nb\r\n";
+        server.feed(output);
+        let output = ServerMsg::PaneOutput { pane: id, bytes: output.to_vec() };
+        app.apply(&mut client, output);
+        let scrolled = client.scrolled(id, &app.panes[&id]);
+        assert_eq!(scrolled, 1000);
+        let seen = text_from(app.panes[&id].emulator(), -(scrolled as i32), 5);
+
+        app.apply(&mut client, snapshot_of(&mut server, 2000, true));
+        let copy = &app.panes[&id];
+        assert_eq!(copy.emulator().history_size(), 2000);
+        assert_eq!(client.scrolled(id, copy), scrolled);
+        assert_eq!(text_from(copy.emulator(), -(scrolled as i32), 5), seen);
+
+        // And further back, more again.
+        client.scroll(id, &app.panes[&id], 1000);
+        assert!(matches!(
+            app.take_outbox(&client)[..],
+            [ClientMsg::History { lines: 4000, .. }]
+        ));
+        app.apply(&mut client, snapshot_of(&mut server, 4000, true));
+        assert!(!app.panes[&id].missing_history());
+        client.scroll(id, &app.panes[&id], 5000);
+        assert!(app.take_outbox(&client).is_empty(), "nothing more to fetch");
+    }
+
+    #[test]
+    fn other_snapshots_return_to_the_live_screen() {
+        let id = PaneId(1);
+        let mut app = App::new(Config::default());
+        let mut client = Client::new(80, 24, Palette::default(), None, false);
+        let mut server = Emulator::new(5, 20);
+        server.feed("x\r\n".repeat(100).as_bytes());
+        app.apply(
+            &mut client,
+            snapshot_of(&mut server, SNAPSHOT_HISTORY, false),
+        );
+        client.scroll(id, &app.panes[&id], 10);
+        app.apply(
+            &mut client,
+            snapshot_of(&mut server, SNAPSHOT_HISTORY, false),
+        );
+        assert_eq!(client.scrolled(id, &app.panes[&id]), 0);
+    }
 
     #[test]
     fn pastes_go_in_chunks() {

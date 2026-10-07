@@ -33,8 +33,11 @@ under a busy pane, gets a **snapshot** instead of the backlog: escape
 sequences that rebuild the screen, its modes, and recent history in a fresh
 copy. Attaching starts from a snapshot too.
 
-Snapshots carry the screen and recent history. A client scrolling back past
-that asks the server for older lines.
+Snapshots carry the screen and the last thousand lines of history, and say
+whether that's all there is. A client scrolling to within a screen of the
+top of its copy, when there's more, asks for the pane again with twice the
+history. The answer is the same terminal further back, so the client keeps
+its place and selection in it.
 
 ## Layout
 
