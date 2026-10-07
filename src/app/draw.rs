@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 use crate::effects::Transition;
+use crate::input;
 use crate::kitty;
 use crate::render::{Frame, Style, fit_width, text_width};
 
@@ -215,9 +216,11 @@ impl App {
                 .is_some_and(|pane| pane.mouse_modes().motion);
         if wanted != client.all_motion {
             client.all_motion = wanted;
-            let mode: &[u8] =
-                if wanted { b"\x1b[?1003h" } else { b"\x1b[?1003l" };
-            client.escapes.extend_from_slice(mode);
+            client.escapes.extend_from_slice(if wanted {
+                input::MOUSE_ALL_MOTION
+            } else {
+                input::MOUSE_BUTTON_MOTION
+            });
         }
     }
 
