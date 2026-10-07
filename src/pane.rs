@@ -52,9 +52,15 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Starts the user's shell in a new PTY, in `cwd`. Its output is read
-    /// with [`Self::read_ready`] once [`Self::fd`] polls readable.
-    pub fn spawn(rows: u16, cols: u16, cwd: &Path) -> Result<Self> {
+    /// Starts the user's shell in a new PTY, in `cwd`, with `agent` as its
+    /// ssh agent if given. Its output is read with [`Self::read_ready`]
+    /// once [`Self::fd`] polls readable.
+    pub fn spawn(
+        rows: u16,
+        cols: u16,
+        cwd: &Path,
+        agent: Option<&Path>,
+    ) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(pty_size(rows, cols))
             .context("failed to open pty")?;
@@ -63,6 +69,9 @@ impl Pane {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TIRI", "1");
+        if let Some(agent) = agent {
+            cmd.env("SSH_AUTH_SOCK", agent);
+        }
         cmd.cwd(cwd);
 
         // Everything that can fail comes before the shell starts, so a
@@ -277,7 +286,7 @@ mod tests {
 
     /// A pane whose shell is left alone: the tests feed its emulator directly.
     fn pane() -> Pane {
-        Pane::spawn(5, 20, Path::new("/")).expect("a shell starts")
+        Pane::spawn(5, 20, Path::new("/"), None).expect("a shell starts")
     }
 
     #[test]
