@@ -106,6 +106,13 @@ There are three sets of keys:
 | `d` | | | Detach |
 | `q` | | | Kill the server and every pane in it |
 
+Programs in panes that ask for the [kitty keyboard
+protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) get it, so
+keys that otherwise send the same thing are told apart: Shift+Enter from
+Enter (a newline in Claude Code), Ctrl+I from Tab, Escape from Alt. That
+takes a terminal that speaks it too, like Ghostty, kitty, WezTerm or foot;
+in others, keys go as they always have.
+
 ### Mouse
 
 - **Click** a pane to focus it. Programs that ask for the mouse get your
