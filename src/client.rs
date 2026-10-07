@@ -148,7 +148,9 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
 enum Incoming {
     Input(event::Event),
     InputFailed(io::Error),
-    Server(ServerMsg),
+    /// A message from the server, and how many bytes of messages have
+    /// come, it included, for acknowledging.
+    Server(ServerMsg, u64),
     /// The server hung up, or sent something that makes no sense: None
     /// for the first.
     Lost(Option<anyhow::Error>),
@@ -181,7 +183,7 @@ fn spawn_reader(
     thread::spawn(move || {
         loop {
             let incoming = match recv(&mut reader, &mut decoder) {
-                Ok(Some(msg)) => Incoming::Server(msg),
+                Ok(Some(msg)) => Incoming::Server(msg, decoder.taken()),
                 Ok(None) => Incoming::Lost(None),
                 Err(e) => Incoming::Lost(Some(e)),
             };
@@ -207,6 +209,9 @@ fn run(
     let mut dirty = true;
     let mut last_tick = Instant::now();
     let mut last_draw = last_tick - FRAME;
+    // What the server's been told this client has taken in, and what it
+    // has.
+    let (mut acked, mut taken) = (0, 0);
     loop {
         // Wake for the next frame, if one's owed, or anything else due.
         let next_frame = (dirty || animating).then(|| last_draw + FRAME);
@@ -234,9 +239,14 @@ fn run(
                     return Err(e)
                         .context("couldn't read input from the terminal");
                 }
-                Incoming::Server(ServerMsg::Exit(reason)) => return Ok(reason),
-                Incoming::Server(ServerMsg::Error(e)) => bail!(e),
-                Incoming::Server(msg) => app.apply(client, msg),
+                Incoming::Server(ServerMsg::Exit(reason), _) => {
+                    return Ok(reason);
+                }
+                Incoming::Server(ServerMsg::Error(e), _) => bail!(e),
+                Incoming::Server(msg, total) => {
+                    app.apply(client, msg);
+                    taken = total;
+                }
                 // A message that doesn't decode says what's wrong itself.
                 Incoming::Lost(Some(e)) if !e.is::<io::Error>() => {
                     return Err(e);
@@ -254,7 +264,10 @@ fn run(
                 }
             }
         }
-        for msg in app.take_outbox() {
+        // Taken in, so the server can send more.
+        let ack = (taken > acked).then_some(ClientMsg::Ack(taken));
+        acked = taken;
+        for msg in app.take_outbox().into_iter().chain(ack) {
             // A server that's gone says so on the reading side.
             if send(writer, &msg).is_err() {
                 break;

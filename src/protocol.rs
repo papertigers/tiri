@@ -75,6 +75,10 @@ pub enum ClientMsg {
         width: u16,
         height: u16,
     },
+    /// The client has taken in this many bytes of messages from the
+    /// server, length prefixes included, since it connected. The server
+    /// holds back panes' output from a client too far behind.
+    Ack(u64),
     /// The client is leaving; its panes keep running.
     Detach,
     /// Asks for the workspace list instead of attaching.
@@ -121,7 +125,8 @@ pub enum ServerMsg {
     /// The layout, whole, whenever it changes.
     Layout(Layout),
     /// Pane `pane`'s terminal, to start a copy from: output that rebuilds
-    /// it in a fresh emulator `rows` by `cols`. Its output follows.
+    /// it in a fresh emulator `rows` by `cols`. Its output follows. Also
+    /// sent in place of output a client fell too far behind to be sent.
     PaneSnapshot {
         pane: PaneId,
         rows: u16,
@@ -186,6 +191,8 @@ pub struct Decoder {
     start: usize,
     /// Messages bigger than this are refused rather than buffered.
     limit: usize,
+    /// Bytes of whole messages decoded so far, length prefixes included.
+    taken: u64,
 }
 
 impl Decoder {
@@ -200,7 +207,7 @@ impl Decoder {
     }
 
     fn with_limit(limit: usize) -> Self {
-        Self { buf: Vec::new(), start: 0, limit }
+        Self { buf: Vec::new(), start: 0, limit, taken: 0 }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -228,7 +235,14 @@ impl Decoder {
              versions? `tiri kill-server` stops a server left from before an upgrade",
         )?;
         self.start += LEN_PREFIX + len;
+        self.taken += (LEN_PREFIX + len) as u64;
         Ok(Some(msg))
+    }
+
+    /// Bytes of whole messages decoded so far, as [`ClientMsg::Ack`]
+    /// counts them.
+    pub fn taken(&self) -> u64 {
+        self.taken
     }
 }
 
@@ -283,6 +297,17 @@ mod tests {
             [ClientMsg::Input { pane: Some(PaneId(3)), bytes }, ClientMsg::KillServer]
                 if bytes == b"\x1bx"
         ));
+    }
+
+    #[test]
+    fn decoders_count_the_bytes_of_whole_messages() {
+        let ack = encode(&ClientMsg::Ack(7));
+        let mut decoder = Decoder::from_client();
+        decoder.push(&ack);
+        decoder.push(&ack[..2]);
+        assert!(decoder.next::<ClientMsg>().unwrap().is_some());
+        assert!(decoder.next::<ClientMsg>().unwrap().is_none());
+        assert_eq!(decoder.taken(), ack.len() as u64);
     }
 
     #[test]
