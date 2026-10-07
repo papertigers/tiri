@@ -168,8 +168,6 @@ pub enum ServerMsg {
     Error(String),
     /// The server is done with this client.
     Exit(ExitReason),
-    /// From `tiri bridge --no-start`: there's no server to relay to.
-    NoServer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

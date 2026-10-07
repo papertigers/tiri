@@ -42,14 +42,9 @@ use protocol::Target;
 #[command(version)]
 struct Cli {
     /// The server's socket. Defaults to `$TIRI_SOCKET`, then a private
-    /// per-user directory.
+    /// per-user directory. With `connect`, the socket on that machine.
     #[arg(short = 'S', long, global = true)]
     socket: Option<PathBuf>,
-
-    /// Use the server on this machine, through ssh. Any socket given is the
-    /// one there; tiri must be installed there too.
-    #[arg(short = 'H', long, global = true)]
-    host: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -61,6 +56,25 @@ enum Command {
     Attach {
         /// The named workspace to land on
         name: Option<String>,
+    },
+    /// Attach to the server on another machine, through ssh
+    ///
+    /// The server there starts if it isn't running. tiri must be installed
+    /// there too, at the same version.
+    ///
+    /// ssh reads your ~/.ssh/config for the user, port, keys and the like,
+    /// so the host can be an alias from there. A `remote` section in tiri's
+    /// config can say where tiri is installed there, and which socket to
+    /// use.
+    Connect {
+        /// The machine, as ssh knows it
+        #[arg(value_name = "HOST")]
+        remote: String,
+        /// The named workspace to land on
+        name: Option<String>,
+        /// Create the named workspace, with a shell, rather than finding it
+        #[arg(long, requires = "name")]
+        new: bool,
     },
     /// Create a named workspace with a shell, and attach to it
     New { name: String },
@@ -76,13 +90,9 @@ enum Command {
     /// Run the server (started for you by the other commands)
     #[command(hide = true)]
     Server,
-    /// Relay to the server from another machine (run by ssh for --host)
+    /// Relay to the server from another machine (run by ssh for connect)
     #[command(hide = true)]
-    Bridge {
-        /// Answer that there's no server rather than starting one
-        #[arg(long)]
-        no_start: bool,
-    },
+    Bridge,
 }
 
 #[derive(Subcommand)]
@@ -95,26 +105,25 @@ enum ConfigCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let server = || -> Result<Server> {
-        Ok(match &cli.host {
-            Some(host) => Server::Remote {
-                host: host.clone(),
-                socket: cli.socket.clone(),
-            },
-            None => Server::Local(socket_path(cli.socket.clone())?),
-        })
-    };
+    let local = || socket_path(cli.socket.clone()).map(Server::Local);
     match cli.command.unwrap_or(Command::Attach { name: None }) {
         Command::Attach { name } => client::attach(
-            &server()?,
+            &local()?,
             name.map_or(Target::Default, Target::Existing),
         ),
-        Command::New { name } => client::attach(&server()?, Target::New(name)),
-        Command::Ls => client::list(&server()?),
-        Command::KillServer => client::kill_server(&server()?),
-        Command::Bridge { no_start } => {
-            client::bridge(&socket_path(cli.socket)?, !no_start)
+        Command::Connect { remote, name, new } => {
+            let target = match name {
+                Some(name) if new => Target::New(name),
+                Some(name) => Target::Existing(name),
+                None => Target::Default,
+            };
+            let server = Server::Remote { host: remote, socket: cli.socket };
+            client::attach(&server, target)
         }
+        Command::New { name } => client::attach(&local()?, Target::New(name)),
+        Command::Ls => client::list(&socket_path(cli.socket)?),
+        Command::KillServer => client::kill_server(&socket_path(cli.socket)?),
+        Command::Bridge => client::bridge(&socket_path(cli.socket)?),
         Command::Server => {
             // Its errors are in its log already, which is where stderr goes.
             if server::run(&socket_path(cli.socket)?).is_err() {
