@@ -167,8 +167,8 @@ remote "box" {
 panes there start in your home directory.
 
 Your terminal draws everything itself, animations included: the server
-sends only what programs in panes write and changes to the layout, so a
-slow link slows those and nothing else.
+sends only what programs in panes write and changes to the layout,
+compressed with zstd, so a slow link slows those and nothing else.
 
 ## Config
 
