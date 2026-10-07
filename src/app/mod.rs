@@ -250,6 +250,12 @@ impl App {
         self.workspaces.tick(dt)
     }
 
+    /// Where the client's view is between workspaces, in workspaces from
+    /// the top, and the workspace it's heading for.
+    pub fn slide(&self) -> (f64, usize) {
+        (self.workspaces.y(LOCAL), self.workspaces.active_index(LOCAL))
+    }
+
     /// The client's terminal changed size.
     pub fn resize(&mut self, client: &mut Client, width: u16, height: u16) {
         (client.width, client.height) = (width, height);

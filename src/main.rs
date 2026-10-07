@@ -26,6 +26,7 @@ mod snapshot;
 mod socket;
 mod theme;
 mod thumbnail;
+mod trace;
 mod workspace;
 
 use std::path::PathBuf;

@@ -34,6 +34,7 @@ use crate::protocol::{
     ClientMsg, Decoder, ExitReason, Hello, ServerMsg, Target, recv, send,
 };
 use crate::socket;
+use crate::trace::{Trace, Traced};
 
 /// How long to wait for a freshly started server to start listening.
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
@@ -121,13 +122,25 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
         client.notify(format!("{}; using the default config", error.summary));
     }
 
+    let mut trace = Trace::from_env()
+        .context("couldn't create the file $TIRI_TRACE names")?;
+    if let Some(trace) = &mut trace {
+        trace.note(format_args!("size {width}x{height}"));
+    }
     let reason = {
         let _guard = TerminalGuard::enter()?;
         let (reader, mut writer) = link.split();
         let (events, incoming) = mpsc::channel();
         spawn_input(events.clone());
         spawn_reader(reader, decoder, events);
-        let result = run(&mut app, &mut client, &incoming, &mut writer, server);
+        let result = run(
+            &mut app,
+            &mut client,
+            &incoming,
+            &mut writer,
+            server,
+            trace.as_mut(),
+        );
         // Done with the server, so the reading thread stops, and ssh with
         // it if that's the way there.
         writer.hang_up();
@@ -207,8 +220,9 @@ fn run(
     incoming: &mpsc::Receiver<Incoming>,
     writer: &mut LinkWriter,
     server: &Server,
+    trace: Option<&mut Trace>,
 ) -> Result<ExitReason> {
-    let mut stdout = io::stdout().lock();
+    let mut stdout = Traced::new(io::stdout().lock(), trace);
     let mut animating = false;
     let mut dirty = true;
     let mut last_tick = Instant::now();
@@ -232,6 +246,9 @@ fn run(
                     // is owed, even if it's too soon to draw one now.
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         dirty = true;
+                        if let Some(trace) = stdout.trace() {
+                            trace.note("woke: something due");
+                        }
                         None
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -244,6 +261,9 @@ fn run(
         // Everything waiting goes in before the next frame.
         for incoming in first.into_iter().chain(incoming.try_iter()) {
             dirty = true;
+            if let Some(trace) = stdout.trace() {
+                trace.note(describe(&incoming));
+            }
             match incoming {
                 Incoming::Input(event) => input(app, client, event),
                 Incoming::InputFailed(e) => {
@@ -293,7 +313,16 @@ fn run(
         // Effects and fades run on frames as animations do.
         animating = app.tick(dt.max(Duration::from_millis(1)))
             || client.effects_running();
-        if !(dirty || animating) || now < last_draw + FRAME {
+        let draw = (dirty || animating) && now >= last_draw + FRAME;
+        if let Some(trace) = stdout.trace() {
+            let (y, active) = app.slide();
+            trace.note(format_args!(
+                "tick: y {y:.4} heading for {active}, animating {animating}, \
+                 dirty {dirty}, {}",
+                if draw { "drawing" } else { "not drawing" }
+            ));
+        }
+        if !draw {
             // Nothing to draw, or too soon after the last frame: the next
             // comes when it's due.
             continue;
@@ -303,6 +332,52 @@ fn run(
         stdout.flush()?;
         last_draw = now;
         dirty = false;
+    }
+}
+
+/// What `incoming` is, for a trace: what keys did, not what was typed.
+fn describe(incoming: &Incoming) -> String {
+    use event::{Event, KeyCode, KeyModifiers};
+    match incoming {
+        Incoming::Input(Event::Key(key)) => {
+            let typed = matches!(key.code, KeyCode::Char(_))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if typed {
+                format!("key: typed ({:?})", key.kind)
+            } else {
+                format!(
+                    "key: {:?} {:?} ({:?})",
+                    key.modifiers, key.code, key.kind
+                )
+            }
+        }
+        Incoming::Input(Event::Paste(text)) => {
+            format!("paste: {} bytes", text.len())
+        }
+        Incoming::Input(event) => format!("input: {event:?}"),
+        Incoming::InputFailed(e) => format!("input failed: {e}"),
+        Incoming::Server(msg, _) => match msg {
+            ServerMsg::Layout(layout) => format!(
+                "server: layout, {} workspaces, on {}",
+                layout.workspaces.len(),
+                layout.active
+            ),
+            ServerMsg::PaneOutput { pane, bytes } => {
+                format!("server: pane {} output, {} bytes", pane.0, bytes.len())
+            }
+            ServerMsg::PaneSnapshot { pane, rows, cols, bytes, .. } => format!(
+                "server: pane {} snapshot, {rows}x{cols}, {} bytes",
+                pane.0,
+                bytes.len()
+            ),
+            ServerMsg::PaneResize { pane, rows, cols } => {
+                format!("server: pane {} resized to {rows}x{cols}", pane.0)
+            }
+            other => format!("server: {other:?}"),
+        },
+        Incoming::Lost(e) => format!("lost the server: {e:?}"),
     }
 }
 
