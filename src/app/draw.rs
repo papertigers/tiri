@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use crate::effects::Transition;
-use crate::input;
+use crate::escape::MouseReporting;
 use crate::kitty;
 use crate::render::{Frame, Style, fit_width, text_width};
 
@@ -22,7 +22,7 @@ impl App {
     /// Returns the frame and where the cursor should be shown, if anywhere.
     pub fn draw(&self, client: &mut Client) -> (Frame, Option<(u16, u16)>) {
         client.follow_selection(&self.panes);
-        self.report_motion_if_wanted(client);
+        self.update_mouse_reporting(client);
         if (client.notice.as_ref())
             .is_some_and(|notice| notice.until <= Instant::now())
         {
@@ -206,21 +206,23 @@ impl App {
         (frame, cursor)
     }
 
-    /// Has `client`'s terminal report every mouse movement only while the
-    /// focused pane's program asks for it, since that's the only place
-    /// they go. Otherwise each move would cross the network for nothing.
-    fn report_motion_if_wanted(&self, client: &mut Client) {
-        let wanted = !self.workspaces.in_overview(client.id)
+    /// How much of the mouse `client`'s terminal should report: every
+    /// movement only while the focused pane's program wants it, since
+    /// that's the only place movements go.
+    fn mouse_reporting_for(&self, client: &Client) -> MouseReporting {
+        let motion = !self.workspaces.in_overview(client.id)
             && (self.workspaces.focused(client.id))
                 .and_then(|id| self.panes.get(&id))
                 .is_some_and(|pane| pane.mouse_modes().motion);
-        if wanted != client.all_motion {
-            client.all_motion = wanted;
-            client.escapes.extend_from_slice(if wanted {
-                input::MOUSE_ALL_MOTION
-            } else {
-                input::MOUSE_BUTTON_MOTION
-            });
+        if motion { MouseReporting::AllMotion } else { MouseReporting::Buttons }
+    }
+
+    /// Switches `client`'s terminal to the mouse reporting it should have.
+    fn update_mouse_reporting(&self, client: &mut Client) {
+        let wanted = self.mouse_reporting_for(client);
+        if wanted != client.mouse {
+            client.mouse.switch(wanted, &mut client.escapes);
+            client.mouse = wanted;
         }
     }
 

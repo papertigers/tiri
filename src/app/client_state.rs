@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::colors::Palette;
 use crate::effects::{Effects, Transition};
-use crate::escape;
+use crate::escape::{self, MouseReporting};
 use crate::layout::PaneId;
 use crate::pane::{Pane, ScrollMark};
 use crate::render::{Frame, Renderer};
@@ -65,9 +65,8 @@ pub struct Client {
     pub(super) notice: Option<Notice>,
     /// A paste partway through arriving.
     pub(super) paste: Option<Paste>,
-    /// Whether its terminal reports every mouse movement (mode 1003), not
-    /// only those with a button held.
-    pub(super) all_motion: bool,
+    /// How much of the mouse its terminal reports.
+    pub(super) mouse: MouseReporting,
 }
 
 /// Where a paste is going, while it arrives in parts.

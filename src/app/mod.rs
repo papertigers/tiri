@@ -28,7 +28,7 @@ use portable_pty::Child;
 use crate::colors::Palette;
 use crate::config::Config;
 use crate::effects::Effects;
-use crate::escape;
+use crate::escape::{self, MouseReporting};
 use crate::layout::{MIN_PANE_HEIGHT, PaneId};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
@@ -157,7 +157,7 @@ impl App {
             kitty_overview,
             thumbnails: HashMap::new(),
             escapes: Vec::new(),
-            all_motion: false,
+            mouse: MouseReporting::default(),
             renderer: Renderer::default(),
             scrollback: HashMap::new(),
             selection: None,
