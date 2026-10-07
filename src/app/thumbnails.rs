@@ -11,10 +11,9 @@ use std::time::{Duration, Instant};
 
 use crate::kitty::{self, Compression};
 use crate::layout::PaneId;
-use crate::pane::Pane;
 use crate::thumbnail;
 
-use super::{App, Client};
+use super::{App, Client, PaneCopy};
 
 /// Kitty image ids for overview thumbnails are this plus the pane id.
 const THUMBNAIL_ID_BASE: u32 = 0x74_0000;
@@ -145,7 +144,10 @@ impl Client {
     /// Keeps the thumbnails of panes that still exist in the terminal after
     /// the overview closes, so opening it again only uploads those that
     /// changed meanwhile. Their images can go: the terminal has them.
-    pub(super) fn park_thumbnails(&mut self, panes: &HashMap<PaneId, Pane>) {
+    pub(super) fn park_thumbnails(
+        &mut self,
+        panes: &HashMap<PaneId, PaneCopy>,
+    ) {
         self.retain_thumbnails(|id| panes.contains_key(id));
         for thumb in self.thumbnails.values_mut() {
             thumb.image = None;
@@ -170,7 +172,7 @@ impl Client {
     /// (0 to 1, in a few steps, for fading it in), for [`Self::upload`].
     pub(super) fn refresh_thumbnail(
         &mut self,
-        panes: &HashMap<PaneId, Pane>,
+        panes: &HashMap<PaneId, PaneCopy>,
         id: PaneId,
         size: (u16, u16),
         opacity: f32,

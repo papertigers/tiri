@@ -3,23 +3,22 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What keys do: looking them up in the configured bindings, and running
-//! the actions they map to.
+//! the actions they map to, here or on the server.
 
-use anyhow::Result;
 use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::effects::Transition;
 use crate::input::encode_key;
 use crate::keys::{Action, Key};
+use crate::protocol::{ClientMsg, Command};
 
 use super::{App, Client};
 
 impl App {
-    pub fn key(&mut self, client: &mut Client, event: KeyEvent) -> Result<()> {
+    pub fn key(&mut self, client: &mut Client, event: KeyEvent) {
         if event.kind != KeyEventKind::Press {
-            return Ok(());
+            return;
         }
-        self.lay_out_for(client);
         let key = Key::from_event(event);
         let bindings = &self.config.bindings;
         let is_prefix = key == bindings.prefix;
@@ -39,7 +38,7 @@ impl App {
             }
             (false, true) => {
                 client.prefix_pending = true;
-                return Ok(());
+                return;
             }
             (false, false) if overview => (bindings.overview_binds.get(key))
                 .or_else(|| bindings.binds.get(key)),
@@ -51,115 +50,42 @@ impl App {
         }
         if overview {
             // The overview takes the keyboard; nothing reaches the panes.
-            return Ok(());
+            return;
         }
         client.selection = None;
         if let Some(id) = self.workspaces.focused(client.id) {
             // Typing returns to the live screen, as in any terminal.
             client.scrollback.remove(&id);
         }
-        if let Some(pane) = self.focused_pane_mut(client) {
-            let bytes = encode_key(event, pane.emulator().application_cursor());
-            pane.write(&bytes);
+        // The server sends it to whichever pane is focused when it arrives,
+        // which a focus change on its way there may have moved.
+        let application_cursor = (self.focused_pane(client))
+            .is_some_and(|pane| pane.emulator().application_cursor());
+        let bytes = encode_key(event, application_cursor);
+        self.outbox.push(ClientMsg::Input { pane: None, bytes });
+    }
+
+    /// Runs a binding's actions in order. Those that change the layout go
+    /// to the server, which runs them in the same order.
+    fn run_all(&mut self, client: &mut Client, actions: &[Action]) {
+        for &action in actions {
+            self.run(client, action);
         }
-        Ok(())
     }
 
-    /// Runs a binding's actions in order, each seeing what the one before
-    /// did. A failure stops the rest.
-    fn run_all(
-        &mut self,
-        client: &mut Client,
-        actions: &[Action],
-    ) -> Result<()> {
-        actions.iter().try_for_each(|&action| self.run(client, action))
-    }
-
-    fn run(&mut self, client: &mut Client, action: Action) -> Result<()> {
-        let id = client.id;
+    fn run(&mut self, client: &mut Client, action: Action) {
         match action {
-            Action::NewColumn => self.open_column(client)?,
-            Action::FocusColumnLeft => {
-                self.workspaces.active_mut(id).focus_left()
-            }
-            Action::FocusColumnRight => {
-                self.workspaces.active_mut(id).focus_right()
-            }
-            Action::FocusColumnFirst => {
-                self.workspaces.active_mut(id).focus_first()
-            }
-            Action::FocusColumnLast => {
-                self.workspaces.active_mut(id).focus_last()
-            }
-            Action::MoveColumnLeft => {
-                self.workspaces.active_mut(id).move_left()
-            }
-            Action::MoveColumnRight => {
-                self.workspaces.active_mut(id).move_right()
-            }
-            Action::FocusPaneUp => self.workspaces.active_mut(id).focus_up(),
-            Action::FocusPaneDown => {
-                self.workspaces.active_mut(id).focus_down()
-            }
-            Action::MovePaneUp => self.workspaces.active_mut(id).move_up(),
-            Action::MovePaneDown => self.workspaces.active_mut(id).move_down(),
-            Action::ConsumeOrExpelPaneLeft => {
-                self.workspaces.active_mut(id).consume_or_expel_left();
-            }
-            Action::ConsumeOrExpelPaneRight => {
-                self.workspaces.active_mut(id).consume_or_expel_right();
-            }
-            Action::ConsumePaneIntoColumn => {
-                self.workspaces.active_mut(id).consume_into_column()
-            }
-            Action::ExpelPaneFromColumn => {
-                self.workspaces.active_mut(id).expel_from_column()
-            }
-            Action::SwitchPresetPaneHeight => {
-                self.workspaces.active_mut(id).switch_preset_height();
-            }
-            Action::ResetPaneHeight => {
-                self.workspaces.active_mut(id).reset_pane_height();
-            }
-            Action::SwitchPresetColumnWidth => {
-                self.workspaces.active_mut(id).cycle_width()
-            }
-            Action::MaximizeColumn => {
-                self.workspaces.active_mut(id).toggle_maximized()
-            }
-            Action::FullscreenPane => {
-                self.workspaces.active_mut(id).toggle_fullscreen()
-            }
-            Action::CenterColumn => {
-                self.workspaces.active_mut(id).center_focused()
-            }
-            Action::ClosePane => {
-                if let Some(pane_id) = self.workspaces.focused(id) {
-                    self.close_pane(pane_id);
-                }
-            }
-            Action::FocusWorkspaceDown => self.workspaces.focus_down(id),
-            Action::FocusWorkspaceUp => self.workspaces.focus_up(id),
-            Action::MoveColumnToWorkspaceDown => {
-                self.workspaces.move_column_down(id)
-            }
-            Action::MoveColumnToWorkspaceUp => {
-                self.workspaces.move_column_up(id)
-            }
             Action::ToggleOverview => {
-                let on = !self.workspaces.in_overview(id);
+                let on = !self.workspaces.in_overview(client.id);
                 self.set_overview(client, on);
             }
             Action::CloseOverview => self.set_overview(client, false),
             Action::ToggleThumbnails => {
                 client.kitty_overview = !client.kitty_overview
             }
-            Action::Detach => client.detach_requested = true,
-            Action::KillServer => self.quit = true,
+            Action::Detach => self.outbox.push(ClientMsg::Detach),
+            action => self.command(Command::Action(action)),
         }
-        // Whatever changed, panes' PTYs follow their boxes' sizes.
-        self.resize_panes();
-        Ok(())
     }
 
     /// Opens or closes `client`'s overview. The layout changes at once, and

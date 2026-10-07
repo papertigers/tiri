@@ -50,13 +50,13 @@ impl App {
                     bold: true,
                     ..base
                 }
-            } else if self.is_new_workspace(ws) {
+            } else if self.workspaces.is_new(ws) {
                 Style { fg: theme.dim, ..base }
             } else {
                 base
             };
             segments.push(Segment {
-                text: format!(" {} ", self.workspace_label(ws)),
+                text: format!(" {} ", self.workspaces.label(ws)),
                 style,
                 target: Some(StatusTarget::Workspace(ws)),
             });

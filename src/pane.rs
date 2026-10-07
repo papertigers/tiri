@@ -47,6 +47,8 @@ pub struct Pane {
     /// The colors to answer the program's color queries with: those of
     /// the client most recently used.
     palette: Palette,
+    /// Output read since [`Self::take_output`], for clients' copies.
+    output: Vec<u8>,
 }
 
 impl Pane {
@@ -95,6 +97,7 @@ impl Pane {
             reaped: false,
             fallback_title,
             palette: Palette::default(),
+            output: Vec::new(),
         })
     }
 
@@ -107,8 +110,14 @@ impl Pane {
         &mut self.emulator
     }
 
-    pub fn title(&self) -> &str {
-        self.emulator.title().unwrap_or(&self.fallback_title)
+    /// The title until the program sets one: its shell's name.
+    pub fn fallback_title(&self) -> &str {
+        &self.fallback_title
+    }
+
+    /// The output read since the last call, as the program wrote it.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output)
     }
 
     pub fn set_palette(&mut self, palette: Palette) {
@@ -132,6 +141,7 @@ impl Pane {
                 Ok(0) => return false,
                 Ok(n) => {
                     self.emulator.feed(&buf[..n]);
+                    self.output.extend_from_slice(&buf[..n]);
                     self.answer_questions();
                     total += n;
                     if total >= READ_BUDGET {

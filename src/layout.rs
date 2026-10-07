@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 const MIN_COLUMN_WIDTH: u16 = 8;
 /// The shortest a stacked pane's box may get, borders included. Columns
 /// refuse to consume more panes than fit at this height.
@@ -18,13 +20,15 @@ pub const MIN_PANE_HEIGHT: i32 = 5;
 /// The size, in columns and rows, panes are laid out for before any
 /// terminal attaches: a classic terminal's.
 pub const DEFAULT_VIEW: (u16, u16) = (80, 24);
+/// The rows the status bar takes, at the foot of each client's screen.
+pub const STATUS_HEIGHT: u16 = 1;
 
 /// Added before rounding a share of the view down to whole cells, so a
 /// share written with a few decimals, like 0.33333, comes to a whole third.
 const ROUNDING_SLACK: f64 = 1e-3;
 
 /// How wide a column is, or how tall a pane in a stack.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PresetSize {
     /// A share of the view's width or height, from just above 0 to 1.
     Proportion(f64),
@@ -38,7 +42,7 @@ const FULL_WIDTH: PresetSize = PresetSize::Proportion(1.0);
 /// The sizes the config gives: what `switch-preset-column-width` and
 /// `switch-preset-pane-height` step through, and the width new columns
 /// start at.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SizePresets {
     /// Never empty.
     pub column_widths: Vec<PresetSize>,
@@ -77,10 +81,10 @@ const SCROLL_TAU: f64 = 0.05;
 pub const OVERVIEW_MAX_ZOOM: f64 = 0.5;
 const OVERVIEW_MIN_ZOOM: f64 = 0.25;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PaneId(pub u32);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     /// Top to bottom; never empty.
     panes: Vec<PaneId>,
@@ -188,7 +192,7 @@ pub enum Visibility {
     Hidden,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strip {
     columns: Vec<Column>,
     focus: usize,
@@ -221,6 +225,16 @@ impl Strip {
     /// already open keep their widths.
     pub fn set_size_presets(&mut self, presets: &SizePresets) {
         self.presets.clone_from(presets);
+    }
+
+    /// The view's width, which columns' shares are of.
+    pub fn view_width(&self) -> u16 {
+        self.view_width
+    }
+
+    /// The view's height, which panes' shares are of.
+    pub fn view_height(&self) -> u16 {
+        self.view_height
     }
 
     pub fn set_view_height(&mut self, rows: u16) {

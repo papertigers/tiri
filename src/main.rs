@@ -9,6 +9,7 @@ mod config;
 mod effects;
 mod emulator;
 mod escape;
+mod host;
 mod input;
 mod keys;
 mod kitty;

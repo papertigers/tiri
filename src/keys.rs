@@ -280,7 +280,17 @@ impl fmt::Display for Key {
 
 /// Everything a key can do, named as niri names them (with panes for
 /// niri's windows).
-#[derive(knus::Decode, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    knus::Decode,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Action {
     NewColumn,
     FocusColumnLeft,
