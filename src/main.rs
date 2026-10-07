@@ -12,6 +12,7 @@ mod input;
 mod keys;
 mod kitty;
 mod layout;
+mod link;
 mod pane;
 mod probe;
 mod protocol;
@@ -28,6 +29,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use link::Server;
 use protocol::Target;
 
 /// A terminal multiplexer whose panes scroll sideways, like the niri window
@@ -40,6 +42,11 @@ struct Cli {
     /// per-user directory.
     #[arg(short = 'S', long, global = true)]
     socket: Option<PathBuf>,
+
+    /// Use the server on this machine, through ssh. Any socket given is the
+    /// one there; tiri must be installed there too.
+    #[arg(short = 'H', long, global = true)]
+    host: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -66,6 +73,13 @@ enum Command {
     /// Run the server (started for you by the other commands)
     #[command(hide = true)]
     Server,
+    /// Relay to the server from another machine (run by ssh for --host)
+    #[command(hide = true)]
+    Bridge {
+        /// Answer that there's no server rather than starting one
+        #[arg(long)]
+        no_start: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -78,16 +92,26 @@ enum ConfigCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let server = || -> Result<Server> {
+        Ok(match &cli.host {
+            Some(host) => Server::Remote {
+                host: host.clone(),
+                socket: cli.socket.clone(),
+            },
+            None => Server::Local(socket_path(cli.socket.clone())?),
+        })
+    };
     match cli.command.unwrap_or(Command::Attach { name: None }) {
         Command::Attach { name } => client::attach(
-            &socket_path(cli.socket)?,
+            &server()?,
             name.map_or(Target::Default, Target::Existing),
         ),
-        Command::New { name } => {
-            client::attach(&socket_path(cli.socket)?, Target::New(name))
+        Command::New { name } => client::attach(&server()?, Target::New(name)),
+        Command::Ls => client::list(&server()?),
+        Command::KillServer => client::kill_server(&server()?),
+        Command::Bridge { no_start } => {
+            client::bridge(&socket_path(cli.socket)?, !no_start)
         }
-        Command::Ls => client::list(&socket_path(cli.socket)?),
-        Command::KillServer => client::kill_server(&socket_path(cli.socket)?),
         Command::Server => {
             // Its errors are in its log already, which is where stderr goes.
             if server::run(&socket_path(cli.socket)?).is_err() {
