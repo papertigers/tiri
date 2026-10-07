@@ -10,7 +10,7 @@
 //! are all non-blocking, so a busy pane or a slow client never holds up the
 //! rest.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +24,7 @@ use signal_hook::consts::SIGCHLD;
 
 use crate::config;
 use crate::host::{Guest, Host};
+use crate::layout::PaneId;
 use crate::protocol::{
     ClientMsg, Decoder, ExitReason, Hello, READ_CHUNK, ServerMsg, encode,
 };
@@ -39,8 +40,16 @@ const CONNECTION_KEY_BASE: usize = 1 << 32;
 /// socket can't keep the server from everything else.
 const READ_BUDGET: usize = 256 * 1024;
 /// The most a client may fall behind by, in bytes not yet taken by its
-/// socket, before it's dropped rather than queued for without end.
+/// socket, before it's dropped rather than queued for without end. Clients
+/// that acknowledge what they take never come near it.
 const MAX_BACKLOG: usize = 64 * 1024 * 1024;
+/// The most a client may have been sent and not yet acknowledged before
+/// panes' output stops going to it. Over a slow link, output would
+/// otherwise pile up in the link's buffers faster than it drains, and
+/// everything after it, the echo of what's typed included, would wait.
+/// A pane whose output was held back is sent whole again instead, as a
+/// snapshot, once the client has caught up to half this.
+const WINDOW: u64 = 32 * 1024;
 /// A server started for a client that never attaches gives up after this.
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// How long shutting down waits, in all, for clients to take their goodbyes.
@@ -72,6 +81,12 @@ struct Connection {
     eof: bool,
     /// The connection failed, or has been dealt with after `eof`.
     dead: bool,
+    /// Bytes of messages queued for it, and that it says it has taken.
+    sent: u64,
+    acked: u64,
+    /// Panes whose output was held back while it was behind, to send it
+    /// snapshots of once it catches up.
+    behind: HashSet<PaneId>,
 }
 
 impl Connection {
@@ -85,6 +100,9 @@ impl Connection {
             closing: false,
             eof: false,
             dead: false,
+            sent: 0,
+            acked: 0,
+            behind: HashSet::new(),
         }
     }
 
@@ -112,6 +130,24 @@ impl Connection {
             return;
         }
         self.outgoing.extend(bytes);
+        self.sent += bytes.len() as u64;
+    }
+
+    /// Bytes sent that it hasn't acknowledged yet.
+    fn unacked(&self) -> u64 {
+        self.sent - self.acked
+    }
+
+    /// Queues pane `pane`'s output, or a change to its size, unless the
+    /// client is too far behind, in which case the pane is noted for a
+    /// snapshot later. Once one of its messages is held back, the rest
+    /// are, until then, since they make no sense without it.
+    fn send_pane(&mut self, pane: PaneId, bytes: &[u8]) {
+        if self.behind.contains(&pane) || self.unacked() > WINDOW {
+            self.behind.insert(pane);
+        } else {
+            self.send_encoded(bytes);
+        }
     }
 
     /// Whether it's attached and still taking messages.
@@ -475,6 +511,11 @@ impl Server<'_> {
                     self.host.resize(guest, width, height);
                 }
             }
+            ClientMsg::Ack(taken) => {
+                // No more than it was sent, whatever it says.
+                connection.acked =
+                    taken.clamp(connection.acked, connection.sent);
+            }
             ClientMsg::Detach => {
                 if let Some(guest) = connection.client.take() {
                     self.host.detach(&guest);
@@ -525,6 +566,7 @@ impl Server<'_> {
     /// then the layout, if it's changed.
     fn deliver(&mut self) {
         self.deliver_outgoing();
+        self.catch_up();
         if self.host.take_layout_changed() {
             for connection in self.connections.values_mut() {
                 if let (true, Some(guest)) =
@@ -539,11 +581,40 @@ impl Server<'_> {
 
     fn deliver_outgoing(&mut self) {
         for msg in self.host.take_outgoing() {
+            let pane = match &msg {
+                ServerMsg::PaneOutput { pane, .. }
+                | ServerMsg::PaneResize { pane, .. }
+                | ServerMsg::PaneSnapshot { pane, .. } => Some(*pane),
+                _ => None,
+            };
             // Encoded once, however many clients it goes to.
             let bytes = encode(&msg);
             for connection in self.connections.values_mut() {
-                if connection.attached() {
-                    connection.send_encoded(&bytes);
+                match pane {
+                    _ if !connection.attached() => {}
+                    Some(pane) => connection.send_pane(pane, &bytes),
+                    None => connection.send_encoded(&bytes),
+                }
+            }
+        }
+    }
+
+    /// Sends clients that have caught up snapshots of the panes whose
+    /// output they missed. Everything those panes wrote has been passed on
+    /// already, to those not behind, so the snapshots pick up where the
+    /// output that follows does.
+    fn catch_up(&mut self) {
+        for connection in self.connections.values_mut() {
+            if connection.behind.is_empty()
+                || !connection.attached()
+                || connection.unacked() > WINDOW / 2
+            {
+                continue;
+            }
+            for pane in std::mem::take(&mut connection.behind) {
+                // A pane that's closed since has nothing to catch up on.
+                if let Some(snapshot) = self.host.snapshot(pane) {
+                    connection.send(&snapshot);
                 }
             }
         }

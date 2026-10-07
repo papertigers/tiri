@@ -95,6 +95,12 @@ impl App {
                 drop(emulator.take_copied());
                 let fallback_title =
                     self.titles.get(&pane).cloned().unwrap_or_default();
+                // Where the client had scrolled to, or selected, was in
+                // the copy this replaces.
+                client.scrollback.remove(&pane);
+                if client.selection.is_some_and(|s| s.pane == pane) {
+                    client.selection = None;
+                }
                 self.panes.insert(pane, PaneCopy { emulator, fallback_title });
             }
             ServerMsg::PaneOutput { pane, bytes } => {
