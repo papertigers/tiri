@@ -151,7 +151,7 @@ impl App {
             };
             let scrolled = client.scrolled(id, pane);
             let title = if scrolled > 0 {
-                let history = pane.history_size();
+                let history = pane.emulator().history_size();
                 format!(" {number}: {} [{scrolled}/{history}] ", pane.title())
             } else {
                 format!(" {number}: {} ", pane.title())
@@ -196,9 +196,12 @@ impl App {
                 ),
             }
 
-            if focused && show_cursor && scrolled == 0 && pane.cursor_visible()
+            if focused
+                && show_cursor
+                && scrolled == 0
+                && pane.emulator().cursor_visible()
             {
-                let (r, c) = pane.cursor();
+                let (r, c) = pane.emulator().cursor();
                 let (cx, cy) =
                     (x + 1 + i32::from(c), y + 1 + i32::from(r) - top);
                 if (0..i32::from(client.width)).contains(&cx)
@@ -221,7 +224,7 @@ impl App {
         let motion = !self.workspaces.in_overview(client.id)
             && (self.workspaces.focused(client.id))
                 .and_then(|id| self.panes.get(&id))
-                .is_some_and(|pane| pane.mouse_modes().motion);
+                .is_some_and(|pane| pane.emulator().mouse_modes().motion);
         if motion { MouseReporting::AllMotion } else { MouseReporting::Buttons }
     }
 

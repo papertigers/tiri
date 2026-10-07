@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 
 use crate::colors::Palette;
 use crate::effects::{Effects, Transition};
+use crate::emulator::ScrollMark;
 use crate::escape::{self, MouseReporting};
 use crate::layout::PaneId;
-use crate::pane::{Pane, ScrollMark};
+use crate::pane::Pane;
 use crate::render::{Frame, Renderer};
 use crate::selection::{Point, Selection};
 use crate::thumbnail;
@@ -169,8 +170,10 @@ impl Client {
             return 0;
         };
         // History being cleared returns to the live screen.
-        let since = pane.scrolled_since(scroll.at);
-        since.map_or(0, |since| (scroll.lines + since).min(pane.history_size()))
+        let since = pane.emulator().scrolled_since(scroll.at);
+        since.map_or(0, |since| {
+            (scroll.lines + since).min(pane.emulator().history_size())
+        })
     }
 
     /// Keeps the selection on the text it was made on as output moves that
@@ -180,8 +183,8 @@ impl Client {
             return;
         };
         let moved = panes.get(&selection.pane).and_then(|pane| {
-            let scrolled = pane.scrolled_since(selection.at)? as i64;
-            let top = -(pane.history_size() as i64);
+            let scrolled = pane.emulator().scrolled_since(selection.at)? as i64;
+            let top = -(pane.emulator().history_size() as i64);
             let shift = |p: Point| {
                 let line = i64::from(p.line) - scrolled;
                 (line >= top).then_some(Point { line: line as i32, ..p })
@@ -193,7 +196,7 @@ impl Client {
                 *selection = Selection {
                     anchor,
                     head,
-                    at: pane.scroll_mark(),
+                    at: pane.emulator().scroll_mark(),
                     ..*selection
                 };
             }
@@ -204,7 +207,7 @@ impl Client {
     /// Scrolls `pane` back by `lines` (forward if negative), returning to
     /// the live screen at the bottom.
     pub(super) fn scroll(&mut self, id: PaneId, pane: &Pane, lines: i32) {
-        let history = pane.history_size();
+        let history = pane.emulator().history_size();
         let current = self.scrolled(id, pane) as i32;
         let target = (current + lines).clamp(0, history as i32) as usize;
         if target == 0 {
@@ -212,7 +215,7 @@ impl Client {
         } else {
             self.scrollback.insert(
                 id,
-                Scrollback { lines: target, at: pane.scroll_mark() },
+                Scrollback { lines: target, at: pane.emulator().scroll_mark() },
             );
         }
     }
