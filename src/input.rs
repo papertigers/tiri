@@ -240,63 +240,9 @@ pub fn encode_mouse(
     Some(out)
 }
 
-/// What tiri asks of its own terminal's mouse reporting: clicks, and
-/// movement while a button is held (1002), in SGR's encoding (1006).
-pub const MOUSE_BUTTONS: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-/// Every movement too, while a program in the focused pane wants it.
-pub const MOUSE_ALL_MOTION: &[u8] = b"\x1b[?1003h";
-/// Back to [`MOUSE_BUTTONS`]' reporting from [`MOUSE_ALL_MOTION`]. 1000,
-/// 1002 and 1003 are one setting, so resetting 1003 alone would leave the
-/// terminal reporting nothing at all; 1002 has to be set again.
-pub const MOUSE_BUTTON_MOTION: &[u8] = b"\x1b[?1003l\x1b[?1002h";
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The terminal's mouse mode after `sequences`, as alacritty, which
-    /// treats them as xterm does, would have it.
-    fn mouse_mode_after(
-        sequences: &[&[u8]],
-    ) -> alacritty_terminal::term::TermMode {
-        use alacritty_terminal::Term;
-        use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::term::{Config, TermMode, test::TermSize};
-        use alacritty_terminal::vte::ansi::Processor;
-
-        let mut term =
-            Term::new(Config::default(), &TermSize::new(10, 2), VoidListener);
-        let mut parser: Processor = Processor::new();
-        for sequence in sequences {
-            parser.advance(&mut term, sequence);
-        }
-        *term.mode() & (TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
-    }
-
-    #[test]
-    fn mouse_reporting_survives_all_motion_going_off() {
-        use alacritty_terminal::term::TermMode;
-        let buttons = mouse_mode_after(&[MOUSE_BUTTONS]);
-        assert!(buttons.contains(TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE));
-        let all = mouse_mode_after(&[MOUSE_BUTTONS, MOUSE_ALL_MOTION]);
-        assert!(all.contains(TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE));
-        // On and off again, any number of times: still reporting buttons.
-        let back = mouse_mode_after(&[
-            MOUSE_BUTTONS,
-            MOUSE_ALL_MOTION,
-            MOUSE_BUTTON_MOTION,
-            MOUSE_ALL_MOTION,
-            MOUSE_BUTTON_MOTION,
-        ]);
-        assert_eq!(back, buttons);
-        // What used to be sent: nothing reported after.
-        let off = mouse_mode_after(&[
-            MOUSE_BUTTONS,
-            MOUSE_ALL_MOTION,
-            b"\x1b[?1003l",
-        ]);
-        assert!(!off.intersects(TermMode::MOUSE_MODE));
-    }
 
     const SGR: MouseModes = MouseModes {
         click: true,

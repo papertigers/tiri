@@ -151,3 +151,128 @@ pub mod sgr {
     /// The final character of an SGR sequence.
     pub const FINAL: char = 'm';
 }
+
+/// Private modes, turned on with [`decset`] and off with [`decrst`].
+pub mod mode {
+    /// Mouse reporting of presses, releases, and movement while a button is
+    /// held. 1000, 1002 and 1003 are one setting with three values.
+    pub const BUTTON_EVENT_MOUSE: u16 = 1002;
+    /// Mouse reporting of every movement too.
+    pub const ANY_EVENT_MOUSE: u16 = 1003;
+    /// Mouse reports in SGR's encoding, separate from what's reported.
+    pub const SGR_MOUSE: u16 = 1006;
+}
+
+/// DECSET: turns private mode `mode` on.
+pub fn decset(out: &mut Vec<u8>, mode: u16) {
+    write!(out, "{CSI}?{mode}h").expect("writing to memory can't fail");
+}
+
+/// DECRST: turns private mode `mode` off.
+pub fn decrst(out: &mut Vec<u8>, mode: u16) {
+    write!(out, "{CSI}?{mode}l").expect("writing to memory can't fail");
+}
+
+/// How much of the mouse a client's terminal reports to tiri.
+///
+/// A client turns reporting on in the default state as it attaches, and the
+/// server starts each client there too, so the two agree from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseReporting {
+    /// Presses, releases, and movement while a button is held: enough for
+    /// tiri's own clicks and drags.
+    #[default]
+    Buttons,
+    /// Every movement too, for a program in the focused pane that wants it.
+    /// Only while one does, since each move costs bytes over the network.
+    AllMotion,
+}
+
+impl MouseReporting {
+    /// The private mode that reports this much.
+    fn mode(self) -> u16 {
+        match self {
+            Self::Buttons => mode::BUTTON_EVENT_MOUSE,
+            Self::AllMotion => mode::ANY_EVENT_MOUSE,
+        }
+    }
+
+    /// Turns reporting on, from none, in this state and SGR's encoding.
+    pub fn enable(self, out: &mut Vec<u8>) {
+        decset(out, self.mode());
+        decset(out, mode::SGR_MOUSE);
+    }
+
+    /// Switches the terminal's reporting from this to `to`. The old mode
+    /// goes off before the new one goes on, which works whether a terminal
+    /// treats the modes as one setting, as xterm does, or as separate ones.
+    pub fn switch(self, to: Self, out: &mut Vec<u8>) {
+        decrst(out, self.mode());
+        decset(out, to.mode());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::Term;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::{Config, TermMode, test::TermSize};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    use super::*;
+
+    /// Every state. Add new ones here, so the test below covers them.
+    const STATES: [MouseReporting; 2] =
+        [MouseReporting::Buttons, MouseReporting::AllMotion];
+
+    /// The mouse modes a terminal is in after `bytes`, as alacritty, which
+    /// treats them as xterm does, would have them.
+    fn mouse_modes_after(bytes: &[u8]) -> TermMode {
+        let mut term =
+            Term::new(Config::default(), &TermSize::new(10, 2), VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        *term.mode() & (TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
+    }
+
+    fn enabled(state: MouseReporting) -> Vec<u8> {
+        let mut out = Vec::new();
+        state.enable(&mut out);
+        out
+    }
+
+    #[test]
+    fn each_state_reports_what_it_says() {
+        let buttons = mouse_modes_after(&enabled(MouseReporting::Buttons));
+        assert_eq!(buttons, TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE);
+        let all = mouse_modes_after(&enabled(MouseReporting::AllMotion));
+        assert_eq!(all, TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE);
+    }
+
+    #[test]
+    fn switching_lands_in_the_new_state_from_any_other() {
+        for from in STATES {
+            for to in STATES {
+                // There and back again, twice, as focus moves around.
+                let mut out = enabled(from);
+                from.switch(to, &mut out);
+                to.switch(from, &mut out);
+                from.switch(to, &mut out);
+                assert_eq!(
+                    mouse_modes_after(&out),
+                    mouse_modes_after(&enabled(to)),
+                    "{from:?} to {to:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_all_motion_by_resetting_it_alone_reports_nothing() {
+        // Why switching sets the new mode, rather than only resetting the
+        // old: this is what tiri once did, and the mouse went dead.
+        let mut out = enabled(MouseReporting::AllMotion);
+        decrst(&mut out, mode::ANY_EVENT_MOUSE);
+        assert!(!mouse_modes_after(&out).intersects(TermMode::MOUSE_MODE));
+    }
+}

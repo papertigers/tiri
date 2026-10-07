@@ -23,7 +23,6 @@ use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::escape;
-use crate::input;
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
     ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target,
@@ -394,10 +393,10 @@ impl TerminalGuard {
         let mut out = io::stdout();
         out.execute(terminal::EnterAlternateScreen)?;
         out.execute(event::EnableBracketedPaste)?;
-        // Clicks, and movement while a button is held, in SGR's encoding.
-        // Every movement (1003) is the server's to turn on, while a
-        // program wants it: it costs bytes on each move.
-        out.write_all(input::MOUSE_BUTTONS)?;
+        // The server switches it from here, as programs want more or less.
+        let mut mouse = Vec::new();
+        escape::MouseReporting::default().enable(&mut mouse);
+        out.write_all(&mouse)?;
         out.flush()?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
