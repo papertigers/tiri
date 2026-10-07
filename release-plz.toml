@@ -1,0 +1,38 @@
+# Release-plz: the release PR, tags, GitHub releases and publishing.
+# See docs/releasing.md.
+
+[workspace]
+# Only when the release PR is merged, not on every push to main.
+release_always = false
+pr_name = "release v{{ version }}"
+pr_labels = ["release"]
+# A binary: there's no library API for semver checks to check.
+semver_check = false
+
+[changelog]
+header = """# Changelog
+
+What changed in each release of tiri. A release that changed how the
+client and server talk says so: after upgrading, stop servers left running
+from before with `tiri kill-server`.
+
+"""
+# Each change is a PR, squash-merged, titled `area: what changed (#n)`.
+# The raw message keeps the area, which git-cliff would take for a type.
+body = """
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for commit in commits %}
+- {{ commit.raw_message | split(pat="\n") | first | trim }}
+{%- endfor %}
+"""
+commit_parsers = [
+  # Release PRs, and the release before there were any.
+  { message = "^release v", skip = true },
+  { message = "^Update tiri to v", skip = true },
+  { message = ".*", group = "changes" },
+]
+sort_commits = "oldest"
+postprocessors = [
+  # PR numbers as links to the PRs.
+  { pattern = '\(#(\d+)\)', replace = "([#${1}](https://github.com/papertigers/tiri/pull/${1}))" },
+]
