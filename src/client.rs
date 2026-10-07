@@ -5,9 +5,9 @@
 //! The tiri client: connects to the server (starting one if needed), puts
 //! the terminal in raw mode, and relays between the two. The server does all
 //! the drawing; the client just forwards input and writes out what it's
-//! sent.
+//! sent. Also the bridge that relays to a server from another machine.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -23,6 +23,7 @@ use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::escape;
+use crate::link::{Link, LinkReader, Server};
 use crate::probe::{self, TerminalInfo};
 use crate::protocol::{
     ClientMsg, Decoder, ExitReason, Hello, PASTE_CHUNK, ServerMsg, Target,
@@ -36,7 +37,7 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
 const SERVER_START_POLL: Duration = Duration::from_millis(20);
 
 /// Attaches this terminal to `target`, starting a server if none is running.
-pub fn attach(socket: &Path, target: Target) -> Result<()> {
+pub fn attach(server: &Server, target: Target) -> Result<()> {
     let terminal_info = detect_terminal();
     // Thumbnails if the terminal can show them, unless told otherwise.
     let kitty_overview = match std::env::var("TIRI_KITTY_OVERVIEW").as_deref() {
@@ -49,18 +50,30 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
         "couldn't get the terminal's size; tiri needs to run in a terminal",
     )?;
     let talking =
-        || format!("couldn't talk to the tiri server at {}", socket.display());
-    let mut stream = connect_or_start(socket)?;
+        || format!("couldn't talk to the tiri server at {}", server.describe());
+    let mut link = match server {
+        Server::Local(socket) => Link::socket(connect_or_start(socket)?)?,
+        Server::Remote { host, socket } => {
+            Link::ssh(host, socket.as_deref(), true)?
+        }
+    };
+    // The client's directory means nothing on another machine.
+    let cwd = match server {
+        Server::Local(_) => Some(
+            std::env::current_dir()
+                .context("couldn't read the current directory")?,
+        ),
+        Server::Remote { .. } => None,
+    };
     let cell_pixels = probed_cell_pixels(&terminal_info, width, height)
         .or_else(size_cell_pixels);
     send(
-        &mut stream,
+        &mut link,
         &ClientMsg::Hello(Hello {
             width,
             height,
             target,
-            cwd: std::env::current_dir()
-                .context("couldn't read the current directory")?,
+            cwd,
             kitty_overview,
             colors: terminal_info.colors,
             cell_pixels,
@@ -68,20 +81,20 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
     )
     .with_context(talking)?;
     let mut decoder = Decoder::from_server();
-    match recv(&mut stream, &mut decoder).with_context(talking)? {
+    match recv(&mut link, &mut decoder).with_context(talking)? {
         Some(ServerMsg::Attached) => {}
         Some(ServerMsg::Error(e)) => bail!(e),
         Some(other) => bail!("unexpected reply from the server: {other:?}"),
         None => bail!(
             "the server closed the connection; its log may say why: {}",
-            socket::log_path(socket).display()
+            server.log_hint()
         ),
     }
 
     let (input_failed, input_error) = mpsc::channel();
     let reason = {
         let _guard = TerminalGuard::enter()?;
-        let mut writer = stream.try_clone()?;
+        let (mut reader, mut writer) = link.split();
         thread::spawn(move || {
             loop {
                 let event = match event::read() {
@@ -90,7 +103,7 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
                         // Hang up, so the relay below stops too and the
                         // terminal is put back before the error is shown.
                         let _ = input_failed.send(e);
-                        let _ = writer.shutdown(Shutdown::Both);
+                        writer.hang_up();
                         break;
                     }
                 };
@@ -115,7 +128,7 @@ pub fn attach(socket: &Path, target: Target) -> Result<()> {
                 }
             }
         });
-        relay(&mut stream, &mut decoder, socket)
+        relay(&mut reader, &mut decoder, server)
     };
     if let Ok(e) = input_error.try_recv() {
         return Err(e).context("couldn't read input from the terminal");
@@ -184,9 +197,9 @@ fn detect_terminal() -> TerminalInfo {
 
 /// Writes the server's output to the terminal until it says goodbye.
 fn relay(
-    stream: &mut UnixStream,
+    stream: &mut LinkReader,
     decoder: &mut Decoder,
-    socket: &Path,
+    server: &Server,
 ) -> Result<ExitReason> {
     let mut stdout = io::stdout().lock();
     loop {
@@ -197,7 +210,7 @@ fn relay(
             }
             e.context(format!(
                 "lost connection to the tiri server; its log may say why: {}",
-                socket::log_path(socket).display()
+                server.log_hint()
             ))
         })?;
         match msg {
@@ -211,20 +224,24 @@ fn relay(
             // A server that's shutting down says so first.
             None => bail!(
                 "the tiri server went away unexpectedly; its log may say why: {}",
-                socket::log_path(socket).display()
+                server.log_hint()
             ),
         }
     }
 }
 
 /// Prints the server's workspaces.
-pub fn list(socket: &Path) -> Result<()> {
-    let Some(mut stream) = connect(socket)? else {
-        println!("no tiri server running");
+pub fn list(server: &Server) -> Result<()> {
+    let Some(mut link) = connect_existing(server)? else {
+        println!("{NO_SERVER}");
         return Ok(());
     };
-    send(&mut stream, &ClientMsg::List)?;
-    match recv(&mut stream, &mut Decoder::from_server())? {
+    send(&mut link, &ClientMsg::List)?;
+    match recv(&mut link, &mut Decoder::from_server())? {
+        Some(ServerMsg::NoServer) => {
+            println!("{NO_SERVER}");
+            Ok(())
+        }
         Some(ServerMsg::Workspaces(workspaces)) => {
             for ws in workspaces {
                 if ws.panes == 0 && ws.name.is_none() {
@@ -249,20 +266,76 @@ pub fn list(socket: &Path) -> Result<()> {
         Some(other) => bail!("unexpected reply from the server: {other:?}"),
         None => bail!(
             "the server closed the connection; its log may say why: {}",
-            socket::log_path(socket).display()
+            server.log_hint()
         ),
     }
 }
 
-pub fn kill_server(socket: &Path) -> Result<()> {
-    let Some(mut stream) = connect(socket)? else {
-        println!("no tiri server running");
+pub fn kill_server(server: &Server) -> Result<()> {
+    let Some(mut link) = connect_existing(server)? else {
+        println!("{NO_SERVER}");
         return Ok(());
     };
-    send(&mut stream, &ClientMsg::KillServer)?;
+    send(&mut link, &ClientMsg::KillServer)?;
     // Wait for the server to hang up, so it's gone when we return.
-    let _ = recv::<ServerMsg>(&mut stream, &mut Decoder::from_server());
+    let reply = recv::<ServerMsg>(&mut link, &mut Decoder::from_server());
+    if let Ok(Some(ServerMsg::NoServer)) = reply {
+        println!("{NO_SERVER}");
+    }
     Ok(())
+}
+
+/// What `ls` and `kill-server` say when there's no server.
+const NO_SERVER: &str = "no tiri server running";
+
+/// A connection to `server` if it's running, without starting one. For a
+/// server on another machine there's always a connection, to the bridge,
+/// which answers [`ServerMsg::NoServer`] if there's nothing to relay to.
+fn connect_existing(server: &Server) -> Result<Option<Link>> {
+    match server {
+        Server::Local(socket) => {
+            connect(socket)?.map(Link::socket).transpose().map_err(Into::into)
+        }
+        Server::Remote { host, socket } => {
+            Link::ssh(host, socket.as_deref(), false).map(Some)
+        }
+    }
+}
+
+/// Relays between this process's standard input and output and the server
+/// at `socket`, for a client on another machine connected through ssh.
+/// With `start`, starts the server if none is running; without, answers
+/// [`ServerMsg::NoServer`] and finishes.
+pub fn bridge(socket: &Path, start: bool) -> Result<()> {
+    let stream = if start {
+        connect_or_start(socket)?
+    } else if let Some(stream) = connect(socket)? {
+        stream
+    } else {
+        send(&mut io::stdout().lock(), &ServerMsg::NoServer)?;
+        return Ok(());
+    };
+    let mut to_server = stream.try_clone()?;
+    thread::spawn(move || {
+        let _ = io::copy(&mut io::stdin().lock(), &mut to_server);
+        // The client is gone: the server will hang up in turn.
+        let _ = to_server.shutdown(Shutdown::Write);
+    });
+    // Flushed as it comes: messages are often small, and the client is
+    // waiting on them.
+    let (mut from_server, mut out) = (stream, io::stdout().lock());
+    let mut buf = vec![0u8; crate::protocol::READ_CHUNK];
+    loop {
+        match from_server.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                out.write_all(&buf[..n])?;
+                out.flush()?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Connects to a running server, or returns None if there isn't one.

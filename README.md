@@ -141,6 +141,21 @@ makes it more talkative.
 
 The server stops by itself when its last pane closes.
 
+### Another machine
+
+`-H <host>` uses the server on another machine, through ssh, with any of
+the commands above: `tiri -H box` attaches to it, starting it if needed,
+and `tiri -H box ls` lists its workspaces. tiri must be installed there
+too, at the same version. ssh runs it without a login shell, so if it isn't
+on the default `PATH` there, give its full path in `TIRI_REMOTE_COMMAND`:
+
+```sh
+TIRI_REMOTE_COMMAND=~/.cargo/bin/tiri tiri -H box
+```
+
+New panes there start in your home directory. `-S` names the socket on
+that machine.
+
 ## Config
 
 tiri reads `~/.config/tiri/config.kdl` (or

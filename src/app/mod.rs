@@ -51,6 +51,11 @@ fn clamp_size(width: u16, height: u16) -> (u16, u16) {
     (width.clamp(1, MAX_WIDTH), height.clamp(1, MAX_HEIGHT))
 }
 
+/// Where panes start for a client that hasn't said: the home directory.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
 /// What every client shares: the panes, the workspaces and their columns.
 pub struct App {
     workspaces: Workspaces,
@@ -149,7 +154,9 @@ impl App {
             id,
             width,
             height,
-            cwd,
+            // A client on another machine sends none: its directories
+            // aren't this machine's.
+            cwd: cwd.unwrap_or_else(home_dir),
             palette: Palette::from_reported(&colors),
             thumbnail_cell: thumbnail::cell_size_for(cell_pixels),
             detach_requested: false,
