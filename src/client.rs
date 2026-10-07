@@ -55,12 +55,22 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
     let (width, height) = terminal::size().context(
         "couldn't get the terminal's size; tiri needs to run in a terminal",
     )?;
+    // A config with mistakes gives way to the default one, with a word in
+    // the status bar: refusing would shut you out of your own panes.
+    // The whole of what's wrong goes to stderr once the terminal's back.
+    let (config, config_error) = match config::default_path() {
+        Some(path) => match Config::load(&path) {
+            Ok(config) => (config, None),
+            Err(e) => (Config::default(), Some(e)),
+        },
+        None => (Config::default(), None),
+    };
     let talking =
         || format!("couldn't talk to the tiri server at {}", server.describe());
     let mut link = match server {
         Server::Local(socket) => Link::socket(connect_or_start(socket)?)?,
         Server::Remote { host, socket } => {
-            Link::ssh(host, socket.as_deref(), true)?
+            Link::ssh(host, socket.as_deref(), config.remote(host))?
         }
     };
     // The client's directory means nothing on another machine.
@@ -95,16 +105,6 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
         ),
     }
 
-    // A config with mistakes gives way to the default one, with a word in
-    // the status bar: refusing would shut you out of your own panes.
-    // The whole of what's wrong goes to stderr once the terminal's back.
-    let (config, config_error) = match config::default_path() {
-        Some(path) => match Config::load(&path) {
-            Ok(config) => (config, None),
-            Err(e) => (Config::default(), Some(e)),
-        },
-        None => (Config::default(), None),
-    };
     let mut app = App::new(config);
     let mut client = Client::new(
         width,
@@ -347,17 +347,13 @@ fn detect_terminal() -> TerminalInfo {
 }
 
 /// Prints the server's workspaces.
-pub fn list(server: &Server) -> Result<()> {
-    let Some(mut link) = connect_existing(server)? else {
+pub fn list(socket: &Path) -> Result<()> {
+    let Some(mut stream) = connect(socket)? else {
         println!("{NO_SERVER}");
         return Ok(());
     };
-    send(&mut link, &ClientMsg::List)?;
-    match recv(&mut link, &mut Decoder::from_server())? {
-        Some(ServerMsg::NoServer) => {
-            println!("{NO_SERVER}");
-            Ok(())
-        }
+    send(&mut stream, &ClientMsg::List)?;
+    match recv(&mut stream, &mut Decoder::from_server())? {
         Some(ServerMsg::Workspaces(workspaces)) => {
             for ws in workspaces {
                 if ws.panes == 0 && ws.name.is_none() {
@@ -382,55 +378,30 @@ pub fn list(server: &Server) -> Result<()> {
         Some(other) => bail!("unexpected reply from the server: {other:?}"),
         None => bail!(
             "the server closed the connection; its log may say why: {}",
-            server.log_hint()
+            socket::log_path(socket).display()
         ),
     }
 }
 
-pub fn kill_server(server: &Server) -> Result<()> {
-    let Some(mut link) = connect_existing(server)? else {
+pub fn kill_server(socket: &Path) -> Result<()> {
+    let Some(mut stream) = connect(socket)? else {
         println!("{NO_SERVER}");
         return Ok(());
     };
-    send(&mut link, &ClientMsg::KillServer)?;
+    send(&mut stream, &ClientMsg::KillServer)?;
     // Wait for the server to hang up, so it's gone when we return.
-    let reply = recv::<ServerMsg>(&mut link, &mut Decoder::from_server());
-    if let Ok(Some(ServerMsg::NoServer)) = reply {
-        println!("{NO_SERVER}");
-    }
+    let _ = recv::<ServerMsg>(&mut stream, &mut Decoder::from_server());
     Ok(())
 }
 
 /// What `ls` and `kill-server` say when there's no server.
 const NO_SERVER: &str = "no tiri server running";
 
-/// A connection to `server` if it's running, without starting one. For a
-/// server on another machine there's always a connection, to the bridge,
-/// which answers [`ServerMsg::NoServer`] if there's nothing to relay to.
-fn connect_existing(server: &Server) -> Result<Option<Link>> {
-    match server {
-        Server::Local(socket) => {
-            connect(socket)?.map(Link::socket).transpose().map_err(Into::into)
-        }
-        Server::Remote { host, socket } => {
-            Link::ssh(host, socket.as_deref(), false).map(Some)
-        }
-    }
-}
-
 /// Relays between this process's standard input and output and the server
-/// at `socket`, for a client on another machine connected through ssh.
-/// With `start`, starts the server if none is running; without, answers
-/// [`ServerMsg::NoServer`] and finishes.
-pub fn bridge(socket: &Path, start: bool) -> Result<()> {
-    let stream = if start {
-        connect_or_start(socket)?
-    } else if let Some(stream) = connect(socket)? {
-        stream
-    } else {
-        send(&mut io::stdout().lock(), &ServerMsg::NoServer)?;
-        return Ok(());
-    };
+/// at `socket`, for a client on another machine connected through ssh,
+/// starting the server if none is running.
+pub fn bridge(socket: &Path) -> Result<()> {
+    let stream = connect_or_start(socket)?;
     let mut to_server = stream.try_clone()?;
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut to_server);

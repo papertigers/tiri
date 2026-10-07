@@ -15,18 +15,20 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::config::Remote;
 use crate::socket;
 
 /// The command that runs tiri on another machine, unless
-/// `$TIRI_REMOTE_COMMAND` says otherwise: ssh runs it without a login
-/// shell, so it may need a full path.
+/// `$TIRI_REMOTE_COMMAND` or the config's `remote` section says otherwise:
+/// ssh runs it without a login shell, so it may need a full path.
 const REMOTE_COMMAND: &str = "tiri";
 
 /// Where a client's server is.
 pub enum Server {
     /// Listening on this socket, here.
     Local(PathBuf),
-    /// On `host`, reached with ssh, at `socket` there or its default.
+    /// On `host`, reached with ssh, at `socket` there or the config's, or
+    /// its default.
     Remote { host: String, socket: Option<PathBuf> },
 }
 
@@ -76,27 +78,31 @@ impl Link {
     }
 
     /// Over ssh to `host`, through `tiri bridge` there, which relays to the
-    /// server's socket: `socket` there, or its default. With `start`, the
-    /// bridge starts a server if none is running; without, it answers
-    /// [`crate::protocol::ServerMsg::NoServer`].
-    pub fn ssh(host: &str, socket: Option<&Path>, start: bool) -> Result<Self> {
-        let remote = std::env::var("TIRI_REMOTE_COMMAND")
-            .unwrap_or_else(|_| REMOTE_COMMAND.to_owned());
-        let mut command = Command::new("ssh");
+    /// server's socket there, starting the server if none is running. The
+    /// socket is `socket`, or `remote`'s, or the default; the command that
+    /// runs tiri is `$TIRI_REMOTE_COMMAND`, or `remote`'s, or `tiri`.
+    pub fn ssh(
+        host: &str,
+        socket: Option<&Path>,
+        remote: Option<&Remote>,
+    ) -> Result<Self> {
+        let command = std::env::var("TIRI_REMOTE_COMMAND")
+            .ok()
+            .or_else(|| remote.and_then(|remote| remote.command.clone()));
+        let command = command.as_deref().unwrap_or(REMOTE_COMMAND);
+        let socket = socket.or_else(|| remote?.socket.as_deref());
+        let mut ssh = Command::new("ssh");
         // No terminal at the far end, so the bytes pass through untouched,
         // and no escape character, which a message could happen to contain.
-        command.args(["-T", "-e", "none", host, "--", &remote]);
+        ssh.args(["-T", "-e", "none", host, "--", command]);
         if let Some(socket) = socket {
-            command.arg("-S").arg(socket);
+            ssh.arg("-S").arg(socket);
         }
-        command.arg("bridge");
-        if !start {
-            command.arg("--no-start");
-        }
+        ssh.arg("bridge");
         // ssh's own prompts and errors go to this terminal.
-        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        ssh.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child =
-            command.spawn().context("couldn't run ssh to reach the server")?;
+            ssh.spawn().context("couldn't run ssh to reach the server")?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let ssh = Arc::new(Mutex::new(SshChild(child)));

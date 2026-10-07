@@ -61,10 +61,21 @@ layout {
 
 // New panes fade in, the overview fades in and out, and the view slides
 // to follow the focus. With `off`, everything changes at once instead:
-// calmer, and much lighter over a slow ssh link, where every frame of an
-// animation is sent in full.
+// calmer, and much lighter when tiri runs in an ssh session over a slow
+// link, where every frame of an animation is sent in full. (`tiri connect`
+// draws on your side instead, and sends only what changed in the panes.)
 animations {
     /-off
+}
+
+// Other machines, for `tiri connect box`. ssh's own config (~/.ssh/config)
+// says how to get there: user, port, keys, jump hosts. A remote section
+// says what ssh can't: where tiri is installed there, since ssh runs it
+// without a login shell and so may not find it on the PATH, and which
+// socket its server uses. $TIRI_REMOTE_COMMAND and -S take precedence.
+/-remote "box" {
+    command "~/.cargo/bin/tiri"
+    socket "/tmp/tiri-work.sock"
 }
 
 // Key bindings. Keys are written like niri's: a key, after any of Ctrl+,
