@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use crate::colors::{ANSI_COLORS, ReportedColors, Rgb};
+use crate::colors::{ANSI_COLORS, HEX_RADIX, ReportedColors, Rgb};
 use crate::escape::{self, BEL, CSI, ESC, OSC, osc_code, report};
 use crate::kitty;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -27,6 +27,9 @@ use rustix::termios::{QueueSelector, tcflush};
 /// over a slow ssh link the answers can take well over a second, and
 /// any that came after giving up would be typed into the first pane.
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of the answers is read at a time.
+const READ_CHUNK: usize = 4096;
 
 /// What a client's terminal said about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,7 +62,7 @@ pub fn probe() -> io::Result<TerminalInfo> {
     let stdin = io::stdin();
     let deadline = Instant::now() + TIMEOUT;
     let mut answers = Vec::new();
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; READ_CHUNK];
     while !has_device_attributes(&answers) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -161,18 +164,23 @@ pub fn parse(answers: &[u8]) -> TerminalInfo {
     info
 }
 
+/// The most hex digits a color report gives a channel.
+const MAX_CHANNEL_DIGITS: usize = 4;
+const BITS_PER_HEX_DIGIT: u32 = 4;
+
 /// Parses `rgb:RRRR/GGGG/BBBB`, where each part has one to four hex digits.
 fn parse_rgb(spec: &str) -> Option<Rgb> {
     let mut channels = spec.strip_prefix(report::RGB_PREFIX)?.split('/');
-    let mut rgb = [0u8; 3];
+    let mut rgb = Rgb::default();
     for channel in &mut rgb {
         let hex = channels.next()?;
-        if hex.is_empty() || hex.len() > 4 {
+        if hex.is_empty() || hex.len() > MAX_CHANNEL_DIGITS {
             return None;
         }
-        let value = u32::from_str_radix(hex, 16).ok()?;
-        let max = (1u32 << (4 * hex.len())) - 1;
-        *channel = ((value * 255 + max / 2) / max) as u8;
+        let value = u32::from_str_radix(hex, HEX_RADIX).ok()?;
+        let digits = u32::try_from(hex.len()).ok()?;
+        let max = (1u32 << (BITS_PER_HEX_DIGIT * digits)) - 1;
+        *channel = ((value * u32::from(u8::MAX) + max / 2) / max) as u8;
     }
     channels.next().is_none().then_some(rgb)
 }

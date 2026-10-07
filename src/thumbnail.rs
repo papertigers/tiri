@@ -14,7 +14,29 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use font8x8::UnicodeFonts as _;
 
-use crate::colors::{Palette, Rgb};
+use crate::colors::{ANSI_COLORS, Palette, Rgb};
+
+/// The built-in font's glyphs are this many pixels square.
+const GLYPH_SIZE: usize = 8;
+/// Bytes in an RGBA pixel, and where its alpha is among them.
+const BYTES_PER_PIXEL: usize = 4;
+const ALPHA: usize = 3;
+const OPAQUE: u8 = u8::MAX;
+/// The cell shapes a real font has: at least half as tall as wide, and at
+/// most this many times taller.
+const TALLEST_CELL: u16 = 4;
+/// Where braille starts, its dots then given by the code's bits.
+const BRAILLE_BASE: u32 = 0x2800;
+/// Braille's dots form a grid this many across and down.
+const BRAILLE_COLUMNS: usize = 2;
+const BRAILLE_ROWS: usize = 4;
+/// Box drawing and block elements, which fill their cells' full height so
+/// that lines join up.
+const BOX_AND_BLOCKS: std::ops::RangeInclusive<char> = '\u{2500}'..='\u{259f}';
+/// Where the smudge for a character the font lacks goes: from this far down
+/// the cell and this much of its height, about where lowercase letters sit.
+const SMUDGE_TOP: f64 = 5.0 / 16.0;
+const SMUDGE_HEIGHT: f64 = 0.5;
 
 /// A thumbnail cell's size in pixels, (width, height).
 pub type CellSize = (usize, usize);
@@ -35,7 +57,7 @@ pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
         (1..=MAX_CELL_PIXELS).contains(&w)
             && (1..=MAX_CELL_PIXELS).contains(&h)
             && h >= w / 2
-            && h <= w * 4
+            && h <= w * TALLEST_CELL
     };
     let Some((w, h)) = cell_pixels.filter(plausible) else {
         return DEFAULT_CELL;
@@ -50,9 +72,9 @@ pub fn cell_size_for(cell_pixels: Option<(u16, u16)>) -> CellSize {
     let g = gcd(w, h);
     let (w, h) = (w / g, h / g);
     if w > MAX_EXACT_WIDTH {
-        return (8, (8 * h + w / 2) / w);
+        return (GLYPH_SIZE, (GLYPH_SIZE * h + w / 2) / w);
     }
-    let scale = 8usize.div_ceil(w);
+    let scale = GLYPH_SIZE.div_ceil(w);
     (w * scale, h * scale)
 }
 
@@ -73,7 +95,7 @@ pub struct Image {
 
 impl Image {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height, rgba: vec![0; width * height * 4] }
+        Self { width, height, rgba: vec![0; width * height * BYTES_PER_PIXEL] }
     }
 
     /// The same image at `opacity` (0 to 1) of its own opacity. Thumbnails
@@ -82,7 +104,8 @@ impl Image {
     pub fn with_opacity(&self, opacity: f32) -> Self {
         let opacity = opacity.clamp(0.0, 1.0);
         let mut faded = self.clone();
-        for alpha in faded.rgba.iter_mut().skip(3).step_by(4) {
+        let alphas = faded.rgba.iter_mut().skip(ALPHA).step_by(BYTES_PER_PIXEL);
+        for alpha in alphas {
             *alpha = (f32::from(*alpha) * opacity).round() as u8;
         }
         faded
@@ -94,14 +117,15 @@ impl Image {
         y: usize,
         w: usize,
         h: usize,
-        rgb: [u8; 3],
+        rgb: Rgb,
         alpha: u8,
     ) {
         for py in y..(y + h).min(self.height) {
             for px in x..(x + w).min(self.width) {
-                let i = (py * self.width + px) * 4;
-                self.rgba[i..i + 4]
-                    .copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+                let i = (py * self.width + px) * BYTES_PER_PIXEL;
+                let [r, g, b] = rgb;
+                self.rgba[i..i + BYTES_PER_PIXEL]
+                    .copy_from_slice(&[r, g, b, alpha]);
             }
         }
     }
@@ -116,7 +140,7 @@ const MAX_PIXELS: usize = 8 << 20;
 /// even that would be too big.
 fn fit_cell(cell_size: CellSize, cols: usize, rows: usize) -> Option<CellSize> {
     let (w, h) = cell_size;
-    let rounded = (8, ((8 * h + w / 2) / w).max(1));
+    let rounded = (GLYPH_SIZE, ((GLYPH_SIZE * h + w / 2) / w).max(1));
     [cell_size, rounded].into_iter().find(|&(w, h)| {
         let pixels = (cols.checked_mul(w))
             .and_then(|x| x.checked_mul(rows.checked_mul(h)?));
@@ -184,7 +208,7 @@ fn draw_cell(
         fg = fg.map(|c| c / 2);
     }
     if let Some(bg) = bg {
-        image.fill(x, y, width, cell_height, bg, 0xff);
+        image.fill(x, y, width, cell_height, bg, OPAQUE);
     }
     if cell.flags.contains(Flags::HIDDEN)
         || cell.c.is_whitespace()
@@ -194,14 +218,20 @@ fn draw_cell(
     }
 
     if let Some(dots) = braille(cell.c) {
-        // Braille is a 2x4 grid of dots; btop draws its graphs with it.
-        let (dot_w, dot_h) =
-            ((cell_width / 4).max(1), (cell_height / 8).max(1));
+        // A grid of dots; btop draws its graphs with it. Each dot is half
+        // its share of the cell, a quarter share in from the share's edge.
+        let (across, down) = (BRAILLE_COLUMNS, BRAILLE_ROWS);
+        let (dot_w, dot_h) = (
+            (cell_width / (2 * across)).max(1),
+            (cell_height / (2 * down)).max(1),
+        );
         for (bit, (dx, dy)) in BRAILLE_DOTS.iter().enumerate() {
             if dots & (1 << bit) != 0 {
-                let dot_x = x + cell_width / 8 + dx * cell_width / 2;
-                let dot_y = y + cell_height / 16 + dy * cell_height / 4;
-                image.fill(dot_x, dot_y, dot_w, dot_h, fg, 0xff);
+                let dot_x =
+                    x + cell_width / (4 * across) + dx * cell_width / across;
+                let dot_y =
+                    y + cell_height / (4 * down) + dy * cell_height / down;
+                image.fill(dot_x, dot_y, dot_w, dot_h, fg, OPAQUE);
             }
         }
     } else if let Some(glyph) = glyph(cell.c) {
@@ -213,27 +243,29 @@ fn draw_cell(
         // them: the terminal draws its own text thin and anti-aliased, and
         // anything heavier reads as a brighter color when the overview
         // hands back to live text.
-        let full_height = matches!(cell.c, '\u{2500}'..='\u{259f}');
+        let full_height = BOX_AND_BLOCKS.contains(&cell.c);
         let (top, height) = if full_height {
             (y, cell_height)
         } else {
-            let rows = 8 * (cell_height / 8).max(1);
+            let rows = GLYPH_SIZE * (cell_height / GLYPH_SIZE).max(1);
             (y + (cell_height - rows) / 2, rows)
         };
         for py in 0..height {
-            let bits = glyph[py * 8 / height];
+            let bits = glyph[py * GLYPH_SIZE / height];
             for px in 0..width {
-                if bits & (1 << (px * 8 / width)) != 0 {
-                    image.fill(x + px, top + py, 1, 1, fg, 0xff);
+                if bits & (1 << (px * GLYPH_SIZE / width)) != 0 {
+                    image.fill(x + px, top + py, 1, 1, fg, OPAQUE);
                 }
             }
         }
     } else {
+        // A pixel in from each side, so neighbors don't run together.
+        let fraction = |f: f64| (cell_height as f64 * f) as usize;
         image.fill(
             x + 1,
-            y + cell_height * 5 / 16,
+            y + fraction(SMUDGE_TOP),
             width - 2,
-            cell_height / 2,
+            fraction(SMUDGE_HEIGHT),
             fg,
             UNKNOWN_GLYPH_ALPHA,
         );
@@ -245,11 +277,11 @@ const BRAILLE_DOTS: [(usize, usize); 8] =
     [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
 
 fn braille(c: char) -> Option<u8> {
-    let offset = u32::from(c).checked_sub(0x2800)?;
+    let offset = u32::from(c).checked_sub(BRAILLE_BASE)?;
     u8::try_from(offset).ok()
 }
 
-fn glyph(c: char) -> Option<[u8; 8]> {
+fn glyph(c: char) -> Option<[u8; GLYPH_SIZE]> {
     font8x8::BASIC_FONTS
         .get(c)
         .or_else(|| font8x8::BOX_FONTS.get(c))
@@ -274,7 +306,9 @@ fn resolve(
         TermColor::Named(n) => {
             let from_palette = match n {
                 NamedColor::Background => None,
-                n if (n as usize) < 16 => Some(palette.indexed(n as u8)),
+                n if (n as usize) < ANSI_COLORS => {
+                    Some(palette.indexed(n as u8))
+                }
                 n if (NamedColor::DimBlack..=NamedColor::DimWhite)
                     .contains(&n) =>
                 {

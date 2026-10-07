@@ -26,6 +26,7 @@ use miette::{
     NamedSource, SourceCode,
 };
 
+use crate::colors::HEX_RADIX;
 use crate::keys::{Action, Bindings, Key, Table};
 use crate::layout::{PresetSize, SizePresets};
 use crate::render::Color;
@@ -739,13 +740,19 @@ fn no_type_name<S: ErrorSpan>(
     }
 }
 
+/// How many hex digits a `#rrggbb` color has.
+const HEX_COLOR_DIGITS: usize = 6;
+
 fn parse_hex(s: &str) -> Option<Color> {
     let hex = s.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Two digits each for red, green and blue.
+    if hex.len() != HEX_COLOR_DIGITS
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
-    let value = u32::from_str_radix(hex, 16).ok()?;
-    Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+    let [_, r, g, b] = u32::from_str_radix(hex, HEX_RADIX).ok()?.to_be_bytes();
+    Some(Color::Rgb(r, g, b))
 }
 
 #[cfg(test)]

@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::layout::{OVERVIEW_MAX_ZOOM, PaneId, SizePresets, Strip, StripView};
+use crate::layout::{
+    DEFAULT_VIEW, OVERVIEW_MAX_ZOOM, PaneId, SizePresets, Strip, StripView,
+};
 
 /// Time constant for the vertical slide between workspaces; matches the
 /// strip's horizontal scrolling.
@@ -73,7 +75,7 @@ impl Workspaces {
         let mut workspaces = Self {
             list: Vec::new(),
             view_width,
-            view_height: 24,
+            view_height: DEFAULT_VIEW.1,
             max_stack: usize::MAX,
             size_presets: SizePresets::default(),
             views: HashMap::new(),

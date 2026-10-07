@@ -22,7 +22,9 @@ use signal_hook::consts::SIGCHLD;
 
 use crate::app::{App, Client};
 use crate::config;
-use crate::protocol::{ClientMsg, Decoder, ExitReason, ServerMsg, encode};
+use crate::protocol::{
+    ClientMsg, Decoder, ExitReason, READ_CHUNK, ServerMsg, encode,
+};
 
 /// Pane PTYs are keyed by pane id, which is a u32; these sit above them.
 /// (`usize::MAX` is reserved by `polling`.)
@@ -42,6 +44,11 @@ const MAX_OUTPUT: usize = 1 << 20;
 const STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// How long shutting down waits, in all, for clients to take their goodbyes.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// However late in that grace, each client gets at least this to take its
+/// last messages.
+const MIN_GOODBYE_WAIT: Duration = Duration::from_millis(10);
+/// How much of the signal pipe is emptied at a time.
+const SIGNAL_DRAIN: usize = 64;
 /// How long to stop accepting after accepting fails (say, out of file
 /// descriptors), rather than retrying in a tight loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -117,7 +124,7 @@ impl Connection {
     /// Takes in what the client has sent, up to [`READ_BUDGET`]; the rest
     /// waits for the next wakeup.
     fn read(&mut self) {
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; READ_CHUNK];
         let mut budget = READ_BUDGET;
         while budget > 0 {
             match self.stream.read(&mut buf) {
@@ -398,7 +405,7 @@ impl Server<'_> {
                 SIGCHLD_KEY => {
                     // Several signals may be pending as one wakeup; one look
                     // at every child covers them all.
-                    let mut buf = [0u8; 64];
+                    let mut buf = [0u8; SIGNAL_DRAIN];
                     while matches!((&*self.sigchld).read(&mut buf), Ok(n) if n > 0)
                     {
                     }
@@ -693,7 +700,7 @@ fn shut_down(
         // A client that isn't reading doesn't hold up the rest for long.
         let left = deadline.saturating_duration_since(Instant::now());
         let _ = (connection.stream)
-            .set_write_timeout(Some(left.max(Duration::from_millis(10))));
+            .set_write_timeout(Some(left.max(MIN_GOODBYE_WAIT)));
         let _ = connection.stream.write_all(&connection.outgoing);
     }
 }

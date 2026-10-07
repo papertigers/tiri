@@ -29,7 +29,7 @@ use crate::colors::Palette;
 use crate::config::Config;
 use crate::effects::Effects;
 use crate::escape::{self, MouseReporting};
-use crate::layout::{MIN_PANE_HEIGHT, PaneId};
+use crate::layout::{DEFAULT_VIEW, MIN_PANE_HEIGHT, PaneId};
 use crate::pane::Pane;
 use crate::protocol::{Hello, Target, WorkspaceInfo};
 use crate::render::Renderer;
@@ -77,7 +77,7 @@ impl App {
     /// Starts with no panes; the first client to attach gets a shell.
     /// The config is read from `config_path` as clients attach.
     pub fn new(poller: Arc<Poller>, config_path: Option<PathBuf>) -> Self {
-        let layout_size = (80, 24);
+        let layout_size = DEFAULT_VIEW;
         Self {
             workspaces: Workspaces::new(layout_size.0, &[]),
             panes: HashMap::new(),

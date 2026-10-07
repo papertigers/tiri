@@ -401,6 +401,11 @@ pub fn id_color(id: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// zlib's compression levels run from 1, fastest, to 9, smallest. Past 6,
+/// thumbnails shrink little for the extra time.
+const FAST_LEVEL: u8 = 1;
+const SMALL_LEVEL: u8 = 6;
+
 /// How hard [`compress`] works at an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -423,8 +428,8 @@ pub struct Compressed {
 /// separate from writing it out so that several can run at once.
 pub fn compress(image: &Image, compression: Compression) -> Compressed {
     let level = match compression {
-        Compression::Fast => 1,
-        Compression::Small => 6,
+        Compression::Fast => FAST_LEVEL,
+        Compression::Small => SMALL_LEVEL,
     };
     Compressed {
         width: image.width,

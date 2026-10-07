@@ -9,6 +9,9 @@ use crate::layout::PaneId;
 
 use super::{App, Client};
 
+/// The smallest box with room inside: a border, a cell, then a border.
+pub(super) const MIN_BOX: i32 = 3;
+
 /// Where a pane is drawn on a client's screen, borders included.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PaneBox {
@@ -126,7 +129,7 @@ impl App {
     pub(super) fn row_height(&self, client: &Client) -> i32 {
         let area = client.area_height();
         ((f64::from(area) * self.workspaces.zoom(client.id)).round() as i32)
-            .clamp(area.min(3), area)
+            .clamp(area.min(MIN_BOX), area)
     }
 
     /// Where workspace `ws`'s row starts on `client`'s screen. Its active

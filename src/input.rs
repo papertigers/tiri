@@ -28,8 +28,7 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
                 out.push(b);
                 return out;
             }
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            write!(out, "{c}").expect("writing to memory can't fail");
         }
         // Alt sends Escape first, for these as for characters.
         KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc => {
@@ -229,10 +228,8 @@ pub fn encode_mouse(
     for value in [code, x, y] {
         let value = value + LEGACY_OFFSET;
         if modes.utf8 {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(
-                char::from_u32(value)?.encode_utf8(&mut buf).as_bytes(),
-            );
+            write!(out, "{}", char::from_u32(value)?)
+                .expect("writing to memory can't fail");
         } else {
             out.push(u8::try_from(value).ok()?);
         }

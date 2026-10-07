@@ -15,6 +15,14 @@ const MIN_COLUMN_WIDTH: u16 = 8;
 /// refuse to consume more panes than fit at this height.
 pub const MIN_PANE_HEIGHT: i32 = 5;
 
+/// The size, in columns and rows, panes are laid out for before any
+/// terminal attaches: a classic terminal's.
+pub const DEFAULT_VIEW: (u16, u16) = (80, 24);
+
+/// Added before rounding a share of the view down to whole cells, so a
+/// share written with a few decimals, like 0.33333, comes to a whole third.
+const ROUNDING_SLACK: f64 = 1e-3;
+
 /// How wide a column is, or how tall a pane in a stack.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PresetSize {
@@ -204,7 +212,7 @@ impl Strip {
             view_width,
             target_offset: 0,
             max_stack: usize::MAX,
-            view_height: 24,
+            view_height: DEFAULT_VIEW.1,
             presets: SizePresets::default(),
         }
     }
@@ -279,7 +287,8 @@ impl Strip {
             // A share written with a few decimals, like 0.33333, should
             // still come to a whole third of 99, not just under it.
             PresetSize::Proportion(share) => {
-                (f64::from(self.view_width) * share + 1e-3).floor() as u16
+                (f64::from(self.view_width) * share + ROUNDING_SLACK).floor()
+                    as u16
             }
             PresetSize::Fixed(cells) => cells.min(self.view_width),
         };
@@ -291,7 +300,7 @@ impl Strip {
         let view = i32::from(self.view_height);
         let rows = match height {
             PresetSize::Proportion(share) => {
-                (f64::from(view) * share + 1e-3).floor() as i32
+                (f64::from(view) * share + ROUNDING_SLACK).floor() as i32
             }
             PresetSize::Fixed(rows) => i32::from(rows),
         };

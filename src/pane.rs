@@ -33,6 +33,8 @@ use crate::input::MouseModes;
 /// The most output to take from one pane per wakeup, so a pane streaming
 /// output can't starve input or the others. The rest is read next time.
 const READ_BUDGET: usize = 256 * 1024;
+/// How much is read from the PTY at a time, within that budget.
+const READ_CHUNK: usize = 16 * 1024;
 
 /// The most text a program may put on the clipboard with OSC 52.
 const MAX_COPY: usize = 1 << 20;
@@ -234,7 +236,7 @@ impl Pane {
     /// Reads and processes the child's output until the PTY runs dry or the
     /// read budget is spent. Returns false once the child has gone.
     pub fn read_ready(&mut self) -> bool {
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; READ_CHUNK];
         let mut total = 0;
         loop {
             match rustix::io::read(self.fd(), &mut buf) {

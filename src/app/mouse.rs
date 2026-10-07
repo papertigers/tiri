@@ -17,7 +17,7 @@ use crate::render::text_width;
 use crate::selection::{self, Point, Selection};
 
 use super::client_state::{Click, Drag};
-use super::geometry::Seam;
+use super::geometry::{MIN_BOX, Seam};
 use super::screen::content_top;
 use super::status::StatusTarget;
 use super::{App, Client};
@@ -42,6 +42,9 @@ const WHEEL_LINES: i32 = 3;
 /// Presses on the same cell this close together make a double or
 /// triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// Clicks in a row select a word, then a line; a fourth starts over.
+const DOUBLE_CLICK: u8 = 2;
+const TRIPLE_CLICK: u8 = 3;
 
 impl App {
     /// What's at (`x`, `y`) on `client`'s screen.
@@ -93,10 +96,12 @@ impl App {
     ) -> Option<(u16, u16, Point, i32)> {
         let pane = self.panes.get(&id)?;
         let b = (self.visible_panes(client).into_iter())
-            .find(|b| b.id == id && b.w >= 3 && b.h >= 3)?;
-        let cx = (x - b.x - 1).clamp(0, b.w - 3);
+            .find(|b| b.id == id && b.w >= MIN_BOX && b.h >= MIN_BOX)?;
+        // Inside the border, to its last cell.
+        let (inner_w, inner_h) = (b.w - 2, b.h - 2);
+        let cx = (x - b.x - 1).clamp(0, inner_w - 1);
         let raw_y = y - b.y - 1;
-        let cy = raw_y.clamp(0, b.h - 3);
+        let cy = raw_y.clamp(0, inner_h - 1);
         let top = content_top(pane, b.h - 2, client.scrolled(id, pane));
         let point = Point { line: top + cy, col: cx as u16 };
         Some((cx as u16, cy as u16, point, (raw_y - cy).signum()))
@@ -259,7 +264,7 @@ impl App {
                                 && last.point == point
                                 && now - last.at < MULTI_CLICK =>
                         {
-                            last.count % 3 + 1
+                            last.count % TRIPLE_CLICK + 1
                         }
                         _ => 1,
                     });
@@ -290,8 +295,8 @@ impl App {
                     client.drag = Drag::Forwarded(id);
                 } else {
                     let (anchor, head) = match clicks {
-                        2 => selection::word_at(pane.term(), point),
-                        3 => selection::line_at(pane.term(), point),
+                        DOUBLE_CLICK => selection::word_at(pane.term(), point),
+                        TRIPLE_CLICK => selection::line_at(pane.term(), point),
                         _ => (point, point),
                     };
                     client.drag =

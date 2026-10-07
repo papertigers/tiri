@@ -7,6 +7,7 @@
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 
+use crate::colors::ANSI_COLORS;
 use crate::layout::PaneId;
 use crate::pane::Pane;
 use crate::render::{Color, Frame, Style};
@@ -133,7 +134,7 @@ fn term_color(pane: &Pane, color: TermColor) -> Color {
                 return rgb(c);
             }
             let idx = n as usize;
-            if idx < 16 {
+            if idx < ANSI_COLORS {
                 Color::Idx(idx as u8)
             } else if is_dim_named(color) {
                 Color::Idx((idx - NamedColor::DimBlack as usize) as u8)

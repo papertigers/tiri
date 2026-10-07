@@ -138,6 +138,9 @@ fn control_char(c: char) -> char {
 }
 
 /// Names for keys that aren't characters, as the config writes them.
+/// The function keys a binding can name, F1 to F12.
+const FUNCTION_KEYS: std::ops::RangeInclusive<u8> = 1..=12;
+
 const NAMED: &[(&str, KeyCode)] = &[
     ("Enter", KeyCode::Enter),
     ("Return", KeyCode::Enter),
@@ -233,7 +236,7 @@ impl FromStr for Key {
                     .map(|(_, c)| *c);
                 let function = (key.strip_prefix(['F', 'f']))
                     .and_then(|n| n.parse::<u8>().ok())
-                    .filter(|n| (1..=12).contains(n))
+                    .filter(|n| FUNCTION_KEYS.contains(n))
                     .map(KeyCode::F);
                 match named.or(function) {
                     Some(KeyCode::Tab)

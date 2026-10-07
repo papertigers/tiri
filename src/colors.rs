@@ -5,12 +5,25 @@
 //! The colors of a client's terminal: what it reported when it attached,
 //! filled in with xterm's defaults wherever it didn't say.
 
+use alacritty_terminal::vte::ansi::NamedColor;
 use serde::{Deserialize, Serialize};
 
 pub type Rgb = [u8; 3];
 
 /// The basic colors at the start of the palette, which terminals report.
 pub const ANSI_COLORS: usize = 16;
+
+/// Hex digits, as colors are written.
+pub const HEX_RADIX: u32 = 16;
+
+// The rest of the 256-color palette: a 6x6x6 color cube, then a grey ramp.
+const CUBE_START: u8 = ANSI_COLORS as u8;
+const CUBE_SIDE: u8 = 6;
+const GREY_START: u8 = CUBE_START + CUBE_SIDE * CUBE_SIDE * CUBE_SIDE;
+/// Each cube channel's levels, as xterm has them.
+const CUBE_LEVELS: [u8; CUBE_SIDE as usize] = [0, 95, 135, 175, 215, 255];
+const GREY_FIRST: u8 = 8;
+const GREY_STEP: u8 = 10;
 
 /// What a terminal said about its colors; None where it didn't answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,26 +84,28 @@ impl Palette {
     /// The color for 256-color index `i`: the ANSI colors, then xterm's
     /// 6x6x6 cube and grey ramp.
     pub fn indexed(&self, i: u8) -> Rgb {
-        match i {
-            0..16 => self.ansi[usize::from(i)],
-            16..232 => {
-                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                let i = i - 16;
-                [level(i / 36), level(i / 6 % 6), level(i % 6)]
-            }
-            232.. => {
-                let v = 8 + (i - 232) * 10;
-                [v, v, v]
-            }
+        if i < CUBE_START {
+            self.ansi[usize::from(i)]
+        } else if i < GREY_START {
+            let i = i - CUBE_START;
+            let level = |v: u8| CUBE_LEVELS[usize::from(v)];
+            [
+                level(i / (CUBE_SIDE * CUBE_SIDE)),
+                level(i / CUBE_SIDE % CUBE_SIDE),
+                level(i % CUBE_SIDE),
+            ]
+        } else {
+            let v = GREY_FIRST + (i - GREY_START) * GREY_STEP;
+            [v, v, v]
         }
     }
 
     /// The color for one of alacritty's color indexes, as in its color
-    /// queries: 0-255 the palette, 256 the foreground, 257 the background.
+    /// queries: the palette, then its named colors.
     pub fn by_index(&self, idx: usize) -> Rgb {
         if let Ok(i) = u8::try_from(idx) {
             self.indexed(i)
-        } else if idx == 257 {
+        } else if idx == NamedColor::Background as usize {
             self.background
         } else {
             self.foreground
