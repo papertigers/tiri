@@ -4,7 +4,8 @@
 
 //! A client's connection to its server: the server's socket on this
 //! machine, or ssh to `tiri bridge` on another, which relays to the socket
-//! there. Both carry the same messages.
+//! there. Both carry the same messages; through ssh, what the server sends
+//! comes compressed with zstd, as one stream flushed as it goes.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -22,6 +23,20 @@ use crate::socket;
 /// `$TIRI_REMOTE_COMMAND` or the config's `remote` section says otherwise:
 /// ssh runs it without a login shell, so it may need a full path.
 const REMOTE_COMMAND: &str = "tiri";
+
+/// How hard the bridge compresses: zstd's default, which keeps up with far
+/// more output than a link that needs compressing carries.
+const COMPRESSION_LEVEL: i32 = 3;
+
+/// `out`, compressing what's written to it, for the bridge to write to ssh.
+/// Each flush sends all that's been written, for the client to decompress
+/// whole: the bridge flushes as the server's messages come, and the client
+/// is waiting on them.
+pub fn compressing<W: Write>(
+    out: W,
+) -> io::Result<zstd::stream::write::Encoder<'static, W>> {
+    zstd::stream::write::Encoder::new(out, COMPRESSION_LEVEL)
+}
 
 /// Where a client's server is.
 pub enum Server {
@@ -108,7 +123,7 @@ impl Link {
         let ssh = Arc::new(Mutex::new(SshChild(child)));
         Ok(Self {
             reader: LinkReader {
-                inner: Box::new(stdout),
+                inner: Box::new(zstd::stream::read::Decoder::new(stdout)?),
                 _ssh: Some(ssh.clone()),
             },
             writer: LinkWriter {
@@ -199,5 +214,68 @@ impl Drop for SshChild {
         // It's normally gone already, the server having hung up.
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Decoder, ServerMsg, encode};
+    use std::sync::mpsc;
+
+    /// Reads what's been sent so far, and fails rather than waiting for
+    /// more, as a pipe with nothing in it would wait.
+    struct Pipe(mpsc::Receiver<Vec<u8>>);
+
+    impl Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self.0.try_recv().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "nothing sent yet")
+            })?;
+            assert!(bytes.len() <= buf.len(), "a test message fits");
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// Collects the bridge's compressed output, a flush at a time.
+    struct Sent(mpsc::Sender<Vec<u8>>, Vec<u8>);
+
+    impl Write for Sent {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.1.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let _ = self.0.send(std::mem::take(&mut self.1));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn each_flush_arrives_whole_without_waiting_for_more() {
+        let (tx, rx) = mpsc::channel();
+        let mut bridge = compressing(Sent(tx, Vec::new())).unwrap();
+        let mut client = zstd::stream::read::Decoder::new(Pipe(rx)).unwrap();
+        let mut decoder = Decoder::from_server();
+        let mut buf = [0; 4096];
+        let mut decompressed = 0;
+        for i in 0..50u32 {
+            let text = format!("line {i}: the same old output\r\n").repeat(20);
+            let msg = ServerMsg::Notice(text.clone());
+            bridge.write_all(&encode(&msg)).unwrap();
+            bridge.flush().unwrap();
+            let msg = loop {
+                if let Some(msg) = decoder.next::<ServerMsg>().unwrap() {
+                    break msg;
+                }
+                let n = client.read(&mut buf).expect("all of it was sent");
+                decompressed += n;
+                decoder.push(&buf[..n]);
+            };
+            assert!(matches!(msg, ServerMsg::Notice(t) if t == text));
+        }
+        assert_eq!(decompressed as u64, decoder.taken());
     }
 }

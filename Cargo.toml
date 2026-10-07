@@ -35,3 +35,4 @@ miette = { version = "7.6.0", default-features = false, features = ["fancy-no-sy
 unicode-width = "0.2"
 compact_str = "0.9"
 signal-hook = "0.4.5"
+zstd = { version = "0.14.0", default-features = false }

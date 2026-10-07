@@ -408,13 +408,18 @@ pub fn bridge(socket: &Path) -> Result<()> {
         // The client is gone: the server will hang up in turn.
         let _ = to_server.shutdown(Shutdown::Write);
     });
-    // Flushed as it comes: messages are often small, and the client is
-    // waiting on them.
-    let (mut from_server, mut out) = (stream, io::stdout().lock());
+    // Compressed, and flushed as it comes: messages are often small, and
+    // the client is waiting on them.
+    let mut from_server = stream;
+    let mut out = crate::link::compressing(io::stdout().lock())?;
     let mut buf = vec![0u8; crate::protocol::READ_CHUNK];
     loop {
         match from_server.read(&mut buf) {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                // The end of the stream, so the client reads it as one.
+                out.finish()?.flush()?;
+                return Ok(());
+            }
             Ok(n) => {
                 out.write_all(&buf[..n])?;
                 out.flush()?;
