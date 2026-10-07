@@ -142,6 +142,12 @@ makes it more talkative.
 
 The server stops by itself when its last pane closes.
 
+Drawing happens in the client, which has no log. To report something it
+draws wrong, run it with `TIRI_TRACE=trace.zst tiri` and reproduce the
+problem: the trace records every frame sent to your terminal, with keys
+and timings, so it can be replayed. It holds whatever your panes showed,
+though not what you typed, so share it only if that's fine.
+
 ### Another machine
 
 `tiri connect box` attaches to the server on another machine, through
