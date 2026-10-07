@@ -107,7 +107,7 @@ impl Frame {
         if let Some(i) = self.index(x, y) {
             self.split_wide(i);
             self.cells[i] =
-                Cell { sym: printable(sym).into(), wide: false, style };
+                Cell { sym: narrow(printable(sym)), wide: false, style };
         }
     }
 
@@ -162,7 +162,9 @@ impl Frame {
             let sym = &*ch.encode_utf8(&mut buf);
             match char_width(ch) {
                 0 => {
-                    if let Some(i) = last {
+                    if let Some(i) = last
+                        && (self.cells[i].wide || ch != EMOJI_PRESENTATION)
+                    {
                         self.cells[i].sym.push(ch);
                     }
                 }
@@ -226,6 +228,22 @@ pub fn fit_width(s: &str, max: usize) -> &str {
         }
     }
     s
+}
+
+/// U+FE0F, which asks for a character's emoji form. Terminals draw a
+/// character with it two columns wide, even one that's otherwise narrow,
+/// like 🗡: drawn in a narrow cell, it spills into the next one, and
+/// whatever's drawn there wipes it out.
+const EMOJI_PRESENTATION: char = '\u{FE0F}';
+
+/// `sym` for a narrow cell: without [`EMOJI_PRESENTATION`], so the terminal
+/// draws it in the one column the frame gives it.
+fn narrow(sym: &str) -> CompactString {
+    if sym.contains(EMOJI_PRESENTATION) {
+        sym.chars().filter(|&ch| ch != EMOJI_PRESENTATION).collect()
+    } else {
+        sym.into()
+    }
 }
 
 /// Control characters would move the outer terminal's cursor behind the
@@ -485,6 +503,29 @@ mod tests {
             .draw(&mut out, b"\x1b]52;c;\x07", frame, Some((3, 0)))
             .unwrap();
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn narrow_cells_go_without_emoji_presentation() {
+        // 🗡 is narrow, but asking for its emoji form makes terminals draw
+        // it two wide, into the cell after it, which then wipes it out.
+        let dagger = "\u{1F5E1}\u{FE0F}";
+        let mut f = Frame::new(6, 1);
+        f.put(0, 0, dagger, Style::default());
+        f.put(1, 0, " ", Style::default());
+        f.put_str(2, 0, dagger, Style::default());
+        // Wide ones are two columns either way, so it's left on them.
+        f.put_wide(4, 0, "\u{1F33F}\u{FE0F}", Style::default());
+        let syms: Vec<&str> = f.cells.iter().map(|c| c.sym.as_str()).collect();
+        assert_eq!(
+            syms,
+            ["\u{1F5E1}", " ", "\u{1F5E1}", " ", "\u{1F33F}\u{FE0F}", ""]
+        );
+
+        let mut out = Vec::new();
+        Renderer::default().draw(&mut out, &[], f, None).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.matches('\u{FE0F}').count(), 1, "{out:?}");
     }
 
     #[test]
