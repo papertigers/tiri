@@ -128,7 +128,7 @@ pub fn attach(server: &Server, target: Target) -> Result<()> {
         trace.note(format_args!("size {width}x{height}"));
     }
     let reason = {
-        let _guard = TerminalGuard::enter()?;
+        let _guard = TerminalGuard::enter(terminal_info.kitty_keyboard)?;
         let (reader, mut writer) = link.split();
         let (events, incoming) = mpsc::channel();
         spawn_input(events.clone());
@@ -671,7 +671,10 @@ fn start_server(socket: &Path) -> Result<()> {
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    /// With `kitty_keyboard`, also asks the terminal to tell keys apart
+    /// that otherwise send the same bytes, like Enter and Shift+Enter, so
+    /// programs in panes that want them can have them.
+    fn enter(kitty_keyboard: bool) -> Result<Self> {
         terminal::enable_raw_mode()?;
         // From here, dropping the guard puts the terminal back, whichever
         // of the steps below fails.
@@ -680,6 +683,14 @@ impl TerminalGuard {
         let mut out = io::stdout();
         out.execute(terminal::EnterAlternateScreen)?;
         out.execute(event::EnableBracketedPaste)?;
+        if kitty_keyboard {
+            // Only disambiguating: plain typing still comes as text, and
+            // keys only as they're pressed, which is all tiri passes on.
+            out.execute(event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ))?;
+            KEYBOARD_PUSHED.store(true, Ordering::Relaxed);
+        }
         // The server switches it from here, as programs want more or less.
         let mut mouse = Vec::new();
         escape::MouseReporting::default().enable(&mut mouse);
@@ -700,6 +711,10 @@ impl TerminalGuard {
 
 /// Whether a [`TerminalGuard`] has the terminal in raw mode.
 static TERMINAL_TAKEN: AtomicBool = AtomicBool::new(false);
+/// Whether it pushed kitty keyboard flags, to pop. Only then: to a
+/// terminal without the protocol the pop could look like restoring the
+/// cursor.
+static KEYBOARD_PUSHED: AtomicBool = AtomicBool::new(false);
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -713,6 +728,10 @@ fn restore() {
     let mut out = io::stdout();
     let _ = out.execute(event::DisableMouseCapture);
     let _ = out.execute(event::DisableBracketedPaste);
+    // The flags are kept per screen, so before leaving this one.
+    if KEYBOARD_PUSHED.swap(false, Ordering::Relaxed) {
+        let _ = out.execute(event::PopKeyboardEnhancementFlags);
+    }
     let _ = out.execute(terminal::LeaveAlternateScreen);
     let _ = out.execute(cursor::Show);
     let _ = terminal::disable_raw_mode();

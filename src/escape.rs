@@ -112,6 +112,9 @@ pub const QUERY_CELL_SIZE: &str = csi!("16t");
 /// Asks for the text area's size in pixels (XTWINOPS 14), answered by a
 /// [`report::TEXT_AREA_SIZE`] window report.
 pub const QUERY_TEXT_AREA_SIZE: &str = csi!("14t");
+/// Asks which kitty keyboard protocol flags are on, answered by a
+/// [`report::KEYBOARD_FLAGS_FINAL`] report by terminals that speak it.
+pub const QUERY_KEYBOARD_FLAGS: &str = csi!("?u");
 /// Asks for the primary device attributes, which every terminal answers.
 pub const QUERY_DEVICE_ATTRIBUTES: &str = csi!("c");
 
@@ -127,6 +130,9 @@ pub mod report {
     pub const DEVICE_ATTRIBUTES: &str = csi!("?");
     /// How the primary device attributes report ends.
     pub const DEVICE_ATTRIBUTES_FINAL: u8 = b'c';
+    /// How the kitty keyboard flags report ends: CSI ? flags u, starting
+    /// as the device attributes report does.
+    pub const KEYBOARD_FLAGS_FINAL: u8 = b'u';
     /// How a color report gives its color: `rgb:` then hex channels.
     pub const RGB_PREFIX: &str = "rgb:";
 }
