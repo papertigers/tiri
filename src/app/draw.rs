@@ -10,12 +10,19 @@ use std::time::Instant;
 use crate::effects::Transition;
 use crate::escape::MouseReporting;
 use crate::kitty;
+use crate::layout::PresetSize;
 use crate::render::{Frame, Style, fit_width, text_width};
 
 use super::geometry::PaneBox;
 use super::screen::{content_top, draw_screen};
 use super::thumbnails::image_id;
 use super::{App, Client};
+
+/// How far into a pane's top border its title starts: past the corner and
+/// one line of border.
+const TITLE_INSET: i32 = 2;
+/// Room on each side of a hint in its box: the border and a space.
+const HINT_MARGIN: i32 = 2;
 
 impl App {
     /// Composes `client`'s view of the workspaces plus its status bar.
@@ -149,8 +156,9 @@ impl App {
             } else {
                 format!(" {number}: {} ", pane.title())
             };
-            let room = usize::try_from(w - 4).unwrap_or(0);
-            frame.put_str(x + 2, y, fit_width(&title, room), border);
+            // As far in from the far corner as from the near one.
+            let room = usize::try_from(w - 2 * TITLE_INSET).unwrap_or(0);
+            frame.put_str(x + TITLE_INSET, y, fit_width(&title, room), border);
 
             let top = content_top(pane, h - 2, scrolled);
             match client.thumbnails.get(&id) {
@@ -282,8 +290,14 @@ impl App {
         if overview {
             // A box the size of a default column, where one would open.
             let zoom = self.workspaces.zoom(client.id);
-            let w = ((f64::from(client.width) * 0.5 * zoom).round() as i32)
-                .max(hint_width + 4);
+            let column = match self.config.size_presets.default_column_width {
+                PresetSize::Proportion(share) => {
+                    f64::from(client.width) * share
+                }
+                PresetSize::Fixed(cells) => f64::from(cells),
+            };
+            let w = ((column * zoom).round() as i32)
+                .max(hint_width + 2 * HINT_MARGIN);
             let x = (i32::from(client.width) - w) / 2;
             draw_box(frame, x, top, w, row_height, style);
             frame.put_str(x + (w - hint_width) / 2, middle, hint, style);

@@ -12,6 +12,9 @@ use crossterm::{QueueableCommand, cursor, style, terminal};
 use unicode_width::UnicodeWidthChar;
 
 use crate::escape::{CSI, sgr};
+
+/// The most bytes a character takes in UTF-8.
+const MAX_UTF8_LEN: usize = 4;
 use crate::kitty;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -155,7 +158,7 @@ impl Frame {
         // The cell the last character went into, for marks that follow it.
         let mut last: Option<usize> = None;
         for ch in s.chars() {
-            let mut buf = [0u8; 4];
+            let mut buf = [0u8; MAX_UTF8_LEN];
             let sym = &*ch.encode_utf8(&mut buf);
             match char_width(ch) {
                 0 => {
@@ -190,11 +193,13 @@ impl Frame {
 /// overview of thumbnails is thousands of them, and moving the cursor to
 /// each would double what they cost to send.
 fn advances_one(cell: &Cell) -> bool {
+    /// Where the symbol blocks start: Miscellaneous Symbols.
+    const FIRST_SYMBOL_BLOCK: char = '\u{2600}';
     let mut chars = cell.sym.chars();
     match (chars.next(), chars.next()) {
         (Some(kitty::PLACEHOLDER), _) => !cell.wide,
         (Some(ch), None) => {
-            !cell.wide && ch < '\u{2600}' && ch.width() == Some(1)
+            !cell.wide && ch < FIRST_SYMBOL_BLOCK && ch.width() == Some(1)
         }
         _ => false,
     }

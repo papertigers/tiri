@@ -32,6 +32,8 @@ use crate::socket;
 
 /// How long to wait for a freshly started server to start listening.
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often to look for a starting server's socket.
+const SERVER_START_POLL: Duration = Duration::from_millis(20);
 
 /// Attaches this terminal to `target`, starting a server if none is running.
 pub fn attach(socket: &Path, target: Target) -> Result<()> {
@@ -316,7 +318,7 @@ fn connect_or_start(socket: &Path) -> Result<UnixStream> {
                 socket::log_path(socket).display()
             );
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(SERVER_START_POLL);
     }
 }
 

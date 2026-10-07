@@ -22,6 +22,10 @@ pub const MAX_SERVER_MESSAGE: usize = 64 * 1024 * 1024;
 /// mouse, resizes) and pastes in [`PASTE_CHUNK`]s, so the server never
 /// buffers much for any one of them.
 pub const MAX_CLIENT_MESSAGE: usize = 1024 * 1024;
+/// Each message starts with its length, as a little-endian u32.
+const LEN_PREFIX: usize = size_of::<u32>();
+/// How much is read from a socket at a time.
+pub const READ_CHUNK: usize = 64 * 1024;
 /// How much of a paste goes in one message.
 pub const PASTE_CHUNK: usize = 64 * 1024;
 
@@ -106,7 +110,7 @@ pub fn encode(msg: &impl Serialize) -> Vec<u8> {
         postcard::to_stdvec(msg).expect("protocol messages always serialize");
     let len =
         u32::try_from(body.len()).expect("messages are far smaller than 4 GiB");
-    let mut out = Vec::with_capacity(4 + body.len());
+    let mut out = Vec::with_capacity(LEN_PREFIX + body.len());
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&body);
     out
@@ -146,7 +150,7 @@ impl Decoder {
     /// The next complete message, if one has fully arrived.
     pub fn next<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
         let buf = &self.buf[self.start..];
-        let Some(header) = buf.get(..4) else {
+        let Some(header) = buf.get(..LEN_PREFIX) else {
             return Ok(None);
         };
         let len =
@@ -154,14 +158,14 @@ impl Decoder {
         if len > self.limit {
             bail!("message of {len} bytes is too big");
         }
-        let Some(body) = buf.get(4..4 + len) else {
+        let Some(body) = buf.get(LEN_PREFIX..LEN_PREFIX + len) else {
             return Ok(None);
         };
         let msg = postcard::from_bytes(body).context(
             "couldn't understand a message: are the tiri client and server different \
              versions? `tiri kill-server` stops a server left from before an upgrade",
         )?;
-        self.start += 4 + len;
+        self.start += LEN_PREFIX + len;
         Ok(Some(msg))
     }
 }
@@ -177,7 +181,7 @@ pub fn recv<T: DeserializeOwned>(
     stream: &mut impl Read,
     decoder: &mut Decoder,
 ) -> Result<Option<T>> {
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; READ_CHUNK];
     loop {
         if let Some(msg) = decoder.next()? {
             return Ok(Some(msg));

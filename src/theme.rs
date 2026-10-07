@@ -66,7 +66,8 @@ const OXIDE: Theme = Theme {
 };
 
 const fn rgb(hex: u32) -> Color {
-    Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+    let [_, r, g, b] = hex.to_be_bytes();
+    Color::Rgb(r, g, b)
 }
 
 #[cfg(test)]
