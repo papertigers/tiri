@@ -15,7 +15,7 @@ use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::{Config, TermMode, cell::Cell};
+use alacritty_terminal::term::{TermMode, cell::Cell};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 
 use crate::escape;
@@ -59,7 +59,7 @@ pub struct ScrollMark {
 impl Emulator {
     pub fn new(rows: u16, cols: u16) -> Self {
         let events = Rc::default();
-        let config = Config::default();
+        let config = snapshot::config();
         let history_limit = config.scrolling_history;
         let term = Term::new(
             config,
@@ -116,6 +116,12 @@ impl Emulator {
     /// How many lines of scrollback there are above the screen.
     pub fn history_size(&self) -> usize {
         self.term.grid().history_size()
+    }
+
+    /// The kitty keyboard protocol flags the program asked for, as the
+    /// protocol numbers them: how its keys are to be sent.
+    pub fn keyboard_flags(&self) -> u8 {
+        snapshot::keyboard_flags(*self.term.mode())
     }
 
     /// What the program asked to hear about the mouse.
@@ -353,6 +359,24 @@ mod tests {
         // Clearing history leaves nothing to measure from.
         emulator.feed(b"\x1b[3J");
         assert_eq!(emulator.scrolled_since(full), None);
+    }
+
+    #[test]
+    fn programs_can_have_the_kitty_keyboard_protocol() {
+        let mut emulator = Emulator::new(5, 20);
+        emulator.feed(b"\x1b[>1u");
+        assert_eq!(emulator.keyboard_flags(), 1);
+        // Asked, it answers with what's in force.
+        emulator.feed(b"\x1b[?u");
+        let answers: Vec<String> = (emulator.take_questions().into_iter())
+            .filter_map(|event| match event {
+                TermEvent::PtyWrite(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, ["\x1b[?1u"]);
+        emulator.feed(b"\x1b[<u");
+        assert_eq!(emulator.keyboard_flags(), 0);
     }
 
     #[test]

@@ -260,6 +260,10 @@ pub const CHARSET_LINE_DRAWING: u8 = b'0';
 pub const RESET_SCROLL_REGION: &str = csi!("r");
 /// DECSTBM's final character: sets the scroll region, top;bottom.
 pub const SET_SCROLL_REGION: char = 'r';
+/// Pushes kitty keyboard protocol flags: CSI > flags u.
+pub const PUSH_KEYBOARD_FLAGS: &str = csi!(">");
+/// Ends a kitty keyboard protocol sequence: pushing, popping or asking.
+pub const KEYBOARD_FLAGS_FINAL: char = 'u';
 /// CUP's final character: moves the cursor to row;column, from 1.
 pub const CURSOR_POSITION: char = 'H';
 /// CUU's final character: moves the cursor up so many rows.
