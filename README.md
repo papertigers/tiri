@@ -131,6 +131,7 @@ mouse.
 | `tiri new <name>` | Create a named workspace with a shell, and attach to it |
 | `tiri ls` | List the workspaces |
 | `tiri kill-server` | Stop the server and every pane in it |
+| `tiri connect <host>` | Attach to the server on another machine, through ssh |
 | `tiri config default` | Print the default config |
 
 The server listens on a socket in a private, per-user directory:
@@ -143,18 +144,27 @@ The server stops by itself when its last pane closes.
 
 ### Another machine
 
-`-H <host>` uses the server on another machine, through ssh, with any of
-the commands above: `tiri -H box` attaches to it, starting it if needed,
-and `tiri -H box ls` lists its workspaces. tiri must be installed there
-too, at the same version. ssh runs it without a login shell, so if it isn't
-on the default `PATH` there, give its full path in `TIRI_REMOTE_COMMAND`:
+`tiri connect box` attaches to the server on another machine, through
+ssh, starting it if needed. `tiri connect box work` lands on the `work`
+workspace, and `tiri connect box work --new` creates it. ssh reads your
+`~/.ssh/config`, so `box` can be an alias there, with its user, port, keys
+and jump hosts. To list the workspaces there, or stop the server, run tiri
+there: `ssh box tiri ls`.
 
-```sh
-TIRI_REMOTE_COMMAND=~/.cargo/bin/tiri tiri -H box
+tiri must be installed there too, at the same version. ssh runs it without
+a login shell, so if it isn't on the default `PATH` there, say where it is
+in a `remote` section of your config, along with the socket there if it's
+not the default:
+
+```kdl
+remote "box" {
+    command "~/.cargo/bin/tiri"
+    socket "/tmp/tiri-work.sock"
+}
 ```
 
-New panes there start in your home directory. `-S` names the socket on
-that machine.
+`TIRI_REMOTE_COMMAND` and `-S` override these for one connection. New
+panes there start in your home directory.
 
 Your terminal draws everything itself, animations included: the server
 sends only what programs in panes write and changes to the layout, so a
@@ -178,7 +188,7 @@ instead, and the status bar names the line at fault. The full report is
 printed when you detach.
 
 Keys, the theme and animations come from the config where you run `tiri`,
-so with `-H` your own apply there too. Column widths and pane heights come
+so with `tiri connect` your own apply there too. Column widths and pane heights come
 from the config on the server's machine, since everyone attached shares
 the layout.
 

@@ -43,6 +43,20 @@ pub struct Config {
     pub size_presets: SizePresets,
     /// Whether things fade and slide, or change at once.
     pub animations: bool,
+    /// How to reach tiri on other machines, for `tiri connect`.
+    pub remotes: Vec<Remote>,
+}
+
+/// A `remote` section: tiri on another machine, as `tiri connect` reaches
+/// it. ssh's own config says how to get there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// The host as given to `tiri connect`, and to ssh.
+    pub host: String,
+    /// The command that runs tiri there, if not `tiri`.
+    pub command: Option<String>,
+    /// The server's socket there, if not its default.
+    pub socket: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -80,6 +94,11 @@ impl Config {
             }
         };
         Config::parse(&file, &text)
+    }
+
+    /// What the config says about reaching `host`, if anything.
+    pub fn remote(&self, host: &str) -> Option<&Remote> {
+        self.remotes.iter().find(|remote| remote.host == host)
     }
 
     /// Parses config `text`, naming it `file` in errors. Its key bindings
@@ -270,6 +289,20 @@ struct RawConfig {
     layout: RawLayout,
     #[knus(child)]
     animations: Option<RawAnimations>,
+    #[knus(children(name = "remote"))]
+    remotes: Vec<RawRemote>,
+}
+
+/// A `remote` section, as written.
+#[derive(knus::Decode, Debug)]
+#[knus(span_type = Span)]
+struct RawRemote {
+    #[knus(argument)]
+    host: Spanned<String, Span>,
+    #[knus(child, unwrap(argument), default)]
+    command: Option<String>,
+    #[knus(child, unwrap(argument), default)]
+    socket: Option<PathBuf>,
 }
 
 /// The `animations` section, niri's way of turning them off.
@@ -586,7 +619,22 @@ impl RawConfig {
                 .ok_or_else(|| unknown_theme("theme", name, &defined))?,
         };
         let animations = self.animations.is_none_or(|a| !a.off);
-        Ok(Config { theme, bindings, size_presets, animations })
+        let mut remotes: Vec<Remote> = Vec::new();
+        for raw in self.remotes {
+            if remotes.iter().any(|r| r.host == *raw.host) {
+                return Err(Problem::at(
+                    *raw.host.span(),
+                    "again",
+                    format!("there's already a remote for {:?}", *raw.host),
+                ));
+            }
+            remotes.push(Remote {
+                host: (*raw.host).clone(),
+                command: raw.command,
+                socket: raw.socket,
+            });
+        }
+        Ok(Config { theme, bindings, size_presets, animations, remotes })
     }
 }
 
@@ -786,6 +834,37 @@ mod tests {
         let off = DEFAULT.replace("/-off", "off");
         assert_ne!(off, DEFAULT);
         assert!(!parse(&off).unwrap().animations);
+    }
+
+    #[test]
+    fn remotes_say_how_to_reach_tiri_elsewhere() {
+        let config = parse(
+            "remote \"box\" { command \"/opt/tiri/bin/tiri\"; socket \"/tmp/w.sock\"; }\n\
+             remote \"other\" {}",
+        )
+        .unwrap();
+        assert_eq!(
+            config.remote("box"),
+            Some(&Remote {
+                host: "box".to_owned(),
+                command: Some("/opt/tiri/bin/tiri".to_owned()),
+                socket: Some(PathBuf::from("/tmp/w.sock")),
+            })
+        );
+        assert_eq!(config.remote("other").unwrap().command, None);
+        assert_eq!(config.remote("elsewhere"), None);
+        // The default config's example is commented out.
+        assert!(Config::default().remotes.is_empty());
+        let example = DEFAULT.replace("/-remote", "remote");
+        assert_ne!(example, DEFAULT);
+        assert!(parse(&example).unwrap().remote("box").is_some());
+
+        let twice = parse("remote \"box\" {}\nremote \"box\" {}").unwrap_err();
+        assert!(
+            twice.summary.contains("already a remote"),
+            "{}",
+            twice.summary
+        );
     }
 
     #[test]
