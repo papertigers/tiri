@@ -1,0 +1,60 @@
+name: Release-plz
+
+# On every push to main, keeps a release PR up to date with the next
+# version and its changelog. Merging that PR tags the release, makes a
+# GitHub release of it and publishes the crate. See docs/releasing.md.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Releases what the merged release PR bumped; nothing otherwise.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'papertigers' }}
+    permissions:
+      contents: write
+      pull-requests: read
+      # Publishing with crates.io's trusted publishing: the job proves it's
+      # this workflow in this repository, and gets a token for just this
+      # run. No crates.io token is kept in secrets.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # Opens or updates the release PR.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'papertigers' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    # One at a time, and never cancelled halfway through.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          # A PR opened with the default token doesn't start CI, illumos
+          # included; one opened with RELEASE_PLZ_TOKEN, if it's set, does.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
