@@ -61,17 +61,22 @@ impl App {
             // The overview takes the keyboard; nothing reaches the panes.
             return;
         }
-        client.selection = None;
-        if let Some(id) = self.workspaces.focused(client.id) {
-            // Typing returns to the live screen, as in any terminal.
-            client.scrollback.remove(&id);
-        }
         // The server sends it to whichever pane is focused when it arrives,
         // which a focus change on its way there may have moved.
         let modes = (self.focused_pane(client))
             .map(|pane| pane.emulator().key_modes())
             .unwrap_or_default();
         let bytes = encode_key(event, modes);
+        if bytes.is_empty() {
+            // A key the program has no way to be sent, like Cmd+C, which
+            // leaves the selection and the scrollback as they were.
+            return;
+        }
+        client.selection = None;
+        if let Some(id) = self.workspaces.focused(client.id) {
+            // Typing returns to the live screen, as in any terminal.
+            client.scrollback.remove(&id);
+        }
         self.outbox.push(ClientMsg::Input { pane: None, bytes });
     }
 

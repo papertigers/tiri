@@ -115,9 +115,16 @@ fn kitty_modifiers(mods: KeyModifiers) -> u8 {
     .sum()
 }
 
-/// A key as terminals have always sent it, xterm's way.
+/// A key as terminals have always sent it, xterm's way. Nothing for keys
+/// with Super, Hyper or Meta, which xterm's way can't say: without them,
+/// Cmd+C would type a c.
 fn legacy_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
+    if mods.intersects(
+        KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+    ) {
+        return Vec::new();
+    }
     let alt = mods.contains(KeyModifiers::ALT);
     let ctrl = mods.contains(KeyModifiers::CONTROL);
 
@@ -482,6 +489,28 @@ mod tests {
         // Keys that already say their modifiers keep their forms.
         assert_eq!(enc(KeyCode::Up, shift, KITTY), b"\x1b[1;2A");
         assert_eq!(enc(KeyCode::F(5), none, KITTY), b"\x1b[15~");
+    }
+
+    #[test]
+    fn keys_with_super_and_the_like_are_not_sent_without_them() {
+        let enc = |code, mods, modes| encode_key(key(code, mods), modes);
+        let cmd = KeyModifiers::SUPER;
+        // Cmd+C and Cmd+K, which Ghostty passes on when it has nothing to
+        // copy or clear, aren't a c and a k.
+        assert_eq!(enc(KeyCode::Char('c'), cmd, PLAIN), b"");
+        assert_eq!(enc(KeyCode::Char('k'), cmd, APP_CURSOR), b"");
+        assert_eq!(enc(KeyCode::Up, cmd, PLAIN), b"");
+        assert_eq!(enc(KeyCode::Enter, KeyModifiers::HYPER, PLAIN), b"");
+        assert_eq!(
+            enc(
+                KeyCode::Char('x'),
+                KeyModifiers::META | KeyModifiers::CONTROL,
+                PLAIN
+            ),
+            b""
+        );
+        // Programs that asked for the kitty keyboard protocol get them.
+        assert_eq!(enc(KeyCode::Char('c'), cmd, KITTY), b"\x1b[99;9u");
     }
 
     #[test]
