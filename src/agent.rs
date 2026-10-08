@@ -144,12 +144,16 @@ mod tests {
         });
     }
 
+    /// What the proxy answers `request` with. With no agent to go to, it
+    /// hangs up at once, maybe before the request is even sent: then the
+    /// write fails (a broken pipe), or the read (a reset), depending on the
+    /// system and the timing. Either way that's no answer.
     fn ask(proxy: &Path, request: &[u8]) -> Vec<u8> {
         let mut stream = UnixStream::connect(proxy).unwrap();
-        stream.write_all(request).unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        let _ = (stream.write_all(request))
+            .and_then(|()| stream.shutdown(Shutdown::Write));
         let mut reply = Vec::new();
-        stream.read_to_end(&mut reply).unwrap();
+        let _ = stream.read_to_end(&mut reply);
         reply
     }
 
