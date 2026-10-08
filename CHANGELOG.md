@@ -4,6 +4,10 @@ What changed in each release of tiri. A release that changed how the
 client and server talk says so: after upgrading, stop servers left running
 from before with `tiri kill-server`.
 
+## [0.3.1](https://github.com/papertigers/tiri/compare/v0.3.0...v0.3.1) - 2026-10-08
+
+- input: keys with Cmd (Super), Hyper or Meta send nothing to programs that didn't ask for the kitty keyboard protocol, rather than the key without them, so Cmd+C and Cmd+K don't type a c or a k ([#51](https://github.com/papertigers/tiri/pull/51))
+- 0.3.1: Cmd+C and Cmd+K no longer type a c or a k; it speaks the same protocol as 0.3.0 ([#52](https://github.com/papertigers/tiri/pull/52))
 ## [0.3.0](https://github.com/papertigers/tiri/compare/v0.2.0...v0.3.0) - 2026-10-08
 
 - render: narrow cells go without U+FE0F, which terminals draw two wide, wiping out the narrow emoji when the next cell's drawn ([#28](https://github.com/papertigers/tiri/pull/28))
