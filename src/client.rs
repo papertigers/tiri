@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{ExecutableCommand, cursor, event, terminal};
 use rustix::fs::{FlockOperation, flock};
+use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 
 use crate::app::{App, Client};
 use crate::colors::Palette;
@@ -39,8 +40,11 @@ use crate::trace::{Trace, Traced};
 
 /// How long to wait for a freshly started server to start listening.
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
-/// How often to look for a starting server's socket.
+/// How often to look for a starting server's socket, or a stopping one's
+/// process.
 const SERVER_START_POLL: Duration = Duration::from_millis(20);
+/// How long to wait for a server told to stop to be gone.
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// The shortest time between frames.
 const FRAME: Duration = Duration::from_millis(16);
 
@@ -507,21 +511,41 @@ pub fn kill_server(socket: &Path) -> Result<()> {
         println!("{NO_SERVER}");
         return Ok(());
     };
+    // Who's listening, asked now: a server from before greetings hangs up
+    // on hearing one.
+    let peer = socket::peer_process(&stream);
     // Asked in a greeting, which a server of any version since there have
     // been greetings takes: a server from before an upgrade still stops.
     send_raw(&mut stream, &Greeting::ours(Intent::Kill).encode())?;
     let mut decoder = Decoder::from_server();
-    if !matches!(recv_greeting(&mut stream, &mut decoder), Ok(Some(_))) {
+    if matches!(recv_greeting(&mut stream, &mut decoder), Ok(Some(_))) {
+        // Wait for it to hang up, so it's gone when we return.
+        let _ = io::copy(&mut stream, &mut io::sink());
+        return Ok(());
+    }
+    // From before greetings, so it can't be asked: it's told, as kill(1)
+    // would, if it's ours.
+    let ours = rustix::process::getuid().as_raw();
+    let pid = peer
+        .filter(|&(_, uid)| uid == ours)
+        .and_then(|(pid, _)| Pid::from_raw(pid));
+    let Some(pid) = pid else {
         bail!(
             "the tiri server at {} is from before servers said their \
-             version, and doesn't understand being asked to stop by this \
-             one. The tiri it was started with can stop it, with \
-             `tiri kill-server`",
+             version, and this system won't say which process it is, to \
+             stop it. The tiri it was started with can, with `tiri \
+             kill-server`",
             socket.display()
         );
+    };
+    kill_process(pid, Signal::TERM).with_context(|| {
+        format!("couldn't stop the tiri server at {}", socket.display())
+    })?;
+    // Gone when we return, as when it's asked.
+    let deadline = Instant::now() + SERVER_STOP_TIMEOUT;
+    while test_kill_process(pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(SERVER_START_POLL);
     }
-    // Wait for it to hang up, so it's gone when we return.
-    let _ = io::copy(&mut stream, &mut io::sink());
     Ok(())
 }
 
