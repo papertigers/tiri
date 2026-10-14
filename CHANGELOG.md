@@ -4,6 +4,9 @@ What changed in each release of tiri. A release that changed how the
 client and server talk says so: after upgrading, stop servers left running
 from before with `tiri kill-server`.
 
+## [0.3.2](https://github.com/papertigers/tiri/compare/v0.3.1...v0.3.2) - 2026-10-14
+
+- layout: focusing up from a column's top pane goes on to the workspace above, and down from its bottom pane to the one below, unless the config says focus-stays-in-workspace ([#55](https://github.com/papertigers/tiri/pull/55))
 ## [0.3.1](https://github.com/papertigers/tiri/compare/v0.3.0...v0.3.1) - 2026-10-08
 
 - input: keys with Cmd (Super), Hyper or Meta send nothing to programs that didn't ask for the kitty keyboard protocol, rather than the key without them, so Cmd+C and Cmd+K don't type a c or a k ([#51](https://github.com/papertigers/tiri/pull/51))
