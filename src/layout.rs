@@ -503,16 +503,31 @@ impl Strip {
         column
     }
 
-    pub fn focus_up(&mut self) {
-        if let Some(col) = self.columns.get_mut(self.focus) {
-            col.set_focus(col.focus.saturating_sub(1));
+    /// Focuses the pane above in the focused column. False if there's none
+    /// to go to: the focus is on the column's top pane, or there's no
+    /// column.
+    pub fn focus_up(&mut self) -> bool {
+        let Some(col) = self.columns.get_mut(self.focus) else {
+            return false;
+        };
+        if col.focus == 0 {
+            return false;
         }
+        col.set_focus(col.focus - 1);
+        true
     }
 
-    pub fn focus_down(&mut self) {
-        if let Some(col) = self.columns.get_mut(self.focus) {
-            col.set_focus((col.focus + 1).min(col.panes.len() - 1));
+    /// Focuses the pane below in the focused column. False if there's none
+    /// to go to.
+    pub fn focus_down(&mut self) -> bool {
+        let Some(col) = self.columns.get_mut(self.focus) else {
+            return false;
+        };
+        if col.focus + 1 >= col.panes.len() {
+            return false;
         }
+        col.set_focus(col.focus + 1);
+        true
     }
 
     pub fn move_up(&mut self) {

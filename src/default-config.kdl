@@ -44,7 +44,14 @@ theme "default"
 // A proportion is a share of the screen's width or height, above 0 and at
 // most 1. fixed is a number of characters across or lines down, borders
 // included, as in `fixed 80`.
+//
+// focus-pane-up (Alt+k) on a column's top pane goes on to the workspace
+// above, and focus-pane-down (Alt+j) on its bottom pane to the one below.
+// focus-stays-in-workspace keeps them in the workspace instead. For
+// `tiri connect`, this is read from the config on the far side.
 layout {
+    /-focus-stays-in-workspace
+
     preset-column-widths {
         proportion 0.33333
         proportion 0.5
@@ -94,7 +101,8 @@ animations {
 //   new-column                       a new column with a shell, right of this one
 //   focus-column-left/right          focus-column-first/last
 //   move-column-left/right
-//   focus-pane-up/down               within the column
+//   focus-pane-up/down               within the column, then on to the
+//                                    workspace above or below
 //   move-pane-up/down
 //   consume-or-expel-pane-left/right into the column to that side, or out of it
 //   consume-pane-into-column         pull the next column's pane into this one

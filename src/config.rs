@@ -43,6 +43,9 @@ pub struct Config {
     pub size_presets: SizePresets,
     /// Whether things fade and slide, or change at once.
     pub animations: bool,
+    /// Whether focusing up from a column's top pane, or down from its
+    /// bottom one, goes on to the workspace above or below.
+    pub focus_crosses_workspaces: bool,
     /// How to reach tiri on other machines, for `tiri connect`.
     pub remotes: Vec<Remote>,
 }
@@ -323,6 +326,9 @@ struct RawLayout {
     default_column_width: Option<RawSizes>,
     #[knus(child)]
     preset_pane_heights: Option<RawSizes>,
+    /// Keeps focus-pane-up and focus-pane-down in the workspace.
+    #[knus(child)]
+    focus_stays_in_workspace: bool,
 }
 
 /// A list of sizes, and where it's written.
@@ -560,6 +566,7 @@ impl RawConfig {
             Some(base) => (Some(base.bindings), base.size_presets),
             None => (None, SizePresets::default()),
         };
+        let focus_crosses_workspaces = !self.layout.focus_stays_in_workspace;
         let size_presets = self.layout.resolve(base_widths)?;
         let prefix = self.prefix.map(|prefix| prefix.0);
         let mut bindings = match (base, prefix) {
@@ -634,7 +641,14 @@ impl RawConfig {
                 socket: raw.socket,
             });
         }
-        Ok(Config { theme, bindings, size_presets, animations, remotes })
+        Ok(Config {
+            theme,
+            bindings,
+            size_presets,
+            animations,
+            focus_crosses_workspaces,
+            remotes,
+        })
     }
 }
 
@@ -834,6 +848,18 @@ mod tests {
         let off = DEFAULT.replace("/-off", "off");
         assert_ne!(off, DEFAULT);
         assert!(!parse(&off).unwrap().animations);
+    }
+
+    #[test]
+    fn pane_focus_crosses_workspaces_unless_kept_in() {
+        assert!(Config::default().focus_crosses_workspaces);
+        assert!(parse("layout {}").unwrap().focus_crosses_workspaces);
+        let kept = parse("layout { focus-stays-in-workspace; }").unwrap();
+        assert!(!kept.focus_crosses_workspaces);
+        let kept = DEFAULT
+            .replace("/-focus-stays-in-workspace", "focus-stays-in-workspace");
+        assert_ne!(kept, DEFAULT);
+        assert!(!parse(&kept).unwrap().focus_crosses_workspaces);
     }
 
     #[test]
