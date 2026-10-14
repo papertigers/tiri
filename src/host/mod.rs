@@ -75,6 +75,9 @@ pub struct Host {
     /// The config file, re-read as each client attaches, for its layout
     /// presets; None to use only what's built in.
     config_path: Option<PathBuf>,
+    /// Whether focusing up from a column's top pane, or down from its
+    /// bottom one, goes on to the workspace above or below; from the config.
+    focus_crosses_workspaces: bool,
     /// What every client is to hear, in order.
     outgoing: Vec<ServerMsg>,
     /// The layout has changed since clients were last sent it.
@@ -119,6 +122,8 @@ impl Host {
             size_owner: None,
             exited: Vec::new(),
             config_path,
+            focus_crosses_workspaces: Config::default()
+                .focus_crosses_workspaces,
             outgoing: Vec::new(),
             layout_changed: false,
             agent,
@@ -139,6 +144,7 @@ impl Host {
         if let Some(path) = &self.config_path {
             let config = Config::load(path).unwrap_or_default();
             self.workspaces.set_size_presets(&config.size_presets);
+            self.focus_crosses_workspaces = config.focus_crosses_workspaces;
         }
         let workspace = match &target {
             Target::Default => None,
@@ -361,9 +367,21 @@ impl Host {
             Action::MoveColumnRight => {
                 self.workspaces.active_mut(id).move_right()
             }
-            Action::FocusPaneUp => self.workspaces.active_mut(id).focus_up(),
+            // Past the column's end, on to the workspace there, unless the
+            // config keeps the focus in the workspace.
+            Action::FocusPaneUp => {
+                if !self.workspaces.active_mut(id).focus_up()
+                    && self.focus_crosses_workspaces
+                {
+                    self.workspaces.focus_up(id);
+                }
+            }
             Action::FocusPaneDown => {
-                self.workspaces.active_mut(id).focus_down()
+                if !self.workspaces.active_mut(id).focus_down()
+                    && self.focus_crosses_workspaces
+                {
+                    self.workspaces.focus_down(id);
+                }
             }
             Action::MovePaneUp => self.workspaces.active_mut(id).move_up(),
             Action::MovePaneDown => self.workspaces.active_mut(id).move_down(),
@@ -657,5 +675,51 @@ mod tests {
         host.shutdown();
         drop(host);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pane_focus_goes_on_past_a_column_end_to_the_next_workspace() {
+        let mut host = Host::new(Arc::new(Poller::new().unwrap()), None, None);
+        let guest = host.attach(hello(None)).unwrap();
+        let run = |host: &mut Host, action| host.run(&guest, action).unwrap();
+        // Two panes stacked in a column, the lower one focused, on the
+        // first workspace; below it, the empty one.
+        let top = host.workspaces.focused(guest.id).unwrap();
+        run(&mut host, Action::NewColumn);
+        let bottom = host.workspaces.focused(guest.id).unwrap();
+        run(&mut host, Action::ConsumeOrExpelPaneLeft);
+        assert_eq!(host.workspaces.active(guest.id).columns().len(), 1);
+        assert_eq!(host.workspaces.focused(guest.id), Some(bottom));
+        let workspace = |host: &Host| host.workspaces.active_index(guest.id);
+
+        // Within the column first.
+        run(&mut host, Action::FocusPaneUp);
+        assert_eq!(host.workspaces.focused(guest.id), Some(top));
+        // Nothing above the first workspace: it stays.
+        run(&mut host, Action::FocusPaneUp);
+        assert_eq!(
+            (workspace(&host), host.workspaces.focused(guest.id)),
+            (0, Some(top))
+        );
+        run(&mut host, Action::FocusPaneDown);
+        assert_eq!(host.workspaces.focused(guest.id), Some(bottom));
+        // Past the bottom pane, the workspace below; and back up.
+        run(&mut host, Action::FocusPaneDown);
+        assert_eq!(workspace(&host), 1);
+        run(&mut host, Action::FocusPaneUp);
+        assert_eq!(
+            (workspace(&host), host.workspaces.focused(guest.id)),
+            (0, Some(bottom))
+        );
+
+        // Unless the config keeps it in.
+        host.focus_crosses_workspaces = false;
+        run(&mut host, Action::FocusPaneDown);
+        assert_eq!(
+            (workspace(&host), host.workspaces.focused(guest.id)),
+            (0, Some(bottom))
+        );
+
+        host.shutdown();
     }
 }

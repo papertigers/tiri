@@ -86,7 +86,7 @@ There are three sets of keys:
 |---|---|---|---|
 | `n`, `Enter` | `Alt+Enter` | `n` | Open a new column |
 | `h` `l` / `←` `→` | `Alt+h` `Alt+l` | `h` `l` | Focus the column to the left or right |
-| `j` `k` / `↓` `↑` | `Alt+j` `Alt+k` | `j` `k` | Focus the pane below or above |
+| `j` `k` / `↓` `↑` | `Alt+j` `Alt+k` | `j` `k` | Focus the pane below or above; past the column's end, the workspace there ([unless you'd rather not](#focus)) |
 | `0` `$` / `Home` `End` | | `0` `$` | Focus the first or last column |
 | `H` `L` | `Alt+H` `Alt+L` | `H` `L` | Move the column left or right |
 | `J` `K` | `Alt+J` `Alt+K` | `J` `K` | Move the pane down or up its stack |
@@ -280,6 +280,20 @@ layout {
 A `proportion` is a share of the screen's width or height, above 0 and at
 most 1. `fixed` is a number of characters across or lines down, borders
 included. Columns and panes keep their size when you change the presets.
+
+### Focus
+
+Focusing up from a column's top pane goes on to the workspace above, and
+down from its bottom pane to the workspace below. To keep the focus in the
+workspace instead:
+
+```kdl
+layout {
+    focus-stays-in-workspace
+}
+```
+
+For `tiri connect`, this is read from the config on the other machine.
 
 ### Animations
 
