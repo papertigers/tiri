@@ -1,0 +1,21 @@
+# Weekly PRs for Cargo dependencies and the GitHub Actions the workflows
+# use. Minor and patch updates come grouped in one PR, since each PR also
+# boots an OmniOS VM in CI; a major update gets a PR of its own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
