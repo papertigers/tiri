@@ -34,11 +34,12 @@ jobs:
           envs: CARGO_TERM_COLOR
           copyback: false
           # Keeps the VM with Rust installed, so later runs skip installing
-          # it. The key follows rust-toolchain.toml, so a new Rust there
-          # prepares the VM afresh.
+          # it. The cache key hashes the prepare script, so the comment
+          # naming rust-toolchain.toml's hash makes a new Rust there
+          # prepare the VM afresh.
           cache-after-prepare: true
-          cache-after-prepare-key-suffix: rust-${{ hashFiles('rust-toolchain.toml') }}
           prepare: |
+            # rust-toolchain.toml: ${{ hashFiles('rust-toolchain.toml') }}
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --profile minimal --default-toolchain none
             . "$HOME/.cargo/env"
