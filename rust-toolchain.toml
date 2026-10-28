@@ -1,0 +1,7 @@
+# The Rust that tiri is built and tested with, here and in CI. Dependabot
+# opens a PR when a new stable comes out. rust-version in Cargo.toml is
+# the oldest Rust that builds tiri, and can stay behind this.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

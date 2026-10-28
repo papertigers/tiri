@@ -26,7 +26,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the Rust that rust-toolchain.toml names.
+      - run: rustup toolchain install
       - uses: release-plz/action@v0.5
         with:
           command: release
@@ -50,7 +51,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the Rust that rust-toolchain.toml names.
+      - run: rustup toolchain install
       - uses: release-plz/action@v0.5
         with:
           command: release-pr

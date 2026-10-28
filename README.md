@@ -25,7 +25,7 @@ been tested there yet.
 
 ## Getting started
 
-Building needs Rust 1.88 or newer.
+Building needs Rust 1.99.1 or newer.
 
 ```sh
 cargo install --path .

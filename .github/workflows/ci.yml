@@ -17,7 +17,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the Rust that rust-toolchain.toml names.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
@@ -32,11 +33,16 @@ jobs:
           release: r151058-build
           envs: CARGO_TERM_COLOR
           copyback: false
-          # Keeps the VM with Rust installed, so later runs skip installing it.
+          # Keeps the VM with Rust installed, so later runs skip installing
+          # it. The key follows rust-toolchain.toml, so a new Rust there
+          # prepares the VM afresh.
           cache-after-prepare: true
+          cache-after-prepare-key-suffix: rust-${{ hashFiles('rust-toolchain.toml') }}
           prepare: |
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal
+              | sh -s -- -y --profile minimal --default-toolchain none
+            . "$HOME/.cargo/env"
+            rustup toolchain install
           run: |
             . "$HOME/.cargo/env"
             cargo test

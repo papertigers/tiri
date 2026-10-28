@@ -19,3 +19,9 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # Bumps rust-toolchain.toml when a new stable Rust comes out.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
