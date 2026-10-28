@@ -4,6 +4,9 @@ What changed in each release of tiri. A release that changed how the
 client and server talk says so: after upgrading, stop servers left running
 from before with `tiri kill-server`.
 
+## [0.3.4](https://github.com/papertigers/tiri/compare/v0.3.3...v0.3.4) - 2026-10-28
+
+- build(deps): bump compact_str from 0.9.1 to 0.10.0 ([#63](https://github.com/papertigers/tiri/pull/63))
 ## [0.3.3](https://github.com/papertigers/tiri/compare/v0.3.2...v0.3.3) - 2026-10-28
 
 - build: Rust 1.99.1 or newer, pinned in rust-toolchain.toml ([#59](https://github.com/papertigers/tiri/pull/59))
