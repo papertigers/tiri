@@ -4,6 +4,10 @@ What changed in each release of tiri. A release that changed how the
 client and server talk says so: after upgrading, stop servers left running
 from before with `tiri kill-server`.
 
+## [0.3.3](https://github.com/papertigers/tiri/compare/v0.3.2...v0.3.3) - 2026-10-28
+
+- build: Rust 1.99.1 or newer, pinned in rust-toolchain.toml ([#59](https://github.com/papertigers/tiri/pull/59))
+- bump the rest of the deps ([#60](https://github.com/papertigers/tiri/pull/60))
 ## [0.3.2](https://github.com/papertigers/tiri/compare/v0.3.1...v0.3.2) - 2026-10-14
 
 - layout: focusing up from a column's top pane goes on to the workspace above, and down from its bottom pane to the one below, unless the config says focus-stays-in-workspace ([#55](https://github.com/papertigers/tiri/pull/55))
